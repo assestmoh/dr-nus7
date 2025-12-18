@@ -1,10 +1,11 @@
 // ===============================
-// server.js — مساعد صحي مختصر + مرفقات (تحاليل/تقارير/أشعة/صور)
+// server.js — شات "نفس القديم" + تقرير/مرفقات (PDF/صورة) بأسلوب مفهوم للمريض
 // ===============================
 
 import "dotenv/config";
 import express from "express";
 import cors from "cors";
+import bodyParser from "body-parser";
 import fetch from "node-fetch";
 
 import multer from "multer";
@@ -14,15 +15,21 @@ import { createRequire } from "node:module";
 
 const require = createRequire(import.meta.url);
 
-// ✅ FIX: pdf-parse قد يرجع default أو module object حسب البيئة
+// ✅ pdf-parse قد يرجع default أو module object حسب البيئة
 const pdfParseModule = require("pdf-parse");
 const pdfParse = pdfParseModule.default || pdfParseModule;
 
 const app = express();
 
+// متغيرات البيئة
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
 const MODEL_ID = process.env.GROQ_MODEL || "openai/gpt-oss-120b";
 const PORT = process.env.PORT || 3000;
+
+// حدود
+const JSON_LIMIT = process.env.JSON_LIMIT || "8mb";
+const FILE_LIMIT_BYTES = Number(process.env.FILE_LIMIT_BYTES || 8 * 1024 * 1024);
+const MAX_OCR_CHARS = Number(process.env.MAX_OCR_CHARS || 2500); // لتقليل التوكنز
 
 if (!GROQ_API_KEY) {
   console.error("❌ GROQ_API_KEY غير مضبوط");
@@ -30,95 +37,90 @@ if (!GROQ_API_KEY) {
 }
 
 app.use(cors());
-app.use(express.json({ limit: process.env.JSON_LIMIT || "8mb" }));
+app.use(bodyParser.json({ limit: JSON_LIMIT }));
 
+// رفع ملفات (صورة/PDF) - على الذاكرة بدون تخزين
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: Number(process.env.FILE_LIMIT_BYTES || 8 * 1024 * 1024) },
+  limits: { fileSize: FILE_LIMIT_BYTES },
 });
 
+// ذاكرة محادثة لكل مستخدم
 const conversations = {};
 
 // ===============================
-// Prompts
+// 1) Prompts
 // ===============================
-function buildSystemPromptGeneral() {
+
+// ✅ هذا نفس روح أسلوبك القديم (اللي تقولين كان حلو)
+function buildSystemPromptChat() {
   return `
-أنت مساعد صحي للتثقيف فقط، بأسلوب شبيه بـ ChatGPT.
-
-قواعد عامة:
-- اختر أسلوب الإجابة تلقائيًا حسب السؤال.
-- استخدم لغة عربية واضحة ومريحة.
-- لا تستخدم جداول إلا إذا طلب المستخدم ذلك صراحة.
-- لا تطِل بدون داعٍ، ولا تختصر لدرجة الإخلال.
-- إذا كانت النصيحة مناسبة: استخدم نقاط.
-- إذا كان الشرح يحتاج سلاسة: استخدم فقرات قصيرة.
-- تجنب المصطلحات الطبية المعقدة إلا إذا كانت ضرورية وفسّرها ببساطة.
-- لا تشخص أمراضًا، ولا تذكر أدوية أو جرعات.
-
-الهدف:
-أن يشعر المستخدم أن الرد ذكي، مفهوم، ومخصص له، مثل أسلوب ChatGPT.
+أنت مساعد صحي للتثقيف الصحي فقط.
+قدّم معلومات عامة عن الصحة ونمط الحياة، بأسلوب عربي مهني واضح ومريح للقارئ.
+تجنّب التشخيص الطبي، وصف الأدوية، أو إعطاء جرعات محددة.
+لا تقدّم خطط علاجية مفصلة.
+اجعل الإجابة عادة بين 6 و12 سطرًا تقريبًا، مع تنظيم بسيط بنقاط أو عناوين قصيرة.
+تجنب الجداول.
+يمكنك ذكر متى يفضَّل مراجعة الطبيب أو الطوارئ عند وجود أعراض خطيرة.
 `.trim();
 }
 
-function buildSystemPromptAttachment() {
+// ✅ تقرير/تحاليل: شرح مفهوم للمريض + يشرح كل فحص بطريقة سهلة
+function buildSystemPromptReport() {
   return `
-أنت مساعد صحي للتثقيف فقط، بأسلوب شبيه بـ ChatGPT.
+أنت مساعد صحي للتثقيف فقط.
+ستستقبل نص تقرير/تحاليل أو نص مستخرج من صورة/ملف.
 
-تعامل مع المرفقات بذكاء:
-- التحاليل: اشرح النتائج بلغة بسيطة، وركّز على المهم فقط.
-- صور الأشعة: اشرح بشكل عام، ووضّح أن الصورة وحدها لا تكفي للتشخيص.
-- صور الحالات: صف ما يظهر بشكل عام بدون تشخيص.
+المطلوب: شرح النتائج للمريض بلغة عربية بسيطة ومفهومة.
+- اشرح "كل فحص مهم" بسطر واحد بسيط (وش يعني إذا مرتفع/منخفض) بدون مصطلحات معقدة.
+- لا تستخدم جداول.
+- لا تكثر أرقام وحدود مرجعية، فقط اذكر (طبيعي/مرتفع/منخفض/قريب من الحد).
+- أعطِ خطوة واضحة للمريض: ماذا يفعل الآن؟
+- اختم بسطر "متى تراجع الطبيب بسرعة" إذا في شيء يستدعي.
 
-قواعد:
-- لا جداول إلا إذا طُلبت.
-- لا تخويف.
-- لا تشخيص أو أدوية.
-- استخدم أسلوب مرن: نقاط أو فقرات حسب الحاجة.
-- الطول متوسط ومريح للقراءة.
+ممنوع: تشخيص نهائي، أدوية، جرعات، أو خطة علاج مفصلة.
 
-الهدف:
-تجربة تشبه ChatGPT في الفهم والأسلوب.
+الطول: مريح للمريض (8–14 سطر كحد أقصى).
+`.trim();
+}
+
+// ✅ في حالة صور بلا نص (أشعة/جرح): شرح عام آمن
+function buildSystemPromptImageNoText() {
+  return `
+أنت مساعد صحي للتثقيف فقط.
+تم رفع صورة طبية بدون نص واضح (قد تكون أشعة أو صورة حالة مثل جرح/جلد/بول).
+
+- لا تشخص من الصورة.
+- إذا كانت أشعة: وضّح أن الصورة وحدها لا تكفي للتشخيص واطلب تقرير الأشعة المكتوب إن وُجد، وقدّم شرحًا عامًا ماذا تُستخدم الأشعة له.
+- إذا كانت صورة حالة: صف بشكل عام ما يمكن ملاحظته عادةً (بدون جزم) واذكر علامات الخطر التي تستدعي الطبيب.
+- أعطِ نصيحة بسيطة للمريض: ماذا يفعل الآن؟
+
+الطول: 6–10 سطور، بدون جداول.
 `.trim();
 }
 
 // ===============================
-// Helpers
+// 2) فلترة خفيفة جدًا لمنع الهلوسات (أكل/شرب أشياء غريبة)
 // ===============================
-function redactPII(text) {
-  return String(text || "")
-    .replace(/\b\d{7,}\b/g, "[رقم محذوف]")
-    .replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi, "[بريد محذوف]");
+const NON_FOOD_KEYWORDS = ["بنزين", "زجاج", "بلاستيك", "مادة تنظيف", "منظفات", "مبيض", "فولاذ"];
+const EAT_DRINK_VERBS = ["تناول", "أكل", "اشرب", "شرب"];
+
+function hasNonFoodConsumption(text) {
+  return EAT_DRINK_VERBS.some((v) => text.includes(v)) && NON_FOOD_KEYWORDS.some((w) => text.includes(w));
 }
 
-async function fetchWithTimeout(url, options = {}, ms = 20000) {
-  const controller = new AbortController();
-  const id = setTimeout(() => controller.abort(), ms);
+const SAFETY_NOTE = `
+لضمان دقة وسلامة المعلومات، جرى استبدال الجزء غير المناسب بمحتوى صحي عام.
+• الامتناع عن أي مواد غير صالحة للاستهلاك.
+• التركيز على الغذاء الصحي، وشرب الماء بانتظام، والحصول على نوم كافٍ.
+• مراجعة الطبيب عند وجود أي أعراض تتطلب التقييم.
+`.trim();
+
+async function sanitizeReply(originalReply) {
+  if (!hasNonFoodConsumption(originalReply)) return originalReply;
+
   try {
-    return await fetch(url, { ...options, signal: controller.signal });
-  } finally {
-    clearTimeout(id);
-  }
-}
-
-function getSessionId(req) {
-  return (
-    (req.headers["x-session-id"] && String(req.headers["x-session-id"]).slice(0, 32)) ||
-    req.ip ||
-    "default"
-  );
-}
-
-async function askAssistant(userMessage, sessionId, mode) {
-  if (!conversations[sessionId]) conversations[sessionId] = [];
-  conversations[sessionId].push({ role: "user", content: userMessage });
-  conversations[sessionId] = conversations[sessionId].slice(-6);
-
-  const systemPrompt = mode === "attachment" ? buildSystemPromptAttachment() : buildSystemPromptGeneral();
-
-  const response = await fetchWithTimeout(
-    "https://api.groq.com/openai/v1/chat/completions",
-    {
+    const response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
       method: "POST",
       headers: {
         Authorization: `Bearer ${GROQ_API_KEY}`,
@@ -128,11 +130,89 @@ async function askAssistant(userMessage, sessionId, mode) {
         model: MODEL_ID,
         temperature: 0.3,
         max_tokens: 500,
-        messages: [{ role: "system", content: systemPrompt }, ...conversations[sessionId]],
+        messages: [
+          {
+            role: "system",
+            content:
+              "أنت محرر نص صحي. احذف أي اقتراح لتناول/شرب مواد غير صالحة للاستهلاك، وقدّم بديلًا صحيًا عامًا مختصرًا.",
+          },
+          { role: "user", content: originalReply },
+        ],
       }),
+    });
+
+    if (!response.ok) {
+      console.error("❌ sanitizeReply API error:", await response.text());
+      return SAFETY_NOTE;
+    }
+
+    const data = await response.json();
+    const cleaned = data.choices?.[0]?.message?.content?.trim() || "";
+    return cleaned ? `${cleaned}\n\n${SAFETY_NOTE}` : SAFETY_NOTE;
+  } catch (err) {
+    console.error("❌ sanitizeReply error:", err);
+    return SAFETY_NOTE;
+  }
+}
+
+// ===============================
+// 3) فلتر الألفاظ غير المناسبة
+// ===============================
+const BLOCKED_WORDS = [
+  "زب","قضيب","كس","طيز","عير","مني","فرج","شهوة","قذف","احتلام",
+  "فقحة","سمبول","سنبول","مفسى","مفسي","مضرط","مضرّط",
+];
+
+function hasBlockedWords(text) {
+  return BLOCKED_WORDS.some((w) => text.includes(w));
+}
+
+// ===============================
+// 4) كلمات تدل على خطورة
+// ===============================
+const DANGER_WORDS = [
+  "ألم صدر","ألم في الصدر","ضيق نفس","صعوبة في التنفس","فقدان وعي","اغمي","إغماء","نزيف","تشنج","صداع شديد","سكتة","جلطة",
+];
+
+// ===============================
+// 5) تعديل سلوك "كمل"
+// ===============================
+const CONTINUE_WORDS = ["كمل", "كمّل", "أكمل", "تابع", "كملي"];
+function rewriteContinueWord(message) {
+  const trimmed = message.trim();
+  if (CONTINUE_WORDS.includes(trimmed)) {
+    return "من فضلك أكمل الشرح السابق بشكل مبسّط وواضح، مع البقاء في نفس الموضوع وعدم فتح موضوع جديد.";
+  }
+  return message;
+}
+
+// ===============================
+// 6) تنقيح بيانات حساسة (بسيط)
+// ===============================
+function redactPII(text) {
+  let t = String(text || "");
+  t = t.replace(/\b\d{7,}\b/g, "[رقم محذوف]");
+  t = t.replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi, "[بريد محذوف]");
+  return t;
+}
+
+// ===============================
+// 7) استدعاء Groq
+// ===============================
+async function callGroq(messages, { temperature = 0.4, max_tokens = 1200 } = {}) {
+  const response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${GROQ_API_KEY}`,
+      "Content-Type": "application/json",
     },
-    mode === "attachment" ? 30000 : 20000
-  );
+    body: JSON.stringify({
+      model: MODEL_ID,
+      temperature,
+      max_tokens,
+      messages,
+    }),
+  });
 
   if (!response.ok) {
     console.error("❌ Groq API error:", await response.text());
@@ -140,108 +220,171 @@ async function askAssistant(userMessage, sessionId, mode) {
   }
 
   const data = await response.json();
-  const reply = data.choices?.[0]?.message?.content?.trim();
-  return reply || "لم أستطع استخراج نتيجة واضحة.";
+  return data.choices?.[0]?.message?.content?.trim() || "";
 }
 
 // ===============================
-// OCR / PDF
+// 8) شات (نفس القديم)
 // ===============================
-async function ocrImage(buf) {
+async function askHealthAssistantChat(userMessage, sessionId) {
+  if (!conversations[sessionId]) conversations[sessionId] = [];
+
+  conversations[sessionId].push({ role: "user", content: userMessage });
+  if (conversations[sessionId].length > 6) conversations[sessionId] = conversations[sessionId].slice(-6);
+
+  const messages = [{ role: "system", content: buildSystemPromptChat() }, ...conversations[sessionId]];
+  let reply = await callGroq(messages, { temperature: 0.4, max_tokens: 1200 });
+
+  reply = await sanitizeReply(reply);
+  if (!reply) reply = "لا تتوفر لدي معلومات كافية. يُفضّل استشارة مقدم رعاية صحية.";
+
+  conversations[sessionId].push({ role: "assistant", content: reply });
+  return reply;
+}
+
+// ===============================
+// 9) تقرير/مرفقات
+// ===============================
+async function askHealthAssistantReport(reportText, sessionId) {
+  if (!conversations[sessionId]) conversations[sessionId] = [];
+
+  // نخلي التقرير خارج “محادثة الشات” حتى ما يخرب أسلوب الشات
+  const messages = [
+    { role: "system", content: buildSystemPromptReport() },
+    { role: "user", content: reportText },
+  ];
+
+  let reply = await callGroq(messages, { temperature: 0.25, max_tokens: 900 });
+  reply = await sanitizeReply(reply);
+  return reply || "لم أستطع استخراج شرح واضح من التقرير. جرّب صورة أوضح أو تقرير آخر.";
+}
+
+// ===============================
+// 10) OCR / PDF
+// ===============================
+async function ocrImageBufferToText(buf) {
   const pre = await sharp(buf).grayscale().normalize().toBuffer();
   const { data } = await Tesseract.recognize(pre, "ara+eng");
   return (data?.text || "").trim();
 }
 
-async function extractTextFromPdf(buf) {
+async function extractTextFromPdfBuffer(buf) {
   const data = await pdfParse(buf);
   return (data?.text || "").trim();
 }
 
 // ===============================
-// Routes
+// 11) Routes
 // ===============================
 app.get("/", (_req, res) => {
-  res.json({ status: "ok", service: "dr-nus7 api", model: MODEL_ID });
+  res.json({ status: "ok", service: "Sehatek Plus API", model: MODEL_ID });
 });
 
 app.post("/chat", async (req, res) => {
   try {
-    const sessionId = getSessionId(req);
-    const msg = redactPII(String(req.body?.message || "").trim());
-    if (!msg) return res.status(400).json({ reply: "لم يصلني نص." });
+    let rawMessage = (req.body.message || "").toString().trim();
+    if (!rawMessage) return res.status(400).json({ reply: "لم يصلني نص." });
 
-    const reply = await askAssistant(msg, sessionId, "general");
+    if (hasBlockedWords(rawMessage)) {
+      return res.json({
+        reply: "يبدو أن الرسالة تحتوي على تعبير غير مناسب.\nيرجى كتابة سؤالك الصحي بشكل واضح ومحترم لأتمكن من مساعدتك.",
+      });
+    }
+
+    rawMessage = rewriteContinueWord(rawMessage);
+    let userMessage = redactPII(rawMessage);
+
+    const sessionId =
+      (req.headers["x-session-id"] && req.headers["x-session-id"].toString().slice(0, 32)) ||
+      req.ip ||
+      "default";
+
+    if (DANGER_WORDS.some((w) => userMessage.includes(w))) {
+      userMessage += "\n\n[تنبيه للنموذج: قد تحتوي الرسالة على أعراض خطيرة. وضّح متى يجب مراجعة الطوارئ.]";
+    }
+
+    const reply = await askHealthAssistantChat(userMessage, sessionId);
     res.json({ reply });
   } catch (err) {
     console.error("❌ Error in /chat:", err);
-    res.status(500).json({ reply: "حدث خطأ. حاول مرة أخرى." });
+    res.status(500).json({
+      reply: "حدث خطأ غير متوقع أثناء معالجة الطلب. يُفضّل إعادة المحاولة، أو مراجعة طبيب عند وجود أعراض مقلقة.",
+    });
   }
 });
 
-// ✅ زر المرفق يرسل هنا: /report
+// ✅ زر المرفق: PDF/صورة
 app.post("/report", upload.single("file"), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ reply: "لم يصلني ملف." });
 
-    const sessionId = getSessionId(req);
+    const sessionId =
+      (req.headers["x-session-id"] && req.headers["x-session-id"].toString().slice(0, 32)) ||
+      req.ip ||
+      "default";
+
     const mime = String(req.file.mimetype || "");
     const buf = req.file.buffer;
 
-    // --------------------
     // PDF
-    // --------------------
     if (mime === "application/pdf") {
-      const extracted = await extractTextFromPdf(buf);
+      let extracted = await extractTextFromPdfBuffer(buf);
 
-      // PDF ممسوح (صور)
       if (!extracted || extracted.length < 30) {
         return res.status(400).json({
           reply:
-            "هذا الـ PDF غالبًا ممسوح (Scan) لذلك ما فيه نص قابل للقراءة.\n" +
-            "الحل: ارفع صورة واضحة لصفحة التقرير، أو ارفع تقرير الأشعة/التحاليل المكتوب.",
+            "هذا الـ PDF غالبًا ممسوح (Scan) وما فيه نص قابل للقراءة.\nارفع صورة واضحة لصفحة التقرير أو أرفق التقرير المكتوب.",
         });
       }
 
-      const prompt = redactPII(`المرفق عبارة عن تقرير/تحاليل PDF.\nالنص:\n${extracted}`);
-      const reply = await askAssistant(prompt, sessionId, "attachment");
+      // قص لتقليل التوكنز
+      extracted = extracted.slice(0, MAX_OCR_CHARS);
+
+      const reportText = redactPII(`نص التقرير:\n${extracted}`);
+      const reply = await askHealthAssistantReport(reportText, sessionId);
       return res.json({ reply });
     }
 
-    // --------------------
-    // IMAGE (تحاليل/أشعة/جرح...)
-    // --------------------
+    // صورة
     if (mime.startsWith("image/")) {
-      const extracted = await ocrImage(buf);
+      let extracted = await ocrImageBufferToText(buf);
 
-      // ✅ إذا ما فيه نص: لا تفشل — قد تكون أشعة أو صورة حالة
-      if (!extracted || extracted.length < 10) {
-        const hint =
-          "تم رفع صورة طبية بدون نص واضح (قد تكون أشعة أو جرح/حالة).\n" +
-          "المطلوب: شرح عام وآمن مختصر (4–6 أسطر):\n" +
-          "- إذا كانت أشعة: قل إن الصورة وحدها لا تكفي للتشخيص واطلب تقرير الأشعة إن وُجد.\n" +
-          "- إذا كانت جرح/جلد/بول: صف بشكل عام فقط واذكر متى يراجع الطبيب.\n" +
-          "مهم: بدون تشخيص أو علاج.";
+      // إذا ما فيه نص واضح: اعتبرها أشعة/حالة
+      if (!extracted || extracted.trim().length < 10) {
+        const hint = redactPII(
+          "تم رفع صورة طبية بدون نص واضح (قد تكون أشعة أو جرح/جلد/بول).\n" +
+            "اشرح للمريض بشكل عام وآمن: ما الذي تعنيه عادةً هذه الصور؟ ومتى يراجع الطبيب؟\n" +
+            "بدون تشخيص أو أدوية."
+        );
 
-        const reply = await askAssistant(hint, sessionId, "attachment");
-        return res.json({ reply });
+        const messages = [
+          { role: "system", content: buildSystemPromptImageNoText() },
+          { role: "user", content: hint },
+        ];
+
+        let reply = await callGroq(messages, { temperature: 0.3, max_tokens: 700 });
+        reply = await sanitizeReply(reply);
+        return res.json({ reply: reply || "وصلت الصورة، لكن لا أستطيع تأكيد شيء طبي منها بدون تقرير مكتوب." });
       }
 
-      // صورة فيها نص (تحاليل/تقرير مصور)
-      const prompt = redactPII(`المرفق صورة تقرير/تحاليل.\nالنص:\n${extracted}`);
-      const reply = await askAssistant(prompt, sessionId, "attachment");
+      // قص لتقليل التوكنز
+      extracted = extracted.slice(0, MAX_OCR_CHARS);
+
+      const reportText = redactPII(`نص التقرير:\n${extracted}`);
+      const reply = await askHealthAssistantReport(reportText, sessionId);
       return res.json({ reply });
     }
 
     return res.status(415).json({ reply: "نوع الملف غير مدعوم. ارفع PDF أو صورة." });
   } catch (err) {
     console.error("❌ Error in /report:", err);
-    res.status(500).json({ reply: "حدث خطأ أثناء قراءة المرفق. جرّب ملفًا آخر." });
+    res.status(500).json({ reply: "حدث خطأ أثناء قراءة المرفق. جرّب ملفًا آخر أو صورة أوضح." });
   }
 });
 
+// ===============================
+// تشغيل الخادم
+// ===============================
 app.listen(PORT, () => {
   console.log(`🚀 الخادم يعمل على البورت ${PORT} — النموذج: ${MODEL_ID}`);
 });
-
-

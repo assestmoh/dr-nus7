@@ -1,5 +1,6 @@
 // ===============================
 // server.js — شات "نفس القديم" + تقرير/مرفقات (PDF/صورة) بأسلوب مفهوم للمريض
+// + Timeout 90s للـ /report
 // ===============================
 
 import "dotenv/config";
@@ -15,21 +16,31 @@ import { createRequire } from "node:module";
 
 const require = createRequire(import.meta.url);
 
-// ✅ pdf-parse قد يرجع default أو module object حسب البيئة
+// ✅ pdf-parse قد يطلع بأكثر من شكل حسب البيئة
 const pdfParseModule = require("pdf-parse");
-const pdfParse = pdfParseModule.default || pdfParseModule;
+const pdfParse =
+  pdfParseModule?.default ||
+  pdfParseModule?.pdfParse ||
+  pdfParseModule;
 
 const app = express();
 
-// متغيرات البيئة
+// ===============================
+// ENV
+// ===============================
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
 const MODEL_ID = process.env.GROQ_MODEL || "openai/gpt-oss-120b";
 const PORT = process.env.PORT || 3000;
 
-// حدود
+// Limits
 const JSON_LIMIT = process.env.JSON_LIMIT || "8mb";
 const FILE_LIMIT_BYTES = Number(process.env.FILE_LIMIT_BYTES || 8 * 1024 * 1024);
-const MAX_OCR_CHARS = Number(process.env.MAX_OCR_CHARS || 2500); // لتقليل التوكنز
+const MAX_OCR_CHARS = Number(process.env.MAX_OCR_CHARS || 2500);
+
+// Timeouts (✅ المطلوب: 90 ثانية)
+const CHAT_TIMEOUT_MS = Number(process.env.CHAT_TIMEOUT_MS || 20000);
+const REPORT_TIMEOUT_MS = Number(process.env.REPORT_TIMEOUT_MS || 90000);
+const SANITIZE_TIMEOUT_MS = Number(process.env.SANITIZE_TIMEOUT_MS || 20000);
 
 if (!GROQ_API_KEY) {
   console.error("❌ GROQ_API_KEY غير مضبوط");
@@ -39,20 +50,31 @@ if (!GROQ_API_KEY) {
 app.use(cors());
 app.use(bodyParser.json({ limit: JSON_LIMIT }));
 
-// رفع ملفات (صورة/PDF) - على الذاكرة بدون تخزين
+// Upload (memory)
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: FILE_LIMIT_BYTES },
 });
 
-// ذاكرة محادثة لكل مستخدم
+// Conversations (chat only)
 const conversations = {};
+
+// ===============================
+// 0) fetchWithTimeout
+// ===============================
+async function fetchWithTimeout(url, options = {}, ms = 20000) {
+  const controller = new AbortController();
+  const id = setTimeout(() => controller.abort(), ms);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } finally {
+    clearTimeout(id);
+  }
+}
 
 // ===============================
 // 1) Prompts
 // ===============================
-
-// ✅ هذا نفس روح أسلوبك القديم (اللي تقولين كان حلو)
 function buildSystemPromptChat() {
   return `
 أنت مساعد صحي للتثقيف الصحي فقط.
@@ -65,7 +87,6 @@ function buildSystemPromptChat() {
 `.trim();
 }
 
-// ✅ تقرير/تحاليل: شرح مفهوم للمريض + يشرح كل فحص بطريقة سهلة
 function buildSystemPromptReport() {
   return `
 أنت مساعد صحي للتثقيف فقط.
@@ -84,7 +105,6 @@ function buildSystemPromptReport() {
 `.trim();
 }
 
-// ✅ في حالة صور بلا نص (أشعة/جرح): شرح عام آمن
 function buildSystemPromptImageNoText() {
   return `
 أنت مساعد صحي للتثقيف فقط.
@@ -100,7 +120,7 @@ function buildSystemPromptImageNoText() {
 }
 
 // ===============================
-// 2) فلترة خفيفة جدًا لمنع الهلوسات (أكل/شرب أشياء غريبة)
+// 2) Safety filter (non-food)
 // ===============================
 const NON_FOOD_KEYWORDS = ["بنزين", "زجاج", "بلاستيك", "مادة تنظيف", "منظفات", "مبيض", "فولاذ"];
 const EAT_DRINK_VERBS = ["تناول", "أكل", "اشرب", "شرب"];
@@ -120,26 +140,29 @@ async function sanitizeReply(originalReply) {
   if (!hasNonFoodConsumption(originalReply)) return originalReply;
 
   try {
-    const response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${GROQ_API_KEY}`,
-        "Content-Type": "application/json",
+    const response = await fetchWithTimeout(
+      "https://api.groq.com/openai/v1/chat/completions",
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${GROQ_API_KEY}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          model: MODEL_ID,
+          temperature: 0.3,
+          max_tokens: 500,
+          messages: [
+            {
+              role: "system",
+              content: "أنت محرر نص صحي. احذف أي اقتراح لتناول/شرب مواد غير صالحة للاستهلاك، وقدّم بديلًا صحيًا عامًا مختصرًا.",
+            },
+            { role: "user", content: originalReply },
+          ],
+        }),
       },
-      body: JSON.stringify({
-        model: MODEL_ID,
-        temperature: 0.3,
-        max_tokens: 500,
-        messages: [
-          {
-            role: "system",
-            content:
-              "أنت محرر نص صحي. احذف أي اقتراح لتناول/شرب مواد غير صالحة للاستهلاك، وقدّم بديلًا صحيًا عامًا مختصرًا.",
-          },
-          { role: "user", content: originalReply },
-        ],
-      }),
-    });
+      SANITIZE_TIMEOUT_MS
+    );
 
     if (!response.ok) {
       console.error("❌ sanitizeReply API error:", await response.text());
@@ -156,7 +179,7 @@ async function sanitizeReply(originalReply) {
 }
 
 // ===============================
-// 3) فلتر الألفاظ غير المناسبة
+// 3) Blocked words
 // ===============================
 const BLOCKED_WORDS = [
   "زب","قضيب","كس","طيز","عير","مني","فرج","شهوة","قذف","احتلام",
@@ -168,14 +191,14 @@ function hasBlockedWords(text) {
 }
 
 // ===============================
-// 4) كلمات تدل على خطورة
+// 4) Danger words
 // ===============================
 const DANGER_WORDS = [
   "ألم صدر","ألم في الصدر","ضيق نفس","صعوبة في التنفس","فقدان وعي","اغمي","إغماء","نزيف","تشنج","صداع شديد","سكتة","جلطة",
 ];
 
 // ===============================
-// 5) تعديل سلوك "كمل"
+// 5) Continue rewriting
 // ===============================
 const CONTINUE_WORDS = ["كمل", "كمّل", "أكمل", "تابع", "كملي"];
 function rewriteContinueWord(message) {
@@ -187,7 +210,7 @@ function rewriteContinueWord(message) {
 }
 
 // ===============================
-// 6) تنقيح بيانات حساسة (بسيط)
+// 6) Redact PII
 // ===============================
 function redactPII(text) {
   let t = String(text || "");
@@ -197,22 +220,26 @@ function redactPII(text) {
 }
 
 // ===============================
-// 7) استدعاء Groq
+// 7) Groq call (with timeout)
 // ===============================
-async function callGroq(messages, { temperature = 0.4, max_tokens = 1200 } = {}) {
-  const response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${GROQ_API_KEY}`,
-      "Content-Type": "application/json",
+async function callGroq(messages, { temperature = 0.4, max_tokens = 1200, timeoutMs = CHAT_TIMEOUT_MS } = {}) {
+  const response = await fetchWithTimeout(
+    "https://api.groq.com/openai/v1/chat/completions",
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${GROQ_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: MODEL_ID,
+        temperature,
+        max_tokens,
+        messages,
+      }),
     },
-    body: JSON.stringify({
-      model: MODEL_ID,
-      temperature,
-      max_tokens,
-      messages,
-    }),
-  });
+    timeoutMs
+  );
 
   if (!response.ok) {
     console.error("❌ Groq API error:", await response.text());
@@ -224,7 +251,7 @@ async function callGroq(messages, { temperature = 0.4, max_tokens = 1200 } = {})
 }
 
 // ===============================
-// 8) شات (نفس القديم)
+// 8) Chat (old style)
 // ===============================
 async function askHealthAssistantChat(userMessage, sessionId) {
   if (!conversations[sessionId]) conversations[sessionId] = [];
@@ -233,7 +260,7 @@ async function askHealthAssistantChat(userMessage, sessionId) {
   if (conversations[sessionId].length > 6) conversations[sessionId] = conversations[sessionId].slice(-6);
 
   const messages = [{ role: "system", content: buildSystemPromptChat() }, ...conversations[sessionId]];
-  let reply = await callGroq(messages, { temperature: 0.4, max_tokens: 1200 });
+  let reply = await callGroq(messages, { temperature: 0.4, max_tokens: 1200, timeoutMs: CHAT_TIMEOUT_MS });
 
   reply = await sanitizeReply(reply);
   if (!reply) reply = "لا تتوفر لدي معلومات كافية. يُفضّل استشارة مقدم رعاية صحية.";
@@ -243,32 +270,45 @@ async function askHealthAssistantChat(userMessage, sessionId) {
 }
 
 // ===============================
-// 9) تقرير/مرفقات
+// 9) Report (separate from chat history)
 // ===============================
 async function askHealthAssistantReport(reportText, sessionId) {
-  if (!conversations[sessionId]) conversations[sessionId] = [];
-
-  // نخلي التقرير خارج “محادثة الشات” حتى ما يخرب أسلوب الشات
   const messages = [
     { role: "system", content: buildSystemPromptReport() },
     { role: "user", content: reportText },
   ];
 
-  let reply = await callGroq(messages, { temperature: 0.25, max_tokens: 900 });
+  let reply = await callGroq(messages, {
+    temperature: 0.25,
+    max_tokens: 900,
+    timeoutMs: REPORT_TIMEOUT_MS, // ✅ 90s
+  });
+
   reply = await sanitizeReply(reply);
   return reply || "لم أستطع استخراج شرح واضح من التقرير. جرّب صورة أوضح أو تقرير آخر.";
 }
 
 // ===============================
-// 10) OCR / PDF
+// 10) OCR / PDF helpers
 // ===============================
 async function ocrImageBufferToText(buf) {
-  const pre = await sharp(buf).grayscale().normalize().toBuffer();
-  const { data } = await Tesseract.recognize(pre, "ara+eng");
-  return (data?.text || "").trim();
+  try {
+    // محاولة تحسين الصورة (قد تفشل مع HEIC)
+    const pre = await sharp(buf).grayscale().normalize().toBuffer();
+    const { data } = await Tesseract.recognize(pre, "ara+eng");
+    return (data?.text || "").trim();
+  } catch (e) {
+    // fallback: OCR مباشر بدون sharp
+    const { data } = await Tesseract.recognize(buf, "ara+eng");
+    return (data?.text || "").trim();
+  }
 }
 
 async function extractTextFromPdfBuffer(buf) {
+  if (typeof pdfParse !== "function") {
+    // عشان ما تتكرر لك pdfParse is not a function بدون تفسير
+    throw new Error("pdf-parse import is not a function in this environment");
+  }
   const data = await pdfParse(buf);
   return (data?.text || "").trim();
 }
@@ -313,7 +353,7 @@ app.post("/chat", async (req, res) => {
   }
 });
 
-// ✅ زر المرفق: PDF/صورة
+// ✅ PDF/صورة
 app.post("/report", upload.single("file"), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ reply: "لم يصلني ملف." });
@@ -332,29 +372,26 @@ app.post("/report", upload.single("file"), async (req, res) => {
 
       if (!extracted || extracted.length < 30) {
         return res.status(400).json({
-          reply:
-            "هذا الـ PDF غالبًا ممسوح (Scan) وما فيه نص قابل للقراءة.\nارفع صورة واضحة لصفحة التقرير أو أرفق التقرير المكتوب.",
+          reply: "هذا الـ PDF غالبًا ممسوح (Scan) وما فيه نص قابل للقراءة.\nارفع صورة واضحة لصفحة التقرير أو أرفق التقرير المكتوب.",
         });
       }
 
-      // قص لتقليل التوكنز
       extracted = extracted.slice(0, MAX_OCR_CHARS);
-
       const reportText = redactPII(`نص التقرير:\n${extracted}`);
       const reply = await askHealthAssistantReport(reportText, sessionId);
       return res.json({ reply });
     }
 
-    // صورة
+    // Image
     if (mime.startsWith("image/")) {
       let extracted = await ocrImageBufferToText(buf);
 
-      // إذا ما فيه نص واضح: اعتبرها أشعة/حالة
+      // إذا ما فيه نص واضح: أشعة/حالة بدون نص
       if (!extracted || extracted.trim().length < 10) {
         const hint = redactPII(
           "تم رفع صورة طبية بدون نص واضح (قد تكون أشعة أو جرح/جلد/بول).\n" +
-            "اشرح للمريض بشكل عام وآمن: ما الذي تعنيه عادةً هذه الصور؟ ومتى يراجع الطبيب؟\n" +
-            "بدون تشخيص أو أدوية."
+          "اشرح للمريض بشكل عام وآمن: ما الذي تعنيه عادةً هذه الصور؟ ومتى يراجع الطبيب؟\n" +
+          "بدون تشخيص أو أدوية."
         );
 
         const messages = [
@@ -362,14 +399,19 @@ app.post("/report", upload.single("file"), async (req, res) => {
           { role: "user", content: hint },
         ];
 
-        let reply = await callGroq(messages, { temperature: 0.3, max_tokens: 700 });
+        let reply = await callGroq(messages, {
+          temperature: 0.3,
+          max_tokens: 700,
+          timeoutMs: REPORT_TIMEOUT_MS, // ✅ 90s
+        });
+
         reply = await sanitizeReply(reply);
-        return res.json({ reply: reply || "وصلت الصورة، لكن لا أستطيع تأكيد شيء طبي منها بدون تقرير مكتوب." });
+        return res.json({
+          reply: reply || "وصلت الصورة، لكن لا أستطيع تأكيد شيء طبي منها بدون تقرير مكتوب.",
+        });
       }
 
-      // قص لتقليل التوكنز
       extracted = extracted.slice(0, MAX_OCR_CHARS);
-
       const reportText = redactPII(`نص التقرير:\n${extracted}`);
       const reply = await askHealthAssistantReport(reportText, sessionId);
       return res.json({ reply });
@@ -383,7 +425,7 @@ app.post("/report", upload.single("file"), async (req, res) => {
 });
 
 // ===============================
-// تشغيل الخادم
+// Start server
 // ===============================
 app.listen(PORT, () => {
   console.log(`🚀 الخادم يعمل على البورت ${PORT} — النموذج: ${MODEL_ID}`);

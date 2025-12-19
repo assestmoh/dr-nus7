@@ -280,7 +280,7 @@ async function askHealthAssistantReport(reportText, sessionId) {
 
   let reply = await callGroq(messages, {
     temperature: 0.25,
-    max_tokens: 900,
+    max_tokens: 1200,
     timeoutMs: REPORT_TIMEOUT_MS, // ✅ 90s
   });
 

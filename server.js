@@ -1,3 +1,7 @@
+// ===============================
+// server.js — Dalil Alafiyah API
+// ===============================
+
 import "dotenv/config";
 import express from "express";
 import cors from "cors";
@@ -7,6 +11,9 @@ import helmet from "helmet";
 
 const app = express();
 
+// ===============================
+// ENV
+// ===============================
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
 const MODEL_ID = process.env.GROQ_MODEL || "openai/gpt-oss-120b";
 const PORT = process.env.PORT || 3000;
@@ -50,13 +57,13 @@ const sArr = (v, n) =>
   Array.isArray(v) ? v.filter(x => typeof x === "string" && x.trim()).slice(0, n) : [];
 
 // ===============================
-// System Prompt (مختلف جذريًا)
+// System Prompt
 // ===============================
 function buildSystemPrompt() {
   return `
 أنت "دليل العافية" — مرافق صحي عربي للتثقيف الصحي فقط.
 
-❗ أخرج الرد بصيغة JSON فقط، بدون أي شرح خارجها:
+أخرج الرد بصيغة JSON فقط وبدون أي نص خارجها:
 
 {
   "category": "general | sugar | blood_pressure | nutrition | sleep | activity | mental | first_aid | report | emergency",
@@ -68,12 +75,12 @@ function buildSystemPrompt() {
   "when_to_seek_help": "متى تراجع الطبيب أو الطوارئ (أو \"\")"
 }
 
-قواعد صارمة:
+قواعد:
 - لا تشخيص
 - لا أدوية
 - لا جرعات
-- السؤال والأزرار تأتي قبل النصائح
-- اختصر قدر الإمكان
+- السؤال والأزرار قبل النصائح
+- لغة بسيطة
 `.trim();
 }
 
@@ -121,7 +128,7 @@ function fallback(text) {
   return {
     category: "general",
     title: "معلومة صحية",
-    verdict: sStr(text) || "لا تتوفر لدي معلومات كافية.",
+    verdict: sStr(text) || "لا تتوفر معلومات كافية.",
     next_question: "",
     quick_choices: [],
     tips: [],
@@ -132,6 +139,10 @@ function fallback(text) {
 // ===============================
 // Routes
 // ===============================
+app.get("/", (_req, res) => {
+  res.json({ ok: true, service: "Dalil Alafiyah API" });
+});
+
 app.post("/chat", async (req, res) => {
   try {
     const msg = String(req.body.message || "").trim();
@@ -153,11 +164,11 @@ app.post("/chat", async (req, res) => {
     res.status(500).json({
       ok: false,
       error: "server_error",
-      data: fallback("حدث خطأ غير متوقع. إذا في أعراض مقلقة راجع الطبيب."),
+      data: fallback("حدث خطأ غير متوقع. راجع الطبيب إذا الأعراض مقلقة."),
     });
   }
 });
 
 app.listen(PORT, () => {
-  console.log(`🚀 دليل العافية يعمل على ${PORT}`);
+  console.log(`🚀 Dalil Alafiyah API يعمل على ${PORT}`);
 });

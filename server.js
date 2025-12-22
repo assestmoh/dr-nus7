@@ -1,7 +1,3 @@
-// ===============================
-// server.js — دليل العافية (Structured JSON API)
-// ===============================
-
 import "dotenv/config";
 import express from "express";
 import cors from "cors";
@@ -11,9 +7,6 @@ import helmet from "helmet";
 
 const app = express();
 
-// ===============================
-// ENV
-// ===============================
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
 const MODEL_ID = process.env.GROQ_MODEL || "openai/gpt-oss-120b";
 const PORT = process.env.PORT || 3000;
@@ -52,34 +45,25 @@ function extractJson(text) {
   }
 }
 
-function safeStr(v) {
-  return typeof v === "string" ? v.trim() : "";
-}
-function safeArr(v, max = 4) {
-  return Array.isArray(v)
-    ? v.filter(x => typeof x === "string" && x.trim()).slice(0, max)
-    : [];
-}
+const sStr = (v) => (typeof v === "string" ? v.trim() : "");
+const sArr = (v, n) =>
+  Array.isArray(v) ? v.filter(x => typeof x === "string" && x.trim()).slice(0, n) : [];
 
 // ===============================
-// Prompt (الفرق الجوهري عن ChatGPT)
+// System Prompt (مختلف جذريًا)
 // ===============================
 function buildSystemPrompt() {
   return `
-أنت "دليل العافية" — مرافق صحي عربي للتثقيف فقط (لست طبيبًا).
+أنت "دليل العافية" — مرافق صحي عربي للتثقيف الصحي فقط.
 
-هدفك:
-- توجيه المستخدم بخطوات قصيرة
-- حكم سريع + سؤال متابعة واحد
-- لا محاضرات ولا تشخيص ولا أدوية
-
-❗ أخرج الرد بصيغة JSON فقط وبدون أي نص خارجها:
+❗ أخرج الرد بصيغة JSON فقط، بدون أي شرح خارجها:
 
 {
+  "category": "general | sugar | blood_pressure | nutrition | sleep | activity | mental | first_aid | report | emergency",
   "title": "عنوان قصير (2-5 كلمات)",
   "verdict": "جملة واحدة: تطمين أو تنبيه",
   "next_question": "سؤال واحد فقط (أو \"\")",
-  "quick_choices": ["خيار 1","خيار 2","خيار 3"],
+  "quick_choices": ["خيار 1","خيار 2"],
   "tips": ["نصيحة قصيرة 1","نصيحة قصيرة 2"],
   "when_to_seek_help": "متى تراجع الطبيب أو الطوارئ (أو \"\")"
 }
@@ -88,13 +72,13 @@ function buildSystemPrompt() {
 - لا تشخيص
 - لا أدوية
 - لا جرعات
-- لا تتجاوز 2 نصائح
-- لغة بسيطة قريبة من الناس
+- السؤال والأزرار تأتي قبل النصائح
+- اختصر قدر الإمكان
 `.trim();
 }
 
 // ===============================
-// Groq Call
+// Groq
 // ===============================
 async function callGroq(messages) {
   const res = await fetchWithTimeout(
@@ -108,38 +92,36 @@ async function callGroq(messages) {
       body: JSON.stringify({
         model: MODEL_ID,
         temperature: 0.35,
-        max_tokens: 500,
+        max_tokens: 450,
         messages,
       }),
     }
   );
-
-  if (!res.ok) {
-    throw new Error("Groq API error");
-  }
-
+  if (!res.ok) throw new Error("Groq API error");
   const data = await res.json();
   return data.choices?.[0]?.message?.content || "";
 }
 
 // ===============================
-// Normalize Output
+// Normalize
 // ===============================
-function normalizeData(obj) {
+function normalize(obj) {
   return {
-    title: safeStr(obj?.title) || "دليل العافية",
-    verdict: safeStr(obj?.verdict),
-    next_question: safeStr(obj?.next_question),
-    quick_choices: safeArr(obj?.quick_choices, 4),
-    tips: safeArr(obj?.tips, 3),
-    when_to_seek_help: safeStr(obj?.when_to_seek_help),
+    category: sStr(obj?.category) || "general",
+    title: sStr(obj?.title) || "دليل العافية",
+    verdict: sStr(obj?.verdict),
+    next_question: sStr(obj?.next_question),
+    quick_choices: sArr(obj?.quick_choices, 3),
+    tips: sArr(obj?.tips, 2),
+    when_to_seek_help: sStr(obj?.when_to_seek_help),
   };
 }
 
-function fallbackData(text) {
+function fallback(text) {
   return {
+    category: "general",
     title: "معلومة صحية",
-    verdict: safeStr(text) || "لا تتوفر لدي معلومات كافية.",
+    verdict: sStr(text) || "لا تتوفر لدي معلومات كافية.",
     next_question: "",
     quick_choices: [],
     tips: [],
@@ -150,59 +132,32 @@ function fallbackData(text) {
 // ===============================
 // Routes
 // ===============================
-app.get("/", (_req, res) => {
-  res.json({
-    ok: true,
-    service: "Dalil Alafiyah API",
-    model: MODEL_ID,
-  });
-});
-
-// ===============================
-// /chat — Structured JSON
-// ===============================
 app.post("/chat", async (req, res) => {
   try {
-    const userMessage = String(req.body.message || "").trim();
-    if (!userMessage) {
-      return res.status(400).json({
-        ok: false,
-        error: "empty_message",
-      });
+    const msg = String(req.body.message || "").trim();
+    if (!msg) {
+      return res.status(400).json({ ok: false, error: "empty_message" });
     }
 
-    const messages = [
+    const raw = await callGroq([
       { role: "system", content: buildSystemPrompt() },
-      { role: "user", content: userMessage },
-    ];
+      { role: "user", content: msg },
+    ]);
 
-    const raw = await callGroq(messages);
     const parsed = extractJson(raw);
+    const data = parsed ? normalize(parsed) : fallback(raw);
 
-    const data = parsed
-      ? normalizeData(parsed)
-      : fallbackData(raw);
-
-    res.json({
-      ok: true,
-      data,
-    });
-
-  } catch (err) {
-    console.error("❌ /chat error:", err);
+    res.json({ ok: true, data });
+  } catch (e) {
+    console.error(e);
     res.status(500).json({
       ok: false,
       error: "server_error",
-      data: fallbackData(
-        "حدث خطأ غير متوقع. إذا عندك أعراض مقلقة، راجع الطبيب."
-      ),
+      data: fallback("حدث خطأ غير متوقع. إذا في أعراض مقلقة راجع الطبيب."),
     });
   }
 });
 
-// ===============================
-// Start
-// ===============================
 app.listen(PORT, () => {
-  console.log(`🚀 دليل العافية يعمل على البورت ${PORT}`);
+  console.log(`🚀 دليل العافية يعمل على ${PORT}`);
 });

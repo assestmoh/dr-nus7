@@ -1,13 +1,12 @@
 // ===============================
-// server.js — Dalil Alafiyah API
+// server.js — Dalil Alafiyah API (Improved)
 // ===============================
 
 import "dotenv/config";
 import express from "express";
 import cors from "cors";
-import bodyParser from "body-parser";
-import fetch from "node-fetch";
 import helmet from "helmet";
+import fetch from "node-fetch";
 
 const app = express();
 
@@ -25,7 +24,45 @@ if (!GROQ_API_KEY) {
 
 app.use(helmet());
 app.use(cors());
-app.use(bodyParser.json({ limit: "2mb" }));
+app.use(express.json({ limit: "2mb" }));
+
+// ===============================
+// Session Memory (in-memory)
+// ===============================
+const sessions = new Map();
+/**
+ * session = {
+ *   lastCard: { category,title,verdict,next_question,quick_choices,tips,when_to_seek_help },
+ *   history: [{ role:"user"|"assistant", content:string }],
+ *   updatedAt: number
+ * }
+ */
+const SESSION_TTL_MS = 1000 * 60 * 60 * 6; // 6 hours
+const MAX_HISTORY = 10;
+
+function getUserId(req, body) {
+  const h = (req.get("x-user-id") || "").trim();
+  if (h) return h;
+  const b = (body?.user_id || "").trim();
+  if (b) return b;
+  return "anon";
+}
+
+function getSession(userId) {
+  const now = Date.now();
+
+  // cleanup occasionally (cheap)
+  for (const [k, s] of sessions.entries()) {
+    if (!s?.updatedAt || now - s.updatedAt > SESSION_TTL_MS) sessions.delete(k);
+  }
+
+  if (!sessions.has(userId)) {
+    sessions.set(userId, { lastCard: null, history: [], updatedAt: now });
+  }
+  const s = sessions.get(userId);
+  s.updatedAt = now;
+  return s;
+}
 
 // ===============================
 // Helpers
@@ -40,11 +77,20 @@ async function fetchWithTimeout(url, options = {}, ms = 15000) {
   }
 }
 
+// robust JSON extraction (fallback only)
 function extractJson(text) {
-  const s = String(text || "");
+  const s = String(text || "").trim();
+
+  // If it's already valid JSON:
+  try {
+    return JSON.parse(s);
+  } catch {}
+
+  // Otherwise try slice between first { and last }
   const a = s.indexOf("{");
   const b = s.lastIndexOf("}");
   if (a === -1 || b === -1 || b <= a) return null;
+
   try {
     return JSON.parse(s.slice(a, b + 1));
   } catch {
@@ -54,34 +100,83 @@ function extractJson(text) {
 
 const sStr = (v) => (typeof v === "string" ? v.trim() : "");
 const sArr = (v, n) =>
-  Array.isArray(v) ? v.filter(x => typeof x === "string" && x.trim()).slice(0, n) : [];
+  Array.isArray(v) ? v.filter((x) => typeof x === "string" && x.trim()).slice(0, n) : [];
+
+function clampCategory(cat) {
+  const allowed = new Set([
+    "general",
+    "nutrition",
+    "sleep",
+    "activity",
+    "mental",
+    "skin",
+    "bp",
+    "sugar",
+    "firstaid",
+    "report",
+    "emergency",
+  ]);
+
+  // allow legacy categories just in case
+  if (cat === "blood_pressure") return "bp";
+  if (cat === "first_aid") return "firstaid";
+
+  return allowed.has(cat) ? cat : "general";
+}
 
 // ===============================
 // System Prompt
 // ===============================
 function buildSystemPrompt() {
   return `
-أنت "دليل العافية" — مرافق صحي عربي للتثقيف الصحي فقط.
+أنت "دليل العافية" — مساعد عربي للتثقيف الصحي فقط.
 
-أخرج الرد بصيغة JSON فقط وبدون أي نص خارجها:
+مهم جدًا:
+- أخرج "JSON فقط" بدون أي نص قبل/بعد، بدون Markdown، بدون ثلاث علامات (```).
+- لا تشخيص. لا وصف أدوية. لا جرعات.
+- اجعل الرد مرتبطًا مباشرة بسؤال المستخدم وسياقه السابق إن وُجد.
 
+صيغة الإخراج (ثابتة):
 {
-  "category": "general | sugar | blood_pressure | nutrition | sleep | activity | mental | first_aid | report | emergency",
+  "category": "general|nutrition|sleep|activity|mental|skin|bp|sugar|firstaid|report|emergency",
   "title": "عنوان قصير (2-5 كلمات)",
-  "verdict": "جملة واحدة: تطمين أو تنبيه",
-  "next_question": "سؤال واحد فقط (أو \"\")",
-  "quick_choices": ["خيار 1","خيار 2"],
+  "verdict": "جملة واحدة واضحة: تطمين/إرشاد/تنبيه",
   "tips": ["نصيحة قصيرة 1","نصيحة قصيرة 2"],
-  "when_to_seek_help": "متى تراجع الطبيب أو الطوارئ (أو \"\")"
+  "when_to_seek_help": "متى تراجع الطبيب/الطوارئ (أو \"\")",
+  "next_question": "سؤال متابعة واحد فقط (أو \"\")",
+  "quick_choices": ["خيار 1","خيار 2"]
 }
 
-قواعد:
-- لا تشخيص
-- لا أدوية
-- لا جرعات
-- الترتيب: verdict ثم tips ثم when_to_seek_help ثم next_question و quick_choices (إذا وجدت)
-- لغة بسيطة
+قواعد جودة:
+- tips: بالعادة 2 فقط (قصيرة وعملية).
+- next_question: سؤال واحد فقط. إذا ما تحتاج سؤال ضع "" واجعل quick_choices [].
+- quick_choices: 0 إلى 2 خيارات فقط، ويجب أن تكون مرتبطة بالسؤال مباشرة.
+- لا تنتقل لموضوع جديد إذا كان إدخال المستخدم قصيرًا ويبدو "إجابة" على سؤال سابق.
 `.trim();
+}
+
+// ===============================
+// Build Context Message
+// ===============================
+function buildContextMessage(session, clientContext) {
+  const last = session?.lastCard || clientContext?.last || null;
+
+  const ctx = {
+    has_last_card: !!last,
+    last_card: last
+      ? {
+          category: last.category || "",
+          title: last.title || "",
+          verdict: last.verdict || "",
+          next_question: last.next_question || "",
+          quick_choices: Array.isArray(last.quick_choices) ? last.quick_choices : [],
+        }
+      : null,
+    instruction:
+      "إذا رسالة المستخدم قصيرة (مثل نعم/لا أو اختيار من quick_choices) فاعتبرها إجابة للسؤال الأخير واستمر بنفس الموضوع.",
+  };
+
+  return JSON.stringify(ctx, null, 0);
 }
 
 // ===============================
@@ -98,13 +193,21 @@ async function callGroq(messages) {
       },
       body: JSON.stringify({
         model: MODEL_ID,
-        temperature: 0.35,
-        max_tokens: 450,
+        temperature: 0.25,
+        max_tokens: 650,
+        // JSON mode (reduces broken JSON / extra text)
+        response_format: { type: "json_object" },
         messages,
       }),
-    }
+    },
+    20000
   );
-  if (!res.ok) throw new Error("Groq API error");
+
+  if (!res.ok) {
+    const t = await res.text().catch(() => "");
+    throw new Error("Groq API error: " + res.status + " " + t);
+  }
+
   const data = await res.json();
   return data.choices?.[0]?.message?.content || "";
 }
@@ -113,26 +216,40 @@ async function callGroq(messages) {
 // Normalize
 // ===============================
 function normalize(obj) {
+  const category = clampCategory(sStr(obj?.category) || "general");
+
+  const title = sStr(obj?.title) || "دليل العافية";
+  const verdict = sStr(obj?.verdict) || "معلومة عامة للتوعية.";
+  const tips = sArr(obj?.tips, 2);
+  const when_to_seek_help = sStr(obj?.when_to_seek_help);
+
+  const next_question = sStr(obj?.next_question);
+  const quick_choices = sArr(obj?.quick_choices, 2);
+
+  // if no question, no choices
+  const fixedNextQ = next_question ? next_question : "";
+  const fixedChoices = fixedNextQ ? quick_choices : [];
+
   return {
-    category: sStr(obj?.category) || "general",
-    title: sStr(obj?.title) || "دليل العافية",
-    verdict: sStr(obj?.verdict),
-    next_question: sStr(obj?.next_question),
-    quick_choices: sArr(obj?.quick_choices, 3),
-    tips: sArr(obj?.tips, 2),
-    when_to_seek_help: sStr(obj?.when_to_seek_help),
+    category,
+    title,
+    verdict,
+    tips,
+    when_to_seek_help: when_to_seek_help || "",
+    next_question: fixedNextQ,
+    quick_choices: fixedChoices,
   };
 }
 
 function fallback(text) {
   return {
     category: "general",
-    title: "معلومة صحية",
+    title: "معلومة عامة",
     verdict: sStr(text) || "لا تتوفر معلومات كافية.",
-    next_question: "",
-    quick_choices: [],
     tips: [],
     when_to_seek_help: "",
+    next_question: "",
+    quick_choices: [],
   };
 }
 
@@ -145,18 +262,62 @@ app.get("/", (_req, res) => {
 
 app.post("/chat", async (req, res) => {
   try {
-    const msg = String(req.body.message || "").trim();
-    if (!msg) {
-      return res.status(400).json({ ok: false, error: "empty_message" });
+    const body = req.body || {};
+    const userId = getUserId(req, body);
+    const session = getSession(userId);
+
+    const msg = String(body.message || "").trim();
+    if (!msg) return res.status(400).json({ ok: false, error: "empty_message" });
+
+    const meta = body.meta || {};
+    const clientContext = body.context || null;
+
+    // merge client last card if server doesn't have it yet
+    if (!session.lastCard && clientContext?.last) session.lastCard = clientContext.last;
+
+    // if it's a choice, make it explicit to the model
+    let userContent = msg;
+    const last = session.lastCard;
+
+    const isChoice = meta?.is_choice === true;
+    if (isChoice && last?.next_question) {
+      userContent =
+        `إجابة المستخدم على السؤال السابق:\n` +
+        `السؤال: ${last.next_question}\n` +
+        `الإجابة المختارة: ${msg}\n` +
+        `الموضوع: ${last.title}\n`;
     }
 
-    const raw = await callGroq([
+    // Build messages with light history
+    const messages = [
       { role: "system", content: buildSystemPrompt() },
-      { role: "user", content: msg },
-    ]);
+      { role: "system", content: buildContextMessage(session, clientContext) },
+    ];
 
+    // append short history
+    if (Array.isArray(session.history) && session.history.length) {
+      for (const h of session.history.slice(-MAX_HISTORY)) {
+        if (h?.role && typeof h.content === "string") messages.push(h);
+      }
+    }
+
+    messages.push({ role: "user", content: userContent });
+
+    const raw = await callGroq(messages);
+
+    // parse
     const parsed = extractJson(raw);
     const data = parsed ? normalize(parsed) : fallback(raw);
+
+    // update session memory
+    session.lastCard = data;
+
+    session.history.push({ role: "user", content: userContent });
+    session.history.push({ role: "assistant", content: JSON.stringify(data) });
+
+    if (session.history.length > MAX_HISTORY) {
+      session.history = session.history.slice(-MAX_HISTORY);
+    }
 
     res.json({ ok: true, data });
   } catch (e) {
@@ -164,7 +325,7 @@ app.post("/chat", async (req, res) => {
     res.status(500).json({
       ok: false,
       error: "server_error",
-      data: fallback("حدث خطأ غير متوقع. راجع الطبيب إذا الأعراض مقلقة."),
+      data: fallback("حدث خطأ غير متوقع. إذا الأعراض مقلقة راجع الطبيب."),
     });
   }
 });

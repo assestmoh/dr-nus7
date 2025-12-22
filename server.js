@@ -1,5 +1,5 @@
 // ===============================
-// server.js — Dalil Alafiyah API (Improved)
+// server.js — Dalil Alafiyah API (Fixed + Contextual)
 // ===============================
 
 import "dotenv/config";
@@ -32,7 +32,7 @@ app.use(express.json({ limit: "2mb" }));
 const sessions = new Map();
 /**
  * session = {
- *   lastCard: { category,title,verdict,next_question,quick_choices,tips,when_to_seek_help },
+ *   lastCard: { category,title,verdict,tips,when_to_seek_help,next_question,quick_choices },
  *   history: [{ role:"user"|"assistant", content:string }],
  *   updatedAt: number
  * }
@@ -51,7 +51,7 @@ function getUserId(req, body) {
 function getSession(userId) {
   const now = Date.now();
 
-  // cleanup occasionally (cheap)
+  // cleanup (cheap)
   for (const [k, s] of sessions.entries()) {
     if (!s?.updatedAt || now - s.updatedAt > SESSION_TTL_MS) sessions.delete(k);
   }
@@ -67,7 +67,7 @@ function getSession(userId) {
 // ===============================
 // Helpers
 // ===============================
-async function fetchWithTimeout(url, options = {}, ms = 15000) {
+async function fetchWithTimeout(url, options = {}, ms = 20000) {
   const controller = new AbortController();
   const id = setTimeout(() => controller.abort(), ms);
   try {
@@ -77,16 +77,16 @@ async function fetchWithTimeout(url, options = {}, ms = 15000) {
   }
 }
 
-// robust JSON extraction (fallback only)
+// robust JSON extraction fallback
 function extractJson(text) {
   const s = String(text || "").trim();
 
-  // If it's already valid JSON:
+  // direct parse
   try {
     return JSON.parse(s);
   } catch {}
 
-  // Otherwise try slice between first { and last }
+  // slice between first { and last }
   const a = s.indexOf("{");
   const b = s.lastIndexOf("}");
   if (a === -1 || b === -1 || b <= a) return null;
@@ -117,11 +117,26 @@ function clampCategory(cat) {
     "emergency",
   ]);
 
-  // allow legacy categories just in case
+  // legacy mapping
   if (cat === "blood_pressure") return "bp";
   if (cat === "first_aid") return "firstaid";
 
   return allowed.has(cat) ? cat : "general";
+}
+
+function looksLikeShortAnswer(msg) {
+  const t = sStr(msg).toLowerCase();
+
+  // very short answer or single word
+  if (t.length <= 4) return true;
+
+  const yes = ["نعم", "اي", "ايه", "أيوه", "ايوه", "تمام", "ok", "yes"];
+  const no = ["لا", "مو", "مش", "لاا", "no", "مابي", "ما ابي", "ماعندي"];
+
+  if (yes.some((w) => t === w || t.includes(w))) return true;
+  if (no.some((w) => t === w || t.includes(w))) return true;
+
+  return false;
 }
 
 // ===============================
@@ -132,9 +147,10 @@ function buildSystemPrompt() {
 أنت "دليل العافية" — مساعد عربي للتثقيف الصحي فقط.
 
 مهم جدًا:
-- أخرج "JSON فقط" بدون أي نص قبل/بعد، بدون Markdown، بدون ثلاث علامات (```).
+- أخرج JSON فقط بدون أي نص قبل/بعد وبدون Markdown وبدون كتل كود.
 - لا تشخيص. لا وصف أدوية. لا جرعات.
 - اجعل الرد مرتبطًا مباشرة بسؤال المستخدم وسياقه السابق إن وُجد.
+- إذا كانت رسالة المستخدم قصيرة أو تبدو إجابة (مثل نعم/لا أو اختيار)، اعتبرها إجابة للسؤال الأخير ولا تغيّر الموضوع.
 
 صيغة الإخراج (ثابتة):
 {
@@ -142,22 +158,19 @@ function buildSystemPrompt() {
   "title": "عنوان قصير (2-5 كلمات)",
   "verdict": "جملة واحدة واضحة: تطمين/إرشاد/تنبيه",
   "tips": ["نصيحة قصيرة 1","نصيحة قصيرة 2"],
-  "when_to_seek_help": "متى تراجع الطبيب/الطوارئ (أو \"\")",
-  "next_question": "سؤال متابعة واحد فقط (أو \"\")",
+  "when_to_seek_help": "متى تراجع الطبيب/الطوارئ (أو \\"\\" )",
+  "next_question": "سؤال متابعة واحد فقط (أو \\"\\" )",
   "quick_choices": ["خيار 1","خيار 2"]
 }
 
 قواعد جودة:
-- tips: بالعادة 2 فقط (قصيرة وعملية).
+- tips: غالبًا 2 فقط، قصيرة وعملية.
 - next_question: سؤال واحد فقط. إذا ما تحتاج سؤال ضع "" واجعل quick_choices [].
 - quick_choices: 0 إلى 2 خيارات فقط، ويجب أن تكون مرتبطة بالسؤال مباشرة.
-- لا تنتقل لموضوع جديد إذا كان إدخال المستخدم قصيرًا ويبدو "إجابة" على سؤال سابق.
+- لا تبدأ موضوع جديد إذا كان إدخال المستخدم إجابة على سؤال سابق.
 `.trim();
 }
 
-// ===============================
-// Build Context Message
-// ===============================
 function buildContextMessage(session, clientContext) {
   const last = session?.lastCard || clientContext?.last || null;
 
@@ -173,10 +186,10 @@ function buildContextMessage(session, clientContext) {
         }
       : null,
     instruction:
-      "إذا رسالة المستخدم قصيرة (مثل نعم/لا أو اختيار من quick_choices) فاعتبرها إجابة للسؤال الأخير واستمر بنفس الموضوع.",
+      "إذا رسالة المستخدم قصيرة أو تبدو اختيارًا/نعم-لا، اعتبرها إجابة للسؤال الأخير وواصل بنفس الموضوع.",
   };
 
-  return JSON.stringify(ctx, null, 0);
+  return JSON.stringify(ctx);
 }
 
 // ===============================
@@ -195,12 +208,11 @@ async function callGroq(messages) {
         model: MODEL_ID,
         temperature: 0.25,
         max_tokens: 650,
-        // JSON mode (reduces broken JSON / extra text)
-        response_format: { type: "json_object" },
+        response_format: { type: "json_object" }, // important
         messages,
       }),
     },
-    20000
+    25000
   );
 
   if (!res.ok) {
@@ -221,23 +233,19 @@ function normalize(obj) {
   const title = sStr(obj?.title) || "دليل العافية";
   const verdict = sStr(obj?.verdict) || "معلومة عامة للتوعية.";
   const tips = sArr(obj?.tips, 2);
-  const when_to_seek_help = sStr(obj?.when_to_seek_help);
+  const when_to_seek_help = sStr(obj?.when_to_seek_help) || "";
 
-  const next_question = sStr(obj?.next_question);
+  const next_question = sStr(obj?.next_question) || "";
   const quick_choices = sArr(obj?.quick_choices, 2);
-
-  // if no question, no choices
-  const fixedNextQ = next_question ? next_question : "";
-  const fixedChoices = fixedNextQ ? quick_choices : [];
 
   return {
     category,
     title,
     verdict,
     tips,
-    when_to_seek_help: when_to_seek_help || "",
-    next_question: fixedNextQ,
-    quick_choices: fixedChoices,
+    when_to_seek_help,
+    next_question,
+    quick_choices: next_question ? quick_choices : [],
   };
 }
 
@@ -272,29 +280,32 @@ app.post("/chat", async (req, res) => {
     const meta = body.meta || {};
     const clientContext = body.context || null;
 
-    // merge client last card if server doesn't have it yet
+    // if server doesn't have last card, take it from client
     if (!session.lastCard && clientContext?.last) session.lastCard = clientContext.last;
 
-    // if it's a choice, make it explicit to the model
-    let userContent = msg;
     const last = session.lastCard;
 
+    // Detect choice/short-answer even if client didn't send meta.is_choice
     const isChoice = meta?.is_choice === true;
-    if (isChoice && last?.next_question) {
+    const autoShort = looksLikeShortAnswer(msg);
+
+    let userContent = msg;
+
+    if ((isChoice || autoShort) && last?.next_question) {
       userContent =
         `إجابة المستخدم على السؤال السابق:\n` +
         `السؤال: ${last.next_question}\n` +
-        `الإجابة المختارة: ${msg}\n` +
-        `الموضوع: ${last.title}\n`;
+        `الإجابة: ${msg}\n` +
+        `الموضوع الحالي: ${last.title}\n` +
+        `تابع بنفس الموضوع وقدّم نصائح/توضيح ثم سؤال متابعة واحد فقط إذا يلزم.\n`;
     }
 
-    // Build messages with light history
     const messages = [
       { role: "system", content: buildSystemPrompt() },
       { role: "system", content: buildContextMessage(session, clientContext) },
     ];
 
-    // append short history
+    // short history
     if (Array.isArray(session.history) && session.history.length) {
       for (const h of session.history.slice(-MAX_HISTORY)) {
         if (h?.role && typeof h.content === "string") messages.push(h);
@@ -305,11 +316,10 @@ app.post("/chat", async (req, res) => {
 
     const raw = await callGroq(messages);
 
-    // parse
     const parsed = extractJson(raw);
     const data = parsed ? normalize(parsed) : fallback(raw);
 
-    // update session memory
+    // update session
     session.lastCard = data;
 
     session.history.push({ role: "user", content: userContent });

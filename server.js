@@ -1,6 +1,6 @@
-// =====================================
-// server.js — Dalil Alafiyah API (Chat + Report)
-// =====================================
+// ===============================
+// server.js — Dalil Alafiyah API (Final)
+// ===============================
 
 import "dotenv/config";
 import express from "express";
@@ -9,6 +9,8 @@ import helmet from "helmet";
 import fetch from "node-fetch";
 import multer from "multer";
 import pdfParse from "pdf-parse";
+import sharp from "sharp";
+import { createWorker } from "tesseract.js";
 
 const app = express();
 
@@ -29,19 +31,18 @@ app.use(cors());
 app.use(express.json({ limit: "2mb" }));
 
 // ===============================
-// Upload (memory)
-// ===============================
-const upload = multer({
-  storage: multer.memoryStorage(),
-  limits: { fileSize: 8 * 1024 * 1024 }, // 8MB
-});
-
-// ===============================
 // Session Memory (in-memory)
 // ===============================
 const sessions = new Map();
+/**
+ * session = {
+ *   lastCard: { category,title,verdict,tips,when_to_seek_help,next_question,quick_choices },
+ *   history: [{ role:"user"|"assistant", content:string }],
+ *   updatedAt: number
+ * }
+ */
 const SESSION_TTL_MS = 1000 * 60 * 60 * 6; // 6 hours
-const MAX_HISTORY = 10;
+const MAX_HISTORY = 8;
 
 function getUserId(req, body) {
   const h = (req.get("x-user-id") || "").trim();
@@ -53,9 +54,12 @@ function getUserId(req, body) {
 
 function getSession(userId) {
   const now = Date.now();
+
+  // cleanup occasionally (cheap)
   for (const [k, s] of sessions.entries()) {
     if (!s?.updatedAt || now - s.updatedAt > SESSION_TTL_MS) sessions.delete(k);
   }
+
   if (!sessions.has(userId)) {
     sessions.set(userId, { lastCard: null, history: [], updatedAt: now });
   }
@@ -67,7 +71,9 @@ function getSession(userId) {
 // ===============================
 // Helpers
 // ===============================
-async function fetchWithTimeout(url, options = {}, ms = 25000) {
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+async function fetchWithTimeout(url, options = {}, ms = 20000) {
   const controller = new AbortController();
   const id = setTimeout(() => controller.abort(), ms);
   try {
@@ -79,11 +85,22 @@ async function fetchWithTimeout(url, options = {}, ms = 25000) {
 
 function extractJson(text) {
   const s = String(text || "").trim();
-  try { return JSON.parse(s); } catch {}
+
+  // If it's already valid JSON:
+  try {
+    return JSON.parse(s);
+  } catch {}
+
+  // Otherwise try slice between first { and last }
   const a = s.indexOf("{");
   const b = s.lastIndexOf("}");
   if (a === -1 || b === -1 || b <= a) return null;
-  try { return JSON.parse(s.slice(a, b + 1)); } catch { return null; }
+
+  try {
+    return JSON.parse(s.slice(a, b + 1));
+  } catch {
+    return null;
+  }
 }
 
 const sStr = (v) => (typeof v === "string" ? v.trim() : "");
@@ -92,28 +109,93 @@ const sArr = (v, n) =>
 
 function clampCategory(cat) {
   const allowed = new Set([
-    "general","nutrition","sleep","activity","mental","skin","bp","sugar","firstaid","report","emergency",
+    "general",
+    "mental",
+    "bp",
+    "sugar",
+    "bmi",
+    "water",
+    "calories",
+    "report",
+    "emergency",
   ]);
+
+  // legacy
   if (cat === "blood_pressure") return "bp";
-  if (cat === "first_aid") return "firstaid";
+
   return allowed.has(cat) ? cat : "general";
 }
 
+function normalize(obj) {
+  const category = clampCategory(sStr(obj?.category) || "general");
+  const title = sStr(obj?.title) || "دليل العافية";
+  const verdict = sStr(obj?.verdict) || "معلومة عامة للتوعية.";
+  const tips = sArr(obj?.tips, 2);
+  const when_to_seek_help = sStr(obj?.when_to_seek_help);
+
+  const next_question = sStr(obj?.next_question);
+  const quick_choices = sArr(obj?.quick_choices, 2);
+
+  const fixedNextQ = next_question ? next_question : "";
+  const fixedChoices = fixedNextQ ? quick_choices : [];
+
+  return {
+    category,
+    title,
+    verdict,
+    tips,
+    when_to_seek_help: when_to_seek_help || "",
+    next_question: fixedNextQ,
+    quick_choices: fixedChoices,
+  };
+}
+
+function fallback(text) {
+  return {
+    category: "general",
+    title: "معلومة عامة",
+    verdict: sStr(text) || "لا تتوفر معلومات كافية.",
+    tips: [],
+    when_to_seek_help: "",
+    next_question: "",
+    quick_choices: [],
+  };
+}
+
+function isShortAnswer(msg) {
+  const m = (msg || "").trim();
+  if (!m) return false;
+  if (m.length <= 12) return true;
+  const yesNo = ["نعم", "لا", "اي", "أيوه", "ايوه", "تمام", "موافق", "ok", "yes", "no"];
+  const ml = m.toLowerCase();
+  return yesNo.some((w) => ml === w.toLowerCase());
+}
+
+function isChoiceAnswer(msg, lastCard) {
+  const m = (msg || "").trim();
+  if (!m || !lastCard?.next_question) return false;
+  const choices = Array.isArray(lastCard.quick_choices) ? lastCard.quick_choices : [];
+  if (choices.includes(m)) return true;
+  return isShortAnswer(m);
+}
+
 // ===============================
-// Prompts
+// System Prompt (NO backticks inside)
 // ===============================
-function buildSystemPromptChat() {
+function buildSystemPrompt() {
   return `
-أنت "دليل العافية" — مساعد عربي للتثقيف الصحي فقط.
+أنت "دليل العافية" — مساعد عربي للتثقيف الصحي فقط (ليس تشخيصًا ولا علاجًا).
 
 مهم جدًا:
-- أخرج JSON فقط بدون أي نص قبل/بعد، وبدون Markdown.
+- أخرج JSON فقط بدون أي نص قبل/بعد.
 - لا تشخيص. لا وصف أدوية. لا جرعات.
-- ممنوع اختراع روابط أو قول "حمّل PDF من الرابط" إذا ما فيه رابط فعلي.
+- اربط الرد مباشرة بسؤال المستخدم وسياقه السابق إن وُجد.
+- إذا كانت رسالة المستخدم تحية فقط مثل "السلام عليكم" أو "هلا": رد بتحية واطلب منه يحدد الموضوع.
+- إذا كانت رسالة المستخدم قصيرة وتبدو إجابة على سؤال سابق، اعتبرها إجابة وكمّل نفس الموضوع.
 
 صيغة الإخراج (ثابتة):
 {
-  "category": "general|nutrition|sleep|activity|mental|skin|bp|sugar|firstaid|report|emergency",
+  "category": "general|mental|bp|sugar|bmi|water|calories|report|emergency",
   "title": "عنوان قصير (2-5 كلمات)",
   "verdict": "جملة واحدة واضحة: تطمين/إرشاد/تنبيه",
   "tips": ["نصيحة قصيرة 1","نصيحة قصيرة 2"],
@@ -122,10 +204,10 @@ function buildSystemPromptChat() {
   "quick_choices": ["خيار 1","خيار 2"]
 }
 
-قواعد:
-- tips غالبًا 2 فقط.
-- next_question سؤال واحد فقط، وإذا "" اجعل quick_choices [].
-- إذا رسالة المستخدم قصيرة (نعم/لا/اختيار) اعتبرها إجابة للسؤال الأخير واستمر بنفس الموضوع.
+قواعد جودة:
+- tips: بالعادة 2 فقط (قصيرة وعملية).
+- next_question: سؤال واحد فقط. إذا لا تحتاج سؤال ضع "" واجعل quick_choices [].
+- quick_choices: 0 إلى 2 خيارات فقط، مرتبطة بالسؤال مباشرة.
 `.trim();
 }
 
@@ -142,149 +224,127 @@ function buildContextMessage(session, clientContext) {
           quick_choices: Array.isArray(last.quick_choices) ? last.quick_choices : [],
         }
       : null,
-    instruction:
-      "إذا رسالة المستخدم تبدو إجابة قصيرة (نعم/لا/اختيار)، اربطها بالسؤال الأخير ولا تغيّر الموضوع.",
   };
   return JSON.stringify(ctx);
 }
 
-function buildSystemPromptReport() {
-  return `
-أنت مساعد عربي للتثقيف الصحي.
-المستخدم أرسل نص تقرير/تحاليل (قد يكون ناقص/غير واضح).
-اكتب شرحًا مبسطًا ومنظمًا:
-
-- ابدأ بملخص سريع.
-- اذكر القيم/البنود الواضحة فقط ولا تخترع أرقام.
-- فسّر ما تعنيه النتائج بشكل عام (بدون تشخيص).
-- اذكر متى يُفضّل مراجعة الطبيب.
-- اختم بسؤال واحد لتحديد المعلومة الناقصة إن لزم.
-
-ممنوع اختراع روابط أو وصف أدوية أو جرعات.
-`.trim();
-}
-
 // ===============================
-// Groq callers
+// Groq (with small retry on 429)
 // ===============================
-async function callGroqJson(messages) {
-  const res = await fetchWithTimeout(
-    "https://api.groq.com/openai/v1/chat/completions",
-    {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${GROQ_API_KEY}`,
-        "Content-Type": "application/json",
+async function callGroq(messages) {
+  const url = "https://api.groq.com/openai/v1/chat/completions";
+
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const res = await fetchWithTimeout(
+      url,
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${GROQ_API_KEY}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          model: MODEL_ID,
+          temperature: 0.25,
+          max_tokens: 520,
+          response_format: { type: "json_object" },
+          messages,
+        }),
       },
-      body: JSON.stringify({
-        model: MODEL_ID,
-        temperature: 0.25,
-        max_tokens: 650,
-        response_format: { type: "json_object" },
-        messages,
-      }),
-    },
-    25000
-  );
+      20000
+    );
 
-  if (!res.ok) {
-    const t = await res.text().catch(() => "");
-    throw new Error("Groq API error: " + res.status + " " + t);
+    if (res.ok) {
+      const data = await res.json();
+      return data.choices?.[0]?.message?.content || "";
+    }
+
+    const body = await res.text().catch(() => "");
+    if (res.status === 429 && attempt < 2) {
+      await sleep(900 + attempt * 900);
+      continue;
+    }
+
+    throw new Error("Groq API error: " + res.status + " " + body);
   }
-  const data = await res.json();
-  return data.choices?.[0]?.message?.content || "";
-}
 
-async function callGroqText(messages) {
-  const res = await fetchWithTimeout(
-    "https://api.groq.com/openai/v1/chat/completions",
-    {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${GROQ_API_KEY}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        model: MODEL_ID,
-        temperature: 0.25,
-        max_tokens: 900,
-        messages,
-      }),
-    },
-    35000
-  );
-
-  if (!res.ok) {
-    const t = await res.text().catch(() => "");
-    throw new Error("Groq API error: " + res.status + " " + t);
-  }
-  const data = await res.json();
-  return data.choices?.[0]?.message?.content || "";
+  throw new Error("Groq API error: retries exhausted");
 }
 
 // ===============================
-// Normalize chat card
+// Report helpers (PDF/OCR)
 // ===============================
-function normalizeCard(obj) {
-  const category = clampCategory(sStr(obj?.category) || "general");
-  const title = sStr(obj?.title) || "دليل العافية";
-  const verdict = sStr(obj?.verdict) || "معلومة عامة للتوعية.";
-  const tips = sArr(obj?.tips, 2);
-  const when_to_seek_help = sStr(obj?.when_to_seek_help) || "";
-  const next_question = sStr(obj?.next_question) || "";
-  const quick_choices = sArr(obj?.quick_choices, 2);
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 8 * 1024 * 1024 } });
 
-  return {
-    category,
-    title,
-    verdict,
-    tips,
-    when_to_seek_help,
-    next_question,
-    quick_choices: next_question ? quick_choices : [],
-  };
-}
-
-function fallbackCard(text) {
-  return {
-    category: "general",
-    title: "معلومة عامة",
-    verdict: sStr(text) || "لا تتوفر معلومات كافية.",
-    tips: [],
-    when_to_seek_help: "",
-    next_question: "",
-    quick_choices: [],
-  };
-}
-
-// ===============================
-// Report extractors
-// ===============================
-function cleanExtractedText(t) {
-  return String(t || "")
-    .replace(/\u0000/g, "")
-    .replace(/[ \t]+\n/g, "\n")
-    .replace(/\n{3,}/g, "\n\n")
-    .trim();
-}
-
-async function ocrImageIfAvailable(buffer) {
-  // اختياري: إذا ما ثبّت tesseract.js بيرجع null بدون ما يطيح السيرفر
+async function extractTextFromPdf(buffer) {
   try {
-    const mod = await import("tesseract.js");
-    const { createWorker } = mod;
-
-    const worker = await createWorker();
-    await worker.loadLanguage("eng"); // OCR إنجليزي فقط غالبًا. (العربي يحتاج إعداد إضافي)
-    await worker.initialize("eng");
-    const { data } = await worker.recognize(buffer);
-    await worker.terminate();
-
-    const text = cleanExtractedText(data?.text || "");
-    return text || null;
+    const out = await pdfParse(buffer);
+    return (out?.text || "").trim();
   } catch {
-    return null;
+    return "";
   }
+}
+
+async function extractTextFromImage(buffer) {
+  let img = buffer;
+  try {
+    img = await sharp(buffer)
+      .rotate()
+      .grayscale()
+      .normalize()
+      .resize({ width: 1600, withoutEnlargement: true })
+      .png()
+      .toBuffer();
+  } catch {}
+
+  const worker = await createWorker("ara+eng");
+  try {
+    const { data } = await worker.recognize(img);
+    return (data?.text || "").trim();
+  } catch {
+    return "";
+  } finally {
+    try {
+      await worker.terminate();
+    } catch {}
+  }
+}
+
+async function explainReportText(text) {
+  const prompt =
+    `أنت مساعد عربي للتثقيف الصحي فقط.\n` +
+    `اشرح نص التقرير التالي بلغة بسيطة. لا تشخيص ولا أدوية.\n` +
+    `قسّم الرد لعناوين قصيرة: (ملخص) (ماذا يعني) (نصائح عامة) (متى أراجع الطبيب).\n\n` +
+    `نص التقرير:\n${text}`;
+
+  const res = await fetchWithTimeout(
+    "https://api.groq.com/openai/v1/chat/completions",
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${GROQ_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: MODEL_ID,
+        temperature: 0.2,
+        max_tokens: 700,
+        messages: [
+          { role: "system", content: "أجب بنص عربي واضح." },
+          { role: "user", content: prompt },
+        ],
+      }),
+    },
+    45000
+  );
+
+  if (!res.ok) {
+    const t = await res.text().catch(() => "");
+    throw new Error("Groq report error: " + res.status + " " + t);
+  }
+
+  const data = await res.json();
+  return (data.choices?.[0]?.message?.content || "").trim();
 }
 
 // ===============================
@@ -294,7 +354,19 @@ app.get("/", (_req, res) => {
   res.json({ ok: true, service: "Dalil Alafiyah API" });
 });
 
-// ---------- CHAT ----------
+// ✅ Reset session (used by "مسح المحادثة")
+app.post("/reset", (req, res) => {
+  try {
+    const userId = getUserId(req, req.body || {});
+    sessions.delete(userId);
+    res.json({ ok: true });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ ok: false, error: "reset_failed" });
+  }
+});
+
+// ✅ Chat
 app.post("/chat", async (req, res) => {
   try {
     const body = req.body || {};
@@ -309,10 +381,12 @@ app.post("/chat", async (req, res) => {
 
     if (!session.lastCard && clientContext?.last) session.lastCard = clientContext.last;
 
-    let userContent = msg;
     const last = session.lastCard;
+    const treatAsAnswer =
+      meta?.force_new === true ? false : meta?.is_choice === true || isChoiceAnswer(msg, last);
 
-    if (meta?.is_choice === true && last?.next_question) {
+    let userContent = msg;
+    if (treatAsAnswer && last?.next_question) {
       userContent =
         `إجابة المستخدم على السؤال السابق:\n` +
         `السؤال: ${last.next_question}\n` +
@@ -321,7 +395,7 @@ app.post("/chat", async (req, res) => {
     }
 
     const messages = [
-      { role: "system", content: buildSystemPromptChat() },
+      { role: "system", content: buildSystemPrompt() },
       { role: "system", content: buildContextMessage(session, clientContext) },
     ];
 
@@ -333,14 +407,19 @@ app.post("/chat", async (req, res) => {
 
     messages.push({ role: "user", content: userContent });
 
-    const raw = await callGroqJson(messages);
+    const raw = await callGroq(messages);
+
     const parsed = extractJson(raw);
-    const data = parsed ? normalizeCard(parsed) : fallbackCard(raw);
+    const data = parsed ? normalize(parsed) : fallback(raw);
 
     session.lastCard = data;
+
     session.history.push({ role: "user", content: userContent });
     session.history.push({ role: "assistant", content: JSON.stringify(data) });
-    if (session.history.length > MAX_HISTORY) session.history = session.history.slice(-MAX_HISTORY);
+
+    if (session.history.length > MAX_HISTORY) {
+      session.history = session.history.slice(-MAX_HISTORY);
+    }
 
     res.json({ ok: true, data });
   } catch (e) {
@@ -348,69 +427,44 @@ app.post("/chat", async (req, res) => {
     res.status(500).json({
       ok: false,
       error: "server_error",
-      data: fallbackCard("حدث خطأ غير متوقع. إذا الأعراض مقلقة راجع الطبيب."),
+      data: fallback("حدث خطأ غير متوقع. إذا الأعراض مقلقة راجع الطبيب."),
     });
   }
 });
 
-// ---------- REPORT ----------
+// ✅ Report (file upload: PDF/image)
 app.post("/report", upload.single("file"), async (req, res) => {
   try {
     const file = req.file;
-    if (!file) {
-      return res.status(400).json({ ok: false, error: "no_file", reply: "ما وصلني ملف. جرّب مرة ثانية." });
-    }
+    if (!file) return res.status(400).json({ ok: false, reply: "لم يصلني ملف." });
 
-    const mime = String(file.mimetype || "");
-    let extracted = "";
+    const mime = (file.mimetype || "").toLowerCase();
+    let text = "";
 
     if (mime === "application/pdf") {
-      // PDF نصي (لو PDF Scan غالبًا بيطلع فاضي)
-      const parsed = await pdfParse(file.buffer);
-      extracted = cleanExtractedText(parsed?.text || "");
-      if (extracted.length < 50) {
-        return res.json({
-          ok: true,
-          reply:
-            "قرأت الـ PDF لكن ما طلع نص واضح (يبدو Scan/صورة).\n" +
-            "جرّب: 1) ارفع **صورة أوضح**، أو 2) الصق **نص النتائج** داخل المحادثة.",
-        });
-      }
+      text = await extractTextFromPdf(file.buffer);
     } else if (mime.startsWith("image/")) {
-      // صورة: OCR اختياري
-      const ocr = await ocrImageIfAvailable(file.buffer);
-      if (!ocr || ocr.length < 30) {
-        return res.json({
-          ok: true,
-          reply:
-            "وصلتني الصورة، لكن ما أقدر أستخرج النص منها الآن.\n" +
-            "الحل الأسرع: الصق **نص التقرير/النتائج** هنا، أو ارفع **PDF نصي** (غير ممسوح).",
-        });
-      }
-      extracted = ocr;
+      text = await extractTextFromImage(file.buffer);
     } else {
-      return res.status(400).json({
-        ok: false,
-        error: "unsupported_type",
-        reply: "نوع الملف غير مدعوم. ارفع صورة أو PDF فقط.",
+      return res.status(400).json({ ok: false, reply: "الملف غير مدعوم. ارفع PDF أو صورة." });
+    }
+
+    if (!text || text.length < 15) {
+      return res.json({
+        ok: true,
+        reply:
+          "ما قدرت أقرأ نص واضح من الملف.\n" +
+          "جرّب: صورة أوضح، إضاءة أفضل، وتأكد أن النص قريب وواضح.",
       });
     }
 
-    // قلّل النص عشان لا يطير التوكنز
-    if (extracted.length > 6000) extracted = extracted.slice(0, 6000);
-
-    const answer = await callGroqText([
-      { role: "system", content: buildSystemPromptReport() },
-      { role: "user", content: "نص التقرير/النتائج:\n" + extracted },
-    ]);
-
-    res.json({ ok: true, reply: String(answer || "").trim() || "ما قدرت أطلع شرح واضح. الصق النتائج كنص أفضل." });
+    const reply = await explainReportText(text);
+    res.json({ ok: true, reply });
   } catch (e) {
     console.error(e);
     res.status(500).json({
       ok: false,
-      error: "server_error",
-      reply: "صار خطأ أثناء قراءة التقرير. جرّب مرة ثانية أو الصق النص بدل الملف.",
+      reply: "تعذّر شرح التقرير الآن.\nجرّب لاحقًا أو ارفع صورة أوضح.",
     });
   }
 });

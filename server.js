@@ -1,39 +1,19 @@
-// ===============================
-// server.js — Dalil Alafiyah (FINAL FIXED)
-// ===============================
-
 import "dotenv/config";
 import express from "express";
 import cors from "cors";
 import helmet from "helmet";
 import multer from "multer";
-import pdfParsePkg from "pdf-parse"; // قد يشتغل في بعض البيئات
 import { createRequire } from "module";
 
 const require = createRequire(import.meta.url);
-// حل مضمون لـ pdf-parse مع ESM
-const pdfParse = (() => {
-  try {
-    // إذا اشتغل import فوق كـ function
-    if (typeof pdfParsePkg === "function") return pdfParsePkg;
-  } catch {}
-  // fallback: require
-  return require("pdf-parse");
-})();
+const pdfParse = require("pdf-parse"); // ✅ FIX: CommonJS via require
 
 const app = express();
 
-// ===============================
 // ENV
-// ===============================
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
 const MODEL_ID = process.env.GROQ_MODEL || "openai/gpt-oss-120b";
 const PORT = process.env.PORT || 8000;
-
-const SHIFAA_ANDROID =
-  "https://play.google.com/store/apps/details?id=om.gov.moh.phr&pcampaignid=web_share";
-const SHIFAA_IOS =
-  "https://apps.apple.com/us/app/%D8%B4-%D9%81-%D8%A7%D8%A1/id1455936672?l=ar";
 
 if (!GROQ_API_KEY) {
   console.error("❌ GROQ_API_KEY غير مضبوط");
@@ -44,23 +24,19 @@ app.use(helmet());
 app.use(cors());
 app.use(express.json({ limit: "2mb" }));
 
-// ✅ لخدمة الصفحة من public/
+// ✅ Serve frontend
 app.use(express.static("public"));
 
-// ===============================
-// Upload (Report)
-// ===============================
+// Upload
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 8 * 1024 * 1024 }, // 8MB
+  limits: { fileSize: 8 * 1024 * 1024 },
 });
 
-// ===============================
-// Session Memory (in-memory)
-// ===============================
+// --------- session memory ----------
 const sessions = new Map();
-const SESSION_TTL_MS = 1000 * 60 * 60 * 6; // 6 hours
-const MAX_HISTORY = 8;
+const SESSION_TTL_MS = 1000 * 60 * 60 * 6;
+const MAX_HISTORY = 6;
 
 function getUserId(req, body) {
   const h = (req.get("x-user-id") || "").trim();
@@ -90,18 +66,16 @@ function resetSession(userId) {
   sessions.delete(userId);
 }
 
-// ===============================
-// Helpers
-// ===============================
+// --------- helpers ----------
 async function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-async function fetchWithTimeout(url, options = {}, ms = 22000) {
+async function fetchWithTimeout(url, options = {}, ms = 24000) {
   const controller = new AbortController();
   const id = setTimeout(() => controller.abort(), ms);
   try {
-    return await fetch(url, { ...options, signal: controller.signal }); // Node 22 فيه fetch مدمج
+    return await fetch(url, { ...options, signal: controller.signal });
   } finally {
     clearTimeout(id);
   }
@@ -112,11 +86,9 @@ function extractJson(text) {
   try {
     return JSON.parse(s);
   } catch {}
-
   const a = s.indexOf("{");
   const b = s.lastIndexOf("}");
   if (a === -1 || b === -1 || b <= a) return null;
-
   try {
     return JSON.parse(s.slice(a, b + 1));
   } catch {
@@ -132,34 +104,38 @@ function clampCategory(cat) {
   return allowed.has(cat) ? cat : "general";
 }
 
+// ✅ official Shifaa links (no fake booking)
+const SHIFAA_ANDROID =
+  "https://play.google.com/store/apps/details?id=om.gov.moh.phr&pcampaignid=web_share";
+const SHIFAA_IOS =
+  "https://apps.apple.com/us/app/%D8%B4-%D9%81-%D8%A7%D8%A1/id1455936672?l=ar";
+
 function buildSystemPrompt() {
-  // ✅ أقصر + يمنع الاختراع + يذكر روابط شفاء
   return `
 أنت "دليل العافية" — توعية صحية فقط.
 
 مهم:
-- أخرج JSON فقط (بدون أي نص خارج JSON).
+- JSON فقط (بدون أي نص خارج JSON).
 - لا تشخيص، لا أدوية، لا جرعات.
-- لا تخترع أرقام هواتف أو روابط أو معلومات حجز.
-- إذا سأل عن المواعيد/الحجز/تطبيق رسمي: قدم الروابط فقط:
-  - [شفاء للأندرويد](${SHIFAA_ANDROID})
-  - [شفاء للآيفون](${SHIFAA_IOS})
+- ممنوع اختراع روابط/أرقام/حجز.
+- لو المستخدم سأل عن مواعيد/حجز/تطبيق: اعطه الروابط الرسمية فقط:
+  - شفاء للأندرويد: ${SHIFAA_ANDROID}
+  - شفاء للآيفون: ${SHIFAA_IOS}
 
-صيغة ثابتة:
+الصيغة:
 {
  "category":"general|bmi|bp|sugar|water|calories|mental|report|emergency",
  "title":"عنوان قصير",
- "verdict":"جملة واحدة واضحة",
+ "verdict":"جملة واحدة",
  "tips":["نصيحة 1","نصيحة 2"],
- "when_to_seek_help":"متى تراجع الطبيب أو الطوارئ أو \"\"",
+ "when_to_seek_help":"... أو \"\"",
  "next_question":"سؤال واحد أو \"\"",
  "quick_choices":["خيار 1","خيار 2"]
 }
 
 قواعد:
-- tips غالبًا 2.
+- مختصر جدًا.
 - إذا next_question = "" => quick_choices = [].
-- خليك مختصر جدًا.
 `.trim();
 }
 
@@ -176,11 +152,10 @@ function buildContextMessage(session, clientContext) {
           quick_choices: Array.isArray(last.quick_choices) ? last.quick_choices : [],
         }
       : null,
-    rule: "إذا المستخدم رد ردّ قصير (نعم/لا/اختيار) وكان فيه سؤال سابق، اعتبره إجابة لنفس السؤال.",
   });
 }
 
-async function callGroq(messages, maxTokens = 750) {
+async function callGroq(messages, maxTokens = 650) {
   for (let attempt = 0; attempt < 2; attempt++) {
     const res = await fetchWithTimeout(
       "https://api.groq.com/openai/v1/chat/completions",
@@ -213,7 +188,7 @@ async function callGroq(messages, maxTokens = 750) {
     }
     throw new Error("Groq API error: " + res.status + " " + t);
   }
-  throw new Error("Groq API error: retry failed");
+  throw new Error("Groq retry failed");
 }
 
 function normalize(obj) {
@@ -251,21 +226,15 @@ function fallback(text) {
   };
 }
 
-// ===============================
-// Routes
-// ===============================
-
-// health check
+// --------- routes ----------
 app.get("/health", (_req, res) => res.json({ ok: true }));
 
-// reset memory
 app.post("/reset", (req, res) => {
   const userId = getUserId(req, req.body || {});
   resetSession(userId);
   res.json({ ok: true, reset: true });
 });
 
-// chat
 app.post("/chat", async (req, res) => {
   try {
     const body = req.body || {};
@@ -281,13 +250,13 @@ app.post("/chat", async (req, res) => {
     if (!session.lastCard && clientContext?.last) session.lastCard = clientContext.last;
 
     const last = session.lastCard;
-    const shouldTreatAsChoice =
+    const isChoice =
       meta?.is_choice === true ||
       ((msg.length <= 12) && last?.next_question) ||
       (Array.isArray(last?.quick_choices) && last.quick_choices.includes(msg));
 
     let userContent = msg;
-    if (shouldTreatAsChoice && last?.next_question) {
+    if (isChoice && last?.next_question) {
       userContent =
         `إجابة المستخدم على السؤال السابق:\n` +
         `السؤال: ${last.next_question}\n` +
@@ -302,8 +271,7 @@ app.post("/chat", async (req, res) => {
       { role: "user", content: userContent },
     ];
 
-    const raw = await callGroq(messages, 750);
-
+    const raw = await callGroq(messages, 650);
     const parsed = extractJson(raw);
     const data = parsed ? normalize(parsed) : fallback(raw);
 
@@ -323,78 +291,60 @@ app.post("/chat", async (req, res) => {
   }
 });
 
-// report upload
 app.post("/report", upload.single("file"), async (req, res) => {
   try {
     const f = req.file;
     if (!f) return res.status(400).json({ ok: false, error: "no_file" });
 
-    if (f.mimetype === "application/pdf") {
-      const out = await pdfParse(f.buffer).catch(() => null);
-      const text = (out?.text || "").trim();
-
-      if (text.length < 40) {
-        return res.json({
-          ok: true,
-          reply:
-            "ما قدرت أقرأ نص واضح من الـ PDF (غالبًا ملف ممسوح Scan).\n" +
-            "جرّب:\n" +
-            "1) صوّر الصفحة كصورة واضحة وارفعها.\n" +
-            "2) أو انسخ النص والصقه هنا.\n",
-        });
-      }
-
-      const clipped = text.slice(0, 4500);
-
-      const reportSystem = `
-أخرج JSON فقط:
-{"summary":"سطرين","highlights":["نقطة1","نقطة2"],"questions":["سؤال واحد"]}
-
-مختصر جدًا. لا تشخيص ولا أدوية ولا جرعات.
-`.trim();
-
-      const raw = await callGroq(
-        [
-          { role: "system", content: reportSystem },
-          { role: "user", content: "نص التقرير:\n" + clipped },
-        ],
-        650
-      );
-
-      const parsed = extractJson(raw) || {};
-      const summary = sStr(parsed.summary) || "هذا ملخص مبسط للنتائج.";
-      const highlights = sArr(parsed.highlights, 2);
-      const questions = sArr(parsed.questions, 1);
-
-      let reply = "🧾 **شرح مبسط للتقرير**\n" + summary;
-      if (highlights.length) reply += "\n\n**أهم النقاط:**\n- " + highlights.join("\n- ");
-      if (questions.length) reply += "\n\n**سؤال سريع:**\n" + questions[0];
-      reply += "\n\n(توعية عامة — إذا فيه أعراض أو نتيجة مقلقة راجع طبيبك.)";
-
-      return res.json({ ok: true, reply });
-    }
-
-    if (f.mimetype.startsWith("image/")) {
-      // بدون OCR عربي هنا
+    if (f.mimetype !== "application/pdf") {
       return res.json({
         ok: true,
         reply:
-          "قراءة الصور تحتاج OCR، وقد تفشل إذا كانت الصورة بعيدة/غير واضحة.\n" +
-          "الأفضل:\n" +
-          "1) قرّب التصوير جدًا على النتيجة.\n" +
-          "2) أو انسخ/الصق نص النتائج هنا.\n" +
-          "3) أو ارفع PDF نصّي (مو Scan) إن توفر.\n",
+          "حاليًا أقرأ PDF النصّي فقط.\n" +
+          "إذا كان التقرير صورة/سكان: انسخي النص والصقيه أو ارفعي PDF نصّي.",
       });
     }
 
-    return res.status(415).json({ ok: false, error: "unsupported_type" });
+    const out = await pdfParse(f.buffer).catch(() => null);
+    const text = (out?.text || "").trim();
+
+    if (text.length < 40) {
+      return res.json({
+        ok: true,
+        reply:
+          "ما قدرت أطلع نص واضح من الـ PDF (غالبًا Scan).\n" +
+          "الحل: انسخي النص والصقيه هنا، أو وفري PDF نصّي.",
+      });
+    }
+
+    const clipped = text.slice(0, 4500);
+
+    const reportSystem = `JSON فقط:
+{"summary":"سطرين","highlights":["نقطة1","نقطة2"],"question":"سؤال واحد"}
+مختصر جدًا. لا تشخيص/أدوية/جرعات.`.trim();
+
+    const raw = await callGroq(
+      [
+        { role: "system", content: reportSystem },
+        { role: "user", content: "نص التقرير:\n" + clipped },
+      ],
+      520
+    );
+
+    const parsed = extractJson(raw) || {};
+    const summary = sStr(parsed.summary) || "ملخص مبسط للتقرير.";
+    const highlights = sArr(parsed.highlights, 2);
+    const question = sStr(parsed.question);
+
+    let reply = "🧾 **شرح مبسط للتقرير**\n" + summary;
+    if (highlights.length) reply += "\n\n**أهم النقاط:**\n- " + highlights.join("\n- ");
+    if (question) reply += "\n\n**سؤال سريع:**\n" + question;
+
+    reply += "\n\n(توعية عامة — إذا نتيجة مقلقة أو أعراض راجع طبيبك.)";
+    res.json({ ok: true, reply });
   } catch (e) {
     console.error(e);
-    res.status(500).json({
-      ok: false,
-      error: "report_error",
-      reply: "تعذّر قراءة التقرير الآن. جرّب صورة أوضح أو الصق النص.",
-    });
+    res.status(500).json({ ok: false, error: "report_error", reply: "تعذّر قراءة التقرير الآن." });
   }
 });
 

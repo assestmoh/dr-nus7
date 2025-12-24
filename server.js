@@ -37,6 +37,7 @@ const ALLOWED_ORIGINS = new Set([
   "http://localhost:5173",
   "http://localhost:3000",
   "http://localhost:8000",
+   "http://192.168.100.26:5173"
 ]);
 
 app.use(

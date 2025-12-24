@@ -1,4 +1,3 @@
-// server.js (ESM) — Dalil Alafiyah API (Updated for tesseract.js v6 + Groq JSON stability)
 
 import express from "express";
 import cors from "cors";
@@ -37,7 +36,7 @@ const ALLOWED_ORIGINS = new Set([
   "http://localhost:5173",
   "http://localhost:3000",
   "http://localhost:8000",
-   "http://192.168.100.26:5173"
+  "http://192.168.100.26:5173",
 ]);
 
 app.use(
@@ -76,9 +75,6 @@ function trimHistory(history, max = 10) {
 
 /* =========================
    OCR (tesseract.js v6) — eng+ara
-   IMPORTANT:
-   - v6 removed worker.loadLanguage/initialize/load
-   - set lang at createWorker("eng+ara")
 ========================= */
 let ocrWorkerPromise = null;
 
@@ -163,6 +159,26 @@ function clampText(s, maxChars) {
   const t = String(s || "").trim();
   if (t.length <= maxChars) return t;
   return t.slice(0, maxChars) + "\n...[تم قص النص لتفادي الأخطاء]";
+}
+
+/* =========================
+   ✅ NEW: تحويل البطاقة إلى نص محادثة (بدون أزرار/بطاقات في الواجهة)
+========================= */
+function cardToChatText(card) {
+  const verdict = (card?.verdict || "").trim();
+  const tipsArr = Array.isArray(card?.tips) ? card.tips.filter(Boolean) : [];
+  const when = (card?.when_to_seek_help || "").trim();
+  const q = (card?.next_question || "").trim();
+
+  const tipsBlock =
+    tipsArr.length > 0
+      ? "نصائح قصيرة:\n" + tipsArr.map((t) => `- ${String(t).trim()}`).join("\n")
+      : "";
+
+  const whenBlock = when ? `متى تراجع طبيب:\n${when}` : "";
+  const qBlock = q ? `سؤال سريع:\n${q}` : "";
+
+  return [verdict, tipsBlock, whenBlock, qBlock].filter(Boolean).join("\n\n").trim();
 }
 
 /* =========================
@@ -268,7 +284,6 @@ function chatSystemPrompt() {
     "اجعل الإجابة بين 6 و12 سطرًا تقريبًا، مع تنظيم بسيط بعناوين قصيرة أو نقاط.\n" +
     "اذكر متى يُنصح بمراجعة الطبيب أو التوجّه للطوارئ عند ظهور أعراض خطيرة أو غير طبيعية.\n" +
     "إذا لم تكن متأكدًا من المعلومة، قل بوضوح: لا أعلم.\n\n" +
-
     "أخرج JSON فقط (كائن واحد) بهذه المفاتيح EXACT:\n" +
     "{\n" +
     '  "title": "string",\n' +
@@ -279,11 +294,9 @@ function chatSystemPrompt() {
     '  "next_question": "string",\n' +
     '  "quick_choices": ["string"]\n' +
     "}\n\n" +
-
     "استخدم لغة عربية واضحة ومختصرة، وركّز على تصحيح المفاهيم الشائعة وتبسيط المعلومة.\n"
   );
 }
-
 
 function reportSystemPrompt() {
   return (
@@ -323,7 +336,14 @@ app.post("/chat", async (req, res) => {
   if (looksLikeAppointments(message)) {
     const card = appointmentsCard();
     session.lastCard = card;
-    return res.json({ ok: true, data: card });
+
+    // ✅ بدل بطاقة/أزرار: رجّع نص
+    const text = cardToChatText(card);
+    // ✅ history اختياري، بس نخليه نص عشان تنظيم المحادثة
+    session.history.push({ role: "assistant", content: text });
+    session.history = trimHistory(session.history, 10);
+
+    return res.json({ ok: true, data: { text } });
   }
 
   session.history.push({ role: "user", content: message });
@@ -350,10 +370,13 @@ app.post("/chat", async (req, res) => {
     const card = makeCard(obj);
     session.lastCard = card;
 
-    session.history.push({ role: "assistant", content: JSON.stringify(card) });
+    // ✅ بدل JSON بطاقة: خزن نص فقط (لتنظيم المحادثة)
+    const text = cardToChatText(card);
+    session.history.push({ role: "assistant", content: text });
     session.history = trimHistory(session.history, 10);
 
-    return res.json({ ok: true, data: card });
+    // ✅ بدل بطاقة/أزرار: رجّع نص
+    return res.json({ ok: true, data: { text } });
   } catch (err) {
     console.error("[chat] FAILED:", err?.message || err);
     return res.status(200).json({ ok: false, error: "model_error" });
@@ -421,7 +444,12 @@ app.post("/report", upload.single("file"), async (req, res) => {
     const card = makeCard({ ...obj, category: "report" });
     session.lastCard = card;
 
-    return res.json({ ok: true, data: card });
+    // ✅ بدل بطاقة/أزرار: رجّع نص
+    const text = cardToChatText(card);
+    session.history.push({ role: "assistant", content: text });
+    session.history = trimHistory(session.history, 10);
+
+    return res.json({ ok: true, data: { text } });
   } catch (err) {
     console.error("[report] FAILED:", err?.message || err);
     return res.status(200).json({

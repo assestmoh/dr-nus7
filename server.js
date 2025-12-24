@@ -107,6 +107,61 @@ function looksLikeAppointments(text) {
   return /موعد|مواعيد|حجز|احجز|حجوزات|حجزت|حجزي|appointment|booking/i.test(t);
 }
 
+/**
+ * ✅ فلتر بسيط لمنع "تصنيف عشوائي" بعيد عن سؤال المستخدم
+ * الهدف: تثبيت category على ما يفهمه من السؤال
+ * (لا يغيّر شكل الرد ولا مفاتيح البطاقة)
+ */
+function inferCategoryFromMessage(message) {
+  const t = String(message || "").toLowerCase();
+
+  // emergency
+  if (/(ألم صدر|الم صدر|ضيق نفس|صعوبة تنفس|اختناق|إغماء|اغماء|شلل|ضعف مفاجئ|نزيف شديد|تشنج|نوبة|افكار انتحارية|أفكار انتحارية|انتحار|ايذاء النفس|إيذاء النفس)/i.test(message)) {
+    return "emergency";
+  }
+
+  // appointments
+  if (looksLikeAppointments(message)) return "appointments";
+
+  // report
+  if (/(تقرير|تحاليل|تحليل|نتيجة|cbc|hba1c|cholesterol|vitamin|lab|report)/i.test(message)) {
+    return "report";
+  }
+
+  // mental
+  if (/(قلق|توتر|اكتئاب|مزاج|نوم|أرق|panic|anxiety|depress)/i.test(message)) {
+    return "mental";
+  }
+
+  // bmi
+  if (/(bmi|كتلة الجسم|مؤشر كتلة|وزني|طولي)/i.test(message)) {
+    // لو السؤال يذكر وزن/طول بشكل واضح غالبًا BMI
+    if (/(طول|سم|cm|وزن|كجم|kg|bmi|كتلة)/i.test(message)) return "bmi";
+  }
+
+  // bp
+  if (/(ضغط|ضغط الدم|systolic|diastolic|mmhg|ملم زئبقي)/i.test(message)) {
+    return "bp";
+  }
+
+  // sugar
+  if (/(سكر|سكري|glucose|mg\/dl|صائم|بعد الأكل|بعد الاكل|hba1c)/i.test(message)) {
+    return "sugar";
+  }
+
+  // water
+  if (/(ماء|سوائل|شرب|ترطيب|hydration)/i.test(message)) {
+    return "water";
+  }
+
+  // calories
+  if (/(سعرات|calories|دايت|رجيم|تخسيس|تنحيف|زيادة وزن|نظام غذائي)/i.test(message)) {
+    return "calories";
+  }
+
+  return "general";
+}
+
 function makeCard({
   title,
   category,
@@ -267,7 +322,9 @@ function chatSystemPrompt() {
     "لا تفسّر نتائج الفحوصات بشكل دقيق، بل قدّم توضيحًا عامًا فقط عند الحاجة.\n" +
     "اجعل الإجابة بين 6 و12 سطرًا تقريبًا، مع تنظيم بسيط بعناوين قصيرة أو نقاط.\n" +
     "اذكر متى يُنصح بمراجعة الطبيب أو التوجّه للطوارئ عند ظهور أعراض خطيرة أو غير طبيعية.\n" +
-    "إذا لم تكن متأكدًا من المعلومة، قل بوضوح: لا أعلم.\n\n" +
+    "إذا لم تكن متأكدًا من المعلومة، قل بوضوح: لا أعلم.\n" +
+    "مهم جدًا: التزم بسؤال المستخدم فقط. لا تنتقل لموضوع آخر ولا تضع نصائح أو تصنيفًا بعيدًا عن السؤال.\n" +
+    "إذا كان سياق آخر رد غير مرتبط بسؤال المستخدم الحالي فتجاهله تمامًا.\n\n" +
     "أخرج JSON فقط (كائن واحد) بهذه المفاتيح EXACT:\n" +
     "{\n" +
     '  "title": "string",\n' +
@@ -288,6 +345,7 @@ function reportSystemPrompt() {
     "المدخل سيكون نصًا مُستخرجًا من صورة/ملف (قد يكون بالإنجليزية).\n" +
     "اشرح المعنى بالعربية بشكل عام + نصائح عامة + متى يراجع الطبيب.\n" +
     "لا تشخّص، ولا تضع أرقام مرجعية دقيقة إذا غير موجودة.\n" +
+    "مهم جدًا: اربط الشرح مباشرة بما ورد في نص التقرير فقط وتجنب أي مواضيع بعيدة.\n" +
     "أخرج JSON فقط بنفس مفاتيح البطاقة.\n"
   );
 }
@@ -320,7 +378,7 @@ app.post("/chat", async (req, res) => {
   if (looksLikeAppointments(message)) {
     const card = appointmentsCard();
     session.lastCard = card;
-    return res.json({ ok: true, data: card }); // ✅ يبقى يرجّع card كما هو
+    return res.json({ ok: true, data: card });
   }
 
   session.history.push({ role: "user", content: message });
@@ -333,8 +391,9 @@ app.post("/chat", async (req, res) => {
   const msgStr = clampText(message, 1200);
 
   const userPrompt =
-    (last ? `سياق آخر رد (قد يفيد):\n${lastStr}\n\n` : "") +
-    `سؤال المستخدم:\n${msgStr}\n\n` +
+    (last ? `سياق آخر رد (قد يفيد فقط إذا كان مرتبطًا بنفس السؤال):\n${lastStr}\n\n` : "") +
+    `سؤال المستخدم (هذا هو الأساس):\n${msgStr}\n\n` +
+    "مهم: اجعل كل محتوى البطاقة مرتبطًا مباشرة بسؤال المستخدم الحالي. إذا لم يكن السياق السابق مرتبطًا فتجاهله.\n" +
     "أجب ببطاقة منظمة وبأسلوب مطمئن وبنصائح قصيرة ومتى يراجع طبيب.";
 
   try {
@@ -344,13 +403,23 @@ app.post("/chat", async (req, res) => {
       maxTokens: 1200,
     });
 
+    // ✅ تثبيت التصنيف لمنع العشوائية (بدون تغيير شكل البطاقة)
+    const inferred = inferCategoryFromMessage(message);
+    if (inferred && typeof inferred === "string") {
+      // إذا النموذج طلع تصنيف بعيد، نرجعه لتصنيف السؤال
+      if (obj && obj.category && obj.category !== inferred) {
+        // لا نغيّر "appointments" لأن عندها route ثابت أصلاً
+        obj.category = inferred;
+      }
+    }
+
     const card = makeCard(obj);
     session.lastCard = card;
 
     session.history.push({ role: "assistant", content: JSON.stringify(card) });
     session.history = trimHistory(session.history, 10);
 
-    return res.json({ ok: true, data: card }); // ✅ يبقى يرجّع card كما هو
+    return res.json({ ok: true, data: card });
   } catch (err) {
     console.error("[chat] FAILED:", err?.message || err);
     return res.status(200).json({ ok: false, error: "model_error" });
@@ -407,6 +476,7 @@ app.post("/report", upload.single("file"), async (req, res) => {
       extractedClamped +
       "\n\n" +
       "اكتب شرحًا عربيًا مطمئنًا وبسيطًا: ماذا يعني بشكل عام + نصائح عامة + متى يراجع الطبيب.\n" +
+      "مهم: اربط الشرح مباشرة بما ورد في التقرير فقط.\n" +
       "لا تذكر تشخيصات مؤكدة.";
 
     const obj = await callGroqJSON({
@@ -418,7 +488,7 @@ app.post("/report", upload.single("file"), async (req, res) => {
     const card = makeCard({ ...obj, category: "report" });
     session.lastCard = card;
 
-    return res.json({ ok: true, data: card }); // ✅ يبقى يرجّع card كما هو
+    return res.json({ ok: true, data: card });
   } catch (err) {
     console.error("[report] FAILED:", err?.message || err);
     return res.status(200).json({

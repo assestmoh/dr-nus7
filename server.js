@@ -10,13 +10,6 @@ import { createWorker } from "tesseract.js";
 const require = createRequire(import.meta.url);
 const pdfParse = require("pdf-parse");
 
-// --- fetch fallback (يحميك لو بيئة الاستضافة ما توفر fetch) ---
-let fetchFn = globalThis.fetch;
-if (!fetchFn) {
-  const nodeFetch = (await import("node-fetch")).default;
-  fetchFn = nodeFetch;
-}
-
 const app = express();
 const upload = multer({ limits: { fileSize: 8 * 1024 * 1024 } });
 
@@ -51,13 +44,12 @@ app.use(
 function requireApiKey(req, res, next) {
   if (!INTERNAL_API_KEY) return next();
   const key = req.header("x-api-key");
-  if (key !== INTERNAL_API_KEY)
-    return res.status(401).json({ ok: false, error: "unauthorized" });
+  if (key !== INTERNAL_API_KEY) return res.status(401).json({ ok: false, error: "unauthorized" });
   next();
 }
 app.use(requireApiKey);
 
-// عدّلها حسب نطاقك
+// عدّل حسب نطاقك
 const ALLOWED_ORIGINS = new Set([
   "https://alafya.netlify.app",
   "http://localhost:5173",
@@ -96,16 +88,7 @@ const METRICS = {
   avgLatencyMs: 0,
   categoryCount: Object.create(null),
   flows: Object.fromEntries(
-    [
-      "sugar",
-      "bp",
-      "bmi",
-      "water",
-      "calories",
-      "mental",
-      "first_aid",
-      "general",
-    ].flatMap((k) => [
+    ["sugar", "bp", "bmi", "water", "calories", "mental", "first_aid", "general"].flatMap((k) => [
       [`${k}Started`, 0],
       [`${k}Completed`, 0],
     ])
@@ -120,9 +103,7 @@ function bumpCategory(cat) {
 function updateAvgLatency(ms) {
   const alpha = 0.2;
   METRICS.avgLatencyMs =
-    METRICS.avgLatencyMs === 0
-      ? ms
-      : Math.round(alpha * ms + (1 - alpha) * METRICS.avgLatencyMs);
+    METRICS.avgLatencyMs === 0 ? ms : Math.round(alpha * ms + (1 - alpha) * METRICS.avgLatencyMs);
 }
 
 /* =========================
@@ -136,7 +117,7 @@ function getSession(userId) {
     sessions.set(id, {
       history: [],
       lastCard: null,
-      flow: null,
+      flow: null, // sugar|bp|bmi|water|calories|mental|first_aid|general
       step: 0,
       profile: {},
       ts: Date.now(),
@@ -207,9 +188,7 @@ function clampText(s, maxChars) {
 
 function looksLikeAppointments(text) {
   const t = String(text || "");
-  return /موعد|مواعيد|حجز|احجز|حجوزات|حجزت|حجزي|appointment|booking|شفاء/i.test(
-    t
-  );
+  return /موعد|مواعيد|حجز|احجز|حجوزات|حجزت|حجزي|appointment|booking|شفاء/i.test(t);
 }
 
 function isEmergencyText(text) {
@@ -223,23 +202,15 @@ function inferCategoryFromMessage(message) {
 
   if (isEmergencyText(t)) return "emergency";
   if (looksLikeAppointments(t)) return "appointments";
-  if (
-    /(تقرير|تحاليل|تحليل|نتيجة|cbc|hba1c|cholesterol|vitamin|lab|report|pdf|صورة)/i.test(
-      t
-    )
-  )
+  if (/(افهم\s*تقريرك|تحاليل|تحليل|نتيجة|cbc|hba1c|cholesterol|vitamin|lab|report|pdf|صورة)/i.test(t))
     return "report";
-  if (/(قلق|توتر|اكتئاب|مزاج|نوم|أرق|panic|anxiety|depress)/i.test(t))
-    return "mental";
   if (/(bmi|كتلة الجسم|مؤشر كتلة|وزني|طولي)/i.test(t)) return "bmi";
   if (/(ضغط|ضغط الدم|systolic|diastolic|mmhg|ملم زئبقي)/i.test(t)) return "bp";
-  if (/(سكر|سكري|glucose|mg\/dl|صائم|بعد الأكل|بعد الاكل|hba1c)/i.test(t))
-    return "sugar";
+  if (/(سكر|سكري|glucose|mg\/dl|mmol|صائم|بعد الأكل|بعد الاكل|hba1c)/i.test(t)) return "sugar";
   if (/(ماء|سوائل|شرب|ترطيب|hydration)/i.test(t)) return "water";
-  if (/(سعرات|calories|دايت|رجيم|تخسيس|تنحيف|زيادة وزن|نظام غذائي)/i.test(t))
-    return "calories";
-  if (/(اسعافات|إسعافات|حروق|جرح|اختناق|إغماء|نزيف|كسر|first aid)/i.test(t))
-    return "first_aid";
+  if (/(سعرات|calories|دايت|رجيم|تخسيس|تنحيف|زيادة وزن|نظام غذائي)/i.test(t)) return "calories";
+  if (/(قلق|توتر|اكتئاب|مزاج|نوم|أرق|panic|anxiety|depress)/i.test(t)) return "mental";
+  if (/(اسعافات|إسعافات|حروق|جرح|اختناق|إغماء|نزيف|كسر|first aid)/i.test(t)) return "first_aid";
   return "general";
 }
 
@@ -267,10 +238,9 @@ function menuCard() {
   return makeCard({
     title: "دليل العافية",
     category: "general",
-    verdict: "اختر مسارًا (أسئلة تخصيص قصيرة):",
+    verdict: "اختر مسارًا:",
     tips: [],
-    when_to_seek_help:
-      "إذا أعراض خطيرة (ألم صدر/ضيق نفس/إغماء/نزيف شديد): طوارئ فورًا.",
+    when_to_seek_help: "إذا أعراض خطيرة (ألم صدر/ضيق نفس/إغماء/نزيف شديد): طوارئ فورًا.",
     next_question: "وش تحب تبدأ فيه؟",
     quick_choices: [
       "🩸 السكر",
@@ -288,20 +258,213 @@ function menuCard() {
 
 function appointmentsCard() {
   return makeCard({
-    title: "معلومات المواعيد عبر تطبيق شفاء",
+    title: "مواعيد شفاء",
     category: "appointments",
     verdict:
-      "للحجز وإدارة المواعيد والاطلاع على الملف الصحي في سلطنة عُمان، استخدم تطبيق **شفاء** الرسمي.\nروابط التحميل الرسمية:",
+      "للحجز وإدارة المواعيد والاطلاع على الملف الصحي في سلطنة عُمان استخدم تطبيق **شفاء** الرسمي.\nروابط التحميل:",
     tips: [`أندرويد: ${SHIFAA_ANDROID}`, `آيفون: ${SHIFAA_IOS}`],
     when_to_seek_help:
       "إذا كانت لديك أعراض طارئة أو شديدة: راجع الطوارئ فورًا.",
-    next_question: "هل تريد شرح خطوات الحجز داخل التطبيق؟",
+    next_question: "هل تريد شرح سريع لخطوات الحجز داخل التطبيق؟",
     quick_choices: ["نعم", "لا"],
   });
 }
 
+function reportUploadCard() {
+  // ثابت مثل ما طلبت (مو ذكي)
+  return makeCard({
+    title: "📄 افهم تقريرك",
+    category: "report",
+    verdict: "اضغط زر **📎 إرفاق ملف** وارفع صورة أو PDF للتقرير، وسأشرح لك **بلغة مبسطة**.",
+    tips: [
+      "يفضّل تغطية الاسم/الرقم المدني قبل الإرسال.",
+      "إذا الصورة غير واضحة، حاول تصويرها بإضاءة جيدة ومن غير اهتزاز.",
+    ],
+    when_to_seek_help:
+      "إذا عندك أعراض شديدة أو مفاجئة (ألم صدر/ضيق نفس/إغماء/نزيف شديد): طوارئ فورًا.",
+    next_question: "جاهز ترفق التقرير؟",
+    quick_choices: ["📎 إرفاق ملف", "رجوع للقائمة"],
+  });
+}
+
 /* =========================
-   Flow engine
+   Sugar engine (Option A) - deterministic
+========================= */
+function parseGlucose(text) {
+  const t = String(text || "").replace(",", ".").toLowerCase();
+
+  // التقط رقم مثل 5.6 أو 120
+  const m = t.match(/(\d+(\.\d+)?)/);
+  if (!m) return null;
+
+  let val = Number(m[1]);
+  if (!Number.isFinite(val)) return null;
+
+  // هل هي mmol/L؟
+  const hasMmol = /mmol|mmol\/l|mmol\s*l|ممول/i.test(t);
+
+  // heuristic: إذا أقل أو يساوي 25 غالبًا mmol/L
+  const assumeMmol = val > 0 && val <= 25;
+
+  if (hasMmol || assumeMmol) {
+    const mgdl = Math.round(val * 18);
+    return { mgdl, unit: "mmol/L", raw: val };
+  }
+
+  // otherwise assume mg/dL
+  return { mgdl: Math.round(val), unit: "mg/dL", raw: val };
+}
+
+function sugarVerdictAndAdvice({ mgdl, context }) {
+  // context: fasting | postmeal | random | unknown
+  const tips = [];
+  let verdict = "";
+  let when = "";
+
+  // قواعد إنقاذية
+  if (mgdl < 54) {
+    verdict = `القراءة منخفضة جدًا (${mgdl} mg/dL). هذا قد يكون خطيرًا.`;
+    tips.push(
+      "إذا عندك تعرّق شديد/رجفة/دوخة/تشوش: اطلب مساعدة فورًا.",
+      "إذا تقدر، تناول شيئًا سكريًا سريعًا (مثل عصير/تمر) ثم راقب نفسك."
+    );
+    when =
+      "إذا فقدان وعي/تشنج/تشوش شديد أو ما تحسّن الوضع بسرعة: طوارئ فورًا.";
+    return { verdict, tips, when, level: "low_critical" };
+  }
+
+  if (mgdl < 70) {
+    verdict = `القراءة منخفضة (${mgdl} mg/dL).`;
+    tips.push(
+      "إذا عندك أعراض انخفاض سكر: خذ سكر سريع (عصير/تمر/عسل) ثم وجبة خفيفة بعدها.",
+      "لا تسوق أو تستخدم آلات إذا تحس بدوخة/تشوش."
+    );
+    when =
+      "إذا تكرر الانخفاض كثيرًا أو كان معه إغماء/تشنج: راجع الطبيب/الطوارئ.";
+    return { verdict, tips, when, level: "low" };
+  }
+
+  // طبيعي/مرتفع حسب السياق (بدون تشخيص)
+  if (context === "fasting") {
+    if (mgdl <= 99) {
+      verdict = `قراءة صائم ضمن الطبيعي غالبًا (${mgdl} mg/dL).`;
+      tips.push(
+        "حافظ على وجبات منتظمة ومتوازنة (بروتين + ألياف + كربوهيدرات معتدلة).",
+        "المشي الخفيف 10 دقائق بعد الأكل يساعد كثيرًا حتى بدون “تمارين”."
+      );
+      when = "إذا عندك أعراض مزعجة مستمرة أو قراءات عالية متكررة: راجع الطبيب.";
+      return { verdict, tips, when, level: "ok" };
+    }
+    if (mgdl <= 125) {
+      verdict = `قراءة صائم أعلى من الطبيعي (${mgdl} mg/dL). ليست تشخيصًا وحدها.`;
+      tips.push(
+        "قلّل السكريات المضافة والمشروبات المحلاة قدر الإمكان.",
+        "زِد الألياف (خضار/شوفان/بقوليات) لأنها تقلل ارتفاع السكر.",
+        "جرّب مشي خفيف 10–15 دقيقة بعد الوجبة الرئيسية."
+      );
+      when =
+        "إذا تكررت قراءات الصائم مرتفعة عدة أيام أو عندك أعراض (عطش شديد/تبول كثير): راجع الطبيب.";
+      return { verdict, tips, when, level: "elevated" };
+    }
+    verdict = `قراءة صائم مرتفعة (${mgdl} mg/dL). ليست تشخيصًا وحدها لكنها تستحق متابعة.`;
+    tips.push(
+      "أعد القياس في يوم آخر بنفس الظروف (صائم 8 ساعات).",
+      "ركّز على: تقليل السكريات + تقليل الخبز/الأرز بكميات كبيرة + زيادة البروتين والألياف.",
+      "بعد الأكل: مشي خفيف 10–20 دقيقة يقلل الارتفاع."
+    );
+    when =
+      "إذا كانت القراءة ≥ 300 أو مع أعراض شديدة (تقيؤ/تشوش/خمول شديد): طوارئ فورًا. خلاف ذلك راجع الطبيب قريبًا.";
+    return { verdict, tips, when, level: "high" };
+  }
+
+  if (context === "postmeal") {
+    if (mgdl < 140) {
+      verdict = `قراءة بعد الأكل تبدو جيدة غالبًا (${mgdl} mg/dL).`;
+      tips.push(
+        "حاول تخلي نصف الصحن خضار + ربع بروتين + ربع كربوهيدرات.",
+        "اختَر فاكهة كاملة بدل العصير غالبًا."
+      );
+      when = "إذا عندك أعراض مزعجة أو قراءات عالية متكررة: راجع الطبيب.";
+      return { verdict, tips, when, level: "ok" };
+    }
+    if (mgdl <= 199) {
+      verdict = `قراءة بعد الأكل مرتفعة نسبيًا (${mgdl} mg/dL). ليست تشخيصًا وحدها.`;
+      tips.push(
+        "قلّل النشويات السريعة (رز/خبز أبيض/حلويات) خصوصًا في نفس الوجبة.",
+        "ابدأ الوجبة بالخضار/سلطة ثم البروتين ثم الكربوهيدرات.",
+        "مشي 10–15 دقيقة بعد الوجبة مفيد جدًا."
+      );
+      when =
+        "إذا تتكرر الارتفاعات أو عندك عطش شديد/تبول كثير/تعب غير معتاد: راجع الطبيب.";
+      return { verdict, tips, when, level: "elevated" };
+    }
+    verdict = `قراءة بعد الأكل عالية (${mgdl} mg/dL). تحتاج متابعة.`;
+    tips.push(
+      "حاول تقليل كمية الكربوهيدرات في الوجبة القادمة وركّز على البروتين والألياف.",
+      "تجنب العصائر حتى لو “طبيعية” لأنها ترفع السكر بسرعة.",
+      "أعد القياس بعد يومين بنفس التوقيت (بعد الأكل بساعتين)."
+    );
+    when =
+      "إذا كانت القراءة ≥ 300 أو معها تقيؤ/تشوش/نعاس شديد: طوارئ فورًا. وإلا راجع الطبيب قريبًا.";
+    return { verdict, tips, when, level: "high" };
+  }
+
+  // random / unknown
+  if (mgdl < 140) {
+    verdict = `القراءة تبدو مقبولة غالبًا (${mgdl} mg/dL) حسب وقت الأكل.`;
+    tips.push(
+      "إذا تريد دقة: قس صائم صباحًا، أو بعد الأكل بساعتين.",
+      "قلّل المشروبات المحلاة وزِد الألياف."
+    );
+    when = "إذا عندك أعراض مستمرة أو قراءات عالية متكررة: راجع الطبيب.";
+    return { verdict, tips, when, level: "ok" };
+  }
+  if (mgdl <= 199) {
+    verdict = `القراءة مرتفعة نسبيًا (${mgdl} mg/dL) حسب وقت الأكل. ليست تشخيصًا وحدها.`;
+    tips.push(
+      "للتأكد: قس صائم 8 ساعات، أو بعد الأكل بساعتين.",
+      "ركّز على تقليل السكريات والمخبوزات البيضاء، وزِد البروتين والألياف."
+    );
+    when = "إذا تتكرر القراءات المرتفعة أو مع أعراض (عطش/تبول كثير): راجع الطبيب.";
+    return { verdict, tips, when, level: "elevated" };
+  }
+  verdict = `القراءة عالية (${mgdl} mg/dL). تحتاج متابعة.`;
+  tips.push(
+    "أعد القياس بوقت معروف (صائم أو بعد الأكل بساعتين) لتقييم أدق.",
+    "قلّل السكريات والمشروبات المحلاة فورًا، وخفف النشويات.",
+    "اشرب ماء بكفاية إذا ما عندك مانع طبي."
+  );
+  when =
+    "إذا كانت القراءة ≥ 300 أو معها تقيؤ/تشوش/جفاف شديد: طوارئ فورًا. وإلا راجع الطبيب قريبًا.";
+  return { verdict, tips, when, level: "high" };
+}
+
+function sugarStartCard() {
+  return makeCard({
+    title: "🩸 مسار السكر",
+    category: "sugar",
+    verdict: "اختَر نوع القراءة:",
+    tips: ["إذا ما تعرف، اختر (ما أعرف) وعطيني الرقم فقط."],
+    when_to_seek_help: "إذا عندك ألم صدر/ضيق نفس/إغماء: طوارئ فورًا.",
+    next_question: "",
+    quick_choices: ["صائم", "بعد الأكل بساعتين", "عشوائي", "ما أعرف", "رجوع للقائمة"],
+  });
+}
+
+function sugarAskValueCard(contextLabel) {
+  return makeCard({
+    title: "🩸 مسار السكر",
+    category: "sugar",
+    verdict: `اكتب رقم السكر ${contextLabel ? `(${contextLabel})` : ""}.\nمثال: 110 أو 6.1 mmol`,
+    tips: ["إذا كتبت mmol سأحوّله تلقائيًا.", "اكتب رقم واحد فقط قدر الإمكان."],
+    when_to_seek_help: "إذا عندك تقيؤ شديد/تشوش/خمول شديد مع سكر عالي جدًا: طوارئ.",
+    next_question: "",
+    quick_choices: ["إلغاء", "رجوع للقائمة"],
+  });
+}
+
+/* =========================
+   Other flows (as-is minimal)
 ========================= */
 function startFlow(session, flowKey) {
   session.flow = flowKey;
@@ -310,29 +473,18 @@ function startFlow(session, flowKey) {
   METRICS.flows[`${flowKey}Started`]++;
   bumpCategory(flowKey);
 
-  const commonAge = ["أقل من 18", "18–40", "41–60", "60+"];
+  if (flowKey === "sugar") return sugarStartCard();
 
-  if (flowKey === "sugar") {
-    return makeCard({
-      title: "🩸 مسار السكر",
-      category: "sugar",
-      verdict: "اختر فئتك العمرية:",
-      tips: [],
-      when_to_seek_help: "",
-      next_question: "",
-      quick_choices: commonAge,
-    });
-  }
-
+  // (بقية المسارات تظل بسيطة كما كانت)
   if (flowKey === "bp") {
     return makeCard({
       title: "🫀 مسار الضغط",
       category: "bp",
-      verdict: "اختر فئتك العمرية:",
-      tips: [],
-      when_to_seek_help: "",
+      verdict: "هل لديك قراءة ضغط الآن؟",
+      tips: ["اكتبها مثل: 120/80 أو اختر (ما أعرف)."],
+      when_to_seek_help: "ألم صدر/ضيق نفس/إغماء: طوارئ فورًا.",
       next_question: "",
-      quick_choices: commonAge,
+      quick_choices: ["أكتب القراءة", "ما أعرف", "رجوع للقائمة"],
     });
   }
 
@@ -340,47 +492,47 @@ function startFlow(session, flowKey) {
     return makeCard({
       title: "⚖️ مسار BMI",
       category: "bmi",
-      verdict: "وش هدفك الآن؟",
-      tips: [],
+      verdict: "اكتب الوزن والطول مثل: وزن 70، طول 170 (اختياري).",
+      tips: ["إذا ما تبغى، اكتب: تخطي."],
       when_to_seek_help: "",
       next_question: "",
-      quick_choices: ["إنقاص وزن", "زيادة وزن", "تحسين لياقة", "متابعة عامة"],
+      quick_choices: ["تخطي", "رجوع للقائمة"],
     });
   }
 
   if (flowKey === "water") {
     return makeCard({
-      title: "💧 مسار شرب الماء",
+      title: "💧 شرب الماء",
       category: "water",
-      verdict: "وش وضع نشاطك اليومي غالبًا؟",
-      tips: [],
+      verdict: "كم تشرب ماء تقريبًا باليوم؟",
+      tips: ["مثال: 1 لتر أو 6 أكواب."],
       when_to_seek_help: "",
       next_question: "",
-      quick_choices: ["خفيف (مكتبي)", "متوسط", "عالي/رياضة"],
+      quick_choices: ["رجوع للقائمة"],
     });
   }
 
   if (flowKey === "calories") {
     return makeCard({
-      title: "🔥 مسار السعرات",
+      title: "🔥 السعرات",
       category: "calories",
       verdict: "وش هدفك؟",
       tips: [],
       when_to_seek_help: "",
       next_question: "",
-      quick_choices: ["إنقاص وزن", "تثبيت وزن", "زيادة وزن", "أكل صحي"],
+      quick_choices: ["إنقاص وزن", "تثبيت وزن", "زيادة وزن", "رجوع للقائمة"],
     });
   }
 
   if (flowKey === "mental") {
     return makeCard({
-      title: "🧠 مسار المزاج",
+      title: "🧠 المزاج",
       category: "mental",
       verdict: "خلال آخر أسبوع، كيف كان مزاجك غالبًا؟",
       tips: [],
-      when_to_seek_help: "",
+      when_to_seek_help: "إذا عندك أفكار إيذاء النفس: اطلب مساعدة عاجلة فورًا.",
       next_question: "",
-      quick_choices: ["ممتاز", "جيد", "متعب", "سيئ"],
+      quick_choices: ["ممتاز", "جيد", "متعب", "سيئ", "رجوع للقائمة"],
     });
   }
 
@@ -388,308 +540,101 @@ function startFlow(session, flowKey) {
     return makeCard({
       title: "🩹 إسعافات أولية",
       category: "general",
-      verdict: "اختر الموقف الأقرب:",
+      verdict: "اختر الموقف:",
       tips: [],
-      when_to_seek_help: "إذا فقدان وعي/نزيف شديد/صعوبة تنفس: طوارئ فورًا.",
+      when_to_seek_help: "فقدان وعي/نزيف شديد/صعوبة تنفس: اتصل بالإسعاف فورًا.",
       next_question: "",
-      quick_choices: ["حروق بسيطة", "جرح/نزيف بسيط", "اختناق", "إغماء", "التواء/كدمة"],
+      quick_choices: ["حروق بسيطة", "جرح/نزيف بسيط", "اختناق", "إغماء", "التواء/كدمة", "رجوع للقائمة"],
     });
   }
 
   return menuCard();
 }
 
-function parseWeightHeight(text) {
-  const t = String(text || "").toLowerCase();
-  const w2 = t.match(/وزن\s*[:=]?\s*(\d{2,3})/i);
-  const h2 = t.match(/طول\s*[:=]?\s*(\d{2,3})/i);
-
-  const w = w2 ? Number(w2[1]) : null;
-  const h = h2 ? Number(h2[1]) : null;
-
-  const W = w && w >= 25 && w <= 250 ? w : null;
-  const H = h && h >= 100 && h <= 220 ? h : null;
-
-  return { weightKg: W, heightCm: H };
-}
-
-function bmiFrom(weightKg, heightCm) {
-  const h = heightCm / 100;
-  const bmi = weightKg / (h * h);
-  return Math.round(bmi * 10) / 10;
-}
-
 function continueFlow(session, message) {
   const flow = session.flow;
   const step = session.step;
   const m = String(message || "").trim();
-  const commonAge = ["أقل من 18", "18–40", "41–60", "60+"];
 
+  // رجوع للقائمة/إلغاء داخل الفلو
+  if (/^(رجوع للقائمة|رجوع|القائمة|menu|إلغاء|الغاء|cancel)$/i.test(m)) {
+    resetFlow(session);
+    return menuCard();
+  }
+
+  // ======= SUGAR (Option A)
   if (flow === "sugar") {
+    // step 1: pick context
     if (step === 1) {
-      session.profile.ageGroup = m;
+      let ctx = "unknown";
+      if (/صائم/i.test(m)) ctx = "fasting";
+      else if (/بعد/i.test(m)) ctx = "postmeal";
+      else if (/عشوائي/i.test(m)) ctx = "random";
+      else if (/ما\s*أعرف|مااعرف|لا\s*أعرف/i.test(m)) ctx = "unknown";
+
+      session.profile.context = ctx;
       session.step = 2;
-      return makeCard({
-        title: "🩸 مسار السكر",
+
+      const label =
+        ctx === "fasting"
+          ? "صائم"
+          : ctx === "postmeal"
+          ? "بعد الأكل بساعتين"
+          : ctx === "random"
+          ? "عشوائي"
+          : "غير محدد";
+
+      return sugarAskValueCard(label);
+    }
+
+    // step 2: parse value -> return result + reset flow
+    if (step === 2) {
+      const parsed = parseGlucose(m);
+      if (!parsed) {
+        return makeCard({
+          title: "🩸 مسار السكر",
+          category: "sugar",
+          verdict: "ما قدرت أقرأ الرقم. اكتب رقم واحد مثل: 110 أو 6.1 mmol",
+          tips: [],
+          when_to_seek_help: "",
+          next_question: "",
+          quick_choices: ["إلغاء", "رجوع للقائمة"],
+        });
+      }
+
+      const ctx = session.profile.context || "unknown";
+      const { verdict, tips, when, level } = sugarVerdictAndAdvice({
+        mgdl: parsed.mgdl,
+        context: ctx === "random" ? "unknown" : ctx,
+      });
+
+      const shownUnit = parsed.unit === "mmol/L" ? `${parsed.raw} mmol/L ≈ ${parsed.mgdl} mg/dL` : `${parsed.mgdl} mg/dL`;
+
+      const card = makeCard({
+        title: "🩸 نتيجة قراءة السكر",
         category: "sugar",
-        verdict: "هل تم تشخيصك بالسكري من قبل؟",
-        tips: [],
-        when_to_seek_help: "",
-        next_question: "",
-        quick_choices: ["نعم", "لا", "غير متأكد"],
+        verdict: `${verdict}\n\n(القراءة المدخلة: ${shownUnit})`,
+        tips: [
+          ...tips,
+          "ملاحظة: هذا تثقيف عام وليس تشخيصًا أو بديلًا للطبيب.",
+        ],
+        when_to_seek_help: when,
+        next_question: "وش تحب تسوي الآن؟",
+        quick_choices: [
+          "نصائح أكل مناسبة",
+          "زيادة النشاط بدون رياضة",
+          "كيف أقيس صح؟",
+          "رجوع للقائمة",
+        ],
       });
-    }
-    if (step === 2) {
-      session.profile.diagnosed = m;
-      session.step = 3;
-      return makeCard({
-        title: "🩸 مسار السكر",
-        category: "sugar",
-        verdict: "وش هدفك الآن؟",
-        tips: [],
-        when_to_seek_help: "",
-        next_question: "",
-        quick_choices: ["فهم مبسط", "أكل مناسب", "تقليل الارتفاعات", "متابعة عامة"],
-      });
-    }
-    if (step === 3) {
-      session.profile.goal = m;
-      session.step = 4;
-      return null;
+
+      METRICS.flows[`sugarCompleted`]++;
+      resetFlow(session);
+      return card;
     }
   }
 
-  if (flow === "bp") {
-    if (step === 1) {
-      session.profile.ageGroup = m;
-      session.step = 2;
-      return makeCard({
-        title: "🫀 مسار الضغط",
-        category: "bp",
-        verdict: "هل تم تشخيصك بضغط الدم من قبل؟",
-        tips: [],
-        when_to_seek_help: "",
-        next_question: "",
-        quick_choices: ["نعم", "لا", "غير متأكد"],
-      });
-    }
-    if (step === 2) {
-      session.profile.diagnosed = m;
-      session.step = 3;
-      return makeCard({
-        title: "🫀 مسار الضغط",
-        category: "bp",
-        verdict: "هل لديك قراءة ضغط الآن/مؤخرًا؟ (اختياري)",
-        tips: ["إذا تعرفها اكتبها مثل: 120/80 أو اختر: ما أعرف."],
-        when_to_seek_help: "",
-        next_question: "",
-        quick_choices: ["أكتب القراءة", "ما أعرف"],
-      });
-    }
-    if (step === 3) {
-      if (/ما\s*أعرف/i.test(m)) {
-        session.profile.reading = "unknown";
-        session.step = 4;
-        return null;
-      }
-      session.profile.reading = "pending";
-      session.step = 31;
-      return makeCard({
-        title: "🫀 مسار الضغط",
-        category: "bp",
-        verdict: "اكتب قراءة الضغط مثل: 120/80",
-        tips: [],
-        when_to_seek_help: "",
-        next_question: "",
-        quick_choices: ["إلغاء"],
-      });
-    }
-    if (step === 31) {
-      session.profile.readingValue = m;
-      session.step = 4;
-      return null;
-    }
-  }
-
-  if (flow === "bmi") {
-    if (step === 1) {
-      session.profile.goal = m;
-      session.step = 2;
-      return makeCard({
-        title: "⚖️ مسار BMI",
-        category: "bmi",
-        verdict: "اختر فئتك العمرية:",
-        tips: [],
-        when_to_seek_help: "",
-        next_question: "",
-        quick_choices: commonAge,
-      });
-    }
-    if (step === 2) {
-      session.profile.ageGroup = m;
-      session.step = 3;
-      return makeCard({
-        title: "⚖️ مسار BMI",
-        category: "bmi",
-        verdict: "هل تبي أحسب BMI؟",
-        tips: ["إذا نعم: اكتب وزن وطول مثل: وزن 70، طول 170"],
-        when_to_seek_help: "",
-        next_question: "",
-        quick_choices: ["أحسب", "بدون حساب"],
-      });
-    }
-    if (step === 3) {
-      if (/بدون/i.test(m)) {
-        session.profile.calc = "no";
-        session.step = 4;
-        return null;
-      }
-      session.profile.calc = "yes";
-      session.step = 32;
-      return makeCard({
-        title: "⚖️ مسار BMI",
-        category: "bmi",
-        verdict: "اكتب الوزن والطول مثل: وزن 70، طول 170",
-        tips: [],
-        when_to_seek_help: "",
-        next_question: "",
-        quick_choices: ["إلغاء"],
-      });
-    }
-    if (step === 32) {
-      const { weightKg, heightCm } = parseWeightHeight(m);
-      session.profile.weightKg = weightKg;
-      session.profile.heightCm = heightCm;
-      if (weightKg && heightCm) session.profile.bmi = bmiFrom(weightKg, heightCm);
-      session.step = 4;
-      return null;
-    }
-  }
-
-  if (flow === "water") {
-    if (step === 1) {
-      session.profile.activity = m;
-      session.step = 2;
-      return makeCard({
-        title: "💧 مسار شرب الماء",
-        category: "water",
-        verdict: "كيف الجو عندك غالبًا هذه الفترة؟",
-        tips: [],
-        when_to_seek_help: "",
-        next_question: "",
-        quick_choices: ["معتدل", "حار", "مكيف أغلب الوقت"],
-      });
-    }
-    if (step === 2) {
-      session.profile.climate = m;
-      session.step = 3;
-      return makeCard({
-        title: "💧 مسار شرب الماء",
-        category: "water",
-        verdict: "لو تقدر: اكتب وزنك بالكيلو (اختياري) أو اختر: تخطي",
-        tips: ["مثال: 70"],
-        when_to_seek_help: "",
-        next_question: "",
-        quick_choices: ["تخطي"],
-      });
-    }
-    if (step === 3) {
-      if (/تخطي/i.test(m)) {
-        session.profile.weightKg = null;
-        session.step = 4;
-        return null;
-      }
-      const n = Number(String(m).match(/\d{2,3}/)?.[0]);
-      session.profile.weightKg = n && n >= 25 && n <= 250 ? n : null;
-      session.step = 4;
-      return null;
-    }
-  }
-
-  if (flow === "calories") {
-    if (step === 1) {
-      session.profile.goal = m;
-      session.step = 2;
-      return makeCard({
-        title: "🔥 مسار السعرات",
-        category: "calories",
-        verdict: "مستوى نشاطك اليومي؟",
-        tips: [],
-        when_to_seek_help: "",
-        next_question: "",
-        quick_choices: ["خفيف", "متوسط", "عالي"],
-      });
-    }
-    if (step === 2) {
-      session.profile.activity = m;
-      session.step = 3;
-      return makeCard({
-        title: "🔥 مسار السعرات",
-        category: "calories",
-        verdict: "اختر فئتك العمرية:",
-        tips: [],
-        when_to_seek_help: "",
-        next_question: "",
-        quick_choices: commonAge,
-      });
-    }
-    if (step === 3) {
-      session.profile.ageGroup = m;
-      session.step = 4;
-      return null;
-    }
-  }
-
-  if (flow === "mental") {
-    if (step === 1) {
-      session.profile.mood = m;
-      session.step = 2;
-      return makeCard({
-        title: "🧠 مسار المزاج",
-        category: "mental",
-        verdict: "كيف نومك خلال آخر أسبوع؟",
-        tips: [],
-        when_to_seek_help: "",
-        next_question: "",
-        quick_choices: ["جيد", "متوسط", "سيئ", "أرق شديد"],
-      });
-    }
-    if (step === 2) {
-      session.profile.sleep = m;
-      session.step = 3;
-      return makeCard({
-        title: "🧠 مسار المزاج",
-        category: "mental",
-        verdict: "وش أكثر شعور مزعج؟",
-        tips: [],
-        when_to_seek_help: "",
-        next_question: "",
-        quick_choices: ["قلق", "توتر", "حزن", "ضغط عمل", "أفكار كثيرة"],
-      });
-    }
-    if (step === 3) {
-      session.profile.feeling = m;
-      session.step = 4;
-      return null;
-    }
-  }
-
-  if (flow === "first_aid") {
-    if (step === 1) {
-      session.profile.scenario = m;
-      session.step = 4;
-      return null;
-    }
-  }
-
-  if (flow === "general") {
-    if (step === 1) {
-      session.profile.intent = m;
-      session.step = 4;
-      return null;
-    }
-  }
-
+  // باقي المسارات: نتركها للنموذج (أو تطوير لاحق)
   return null;
 }
 
@@ -722,45 +667,39 @@ const CARD_SCHEMA = {
     next_question: { type: "string" },
     quick_choices: { type: "array", items: { type: "string" } },
   },
-  required: [
-    "title",
-    "category",
-    "verdict",
-    "tips",
-    "when_to_seek_help",
-    "next_question",
-    "quick_choices",
-  ],
+  required: ["title", "category", "verdict", "tips", "when_to_seek_help", "next_question", "quick_choices"],
 };
 
 function chatSystemPrompt() {
   return (
-    "أنت مساعد تثقيف صحي فقط (معلومات عامة)، ولست طبيبًا.\n" +
-    "ممنوع: التشخيص، وصف الأدوية، الجرعات، أو خطة علاج.\n" +
-    "قدّم نصائح نمط حياة عامة وخطوات عملية.\n" +
-    "إذا ظهرت علامات خطورة اذكر بوضوح متى يراجع الطبيب/الطوارئ.\n" +
-    "اكتب عربي بسيط وواضح.\n" +
+    "أنت مساعد تثقيف صحي فقط، ولست طبيبًا.\n" +
+    "ممنوع: التشخيص المؤكد، وصف الأدوية، الجرعات، أو خطط علاج.\n" +
+    "قدّم نصائح نمط حياة عملية.\n" +
+    "استخدم لغة عربية بسيطة جدًا.\n" +
+    "إذا اضطررت لذكر مصطلح طبي، اكتب معه معنى مبسط.\n" +
+    "اذكر متى يجب مراجعة الطبيب/الطوارئ.\n" +
     "أخرج JSON فقط بالمفاتيح المحددة.\n"
   );
 }
 
 function reportSystemPrompt() {
   return (
-    "أنت مساعد يشرح التقارير الطبية/التحاليل للناس العاديين.\n" +
-    "استخدم لغة مبسطة جدًا وتجنب المصطلحات الصعبة أو اشرحها داخل نفس الجملة.\n" +
-    "الممنوع: تشخيص مؤكد، وصف علاج، أدوية، جرعات.\n" +
-    "النتيجة تكون: ماذا يعني بشكل عام + هل يوجد شيء يحتاج مراجعة طبيب + نصائح عامة.\n" +
+    "أنت مساعد يشرح تقارير التحاليل للناس العاديين.\n" +
+    "مهم جدًا: لغة مبسطة، بدون مصطلحات مختبرية معقدة.\n" +
+    "إذا ظهر مصطلح مثل Hemoglobin اكتب: (الهيموغلوبين: بروتين ينقل الأكسجين في الدم).\n" +
+    "ممنوع: تشخيص مؤكد، أدوية، جرعات، أو خطة علاج.\n" +
+    "اذكر متى يراجع الطبيب/الطوارئ.\n" +
     "أخرج JSON فقط بنفس مفاتيح البطاقة.\n"
   );
 }
 
-async function callGroqJSON({ system, user, maxTokens = 1400 }) {
+async function callGroqJSON({ system, user, maxTokens = 1200 }) {
   if (!GROQ_API_KEY) throw new Error("Missing GROQ_API_KEY");
 
   const url = "https://api.groq.com/openai/v1/chat/completions";
   const body = {
     model: GROQ_MODEL,
-    temperature: 0.15,
+    temperature: 0.2,
     max_tokens: maxTokens,
     response_format: {
       type: "json_schema",
@@ -773,12 +712,9 @@ async function callGroqJSON({ system, user, maxTokens = 1400 }) {
   };
 
   for (let attempt = 0; attempt < 3; attempt++) {
-    const res = await fetchFn(url, {
+    const res = await fetch(url, {
       method: "POST",
-      headers: {
-        Authorization: `Bearer ${GROQ_API_KEY}`,
-        "Content-Type": "application/json",
-      },
+      headers: { Authorization: `Bearer ${GROQ_API_KEY}`, "Content-Type": "application/json" },
       body: JSON.stringify(body),
     });
 
@@ -801,77 +737,40 @@ async function callGroqJSON({ system, user, maxTokens = 1400 }) {
 }
 
 /* =========================
-   Safety post-filter (تنقية بدل نسف)
+   Safety post-filter (LLM only)
 ========================= */
 function postFilterCard(card) {
-  // أي شيء قريب من وصف أدوية/جرعات
-  const banned =
-    /(جرعة|حبوب|دواء|أدوية|انسولين|insulin|metformin|ibuprofen|paracetamol|panadol|amoxicillin|خذ|خذي|مرتين يوميًا|ثلاث مرات)/i;
+  // فلتر للأدوية/الجرعات — فقط لحماية مخرجات LLM
+  const bad =
+    /(جرعة|مرتين\s*يوميًا|ثلاث\s*مرات|حبوب|دواء|انسولين|metformin|ibuprofen|paracetamol|amoxicillin|antibiotic)/i;
 
-  const strip = (text) => {
-    const lines = String(text || "").split("\n");
-    return lines.filter((ln) => !banned.test(ln)).join("\n").trim();
-  };
+  const combined =
+    (card?.verdict || "") +
+    "\n" +
+    (Array.isArray(card?.tips) ? card.tips.join("\n") : "") +
+    "\n" +
+    (card?.when_to_seek_help || "");
 
-  const cleaned = {
-    ...card,
-    verdict: strip(card?.verdict),
-    tips: Array.isArray(card?.tips) ? card.tips.map(strip).filter(Boolean) : [],
-    when_to_seek_help: strip(card?.when_to_seek_help),
-    next_question: strip(card?.next_question),
-    quick_choices: Array.isArray(card?.quick_choices) ? card.quick_choices : [],
-  };
-
-  const hasContent =
-    (cleaned.verdict && cleaned.verdict.length > 5) ||
-    (cleaned.tips && cleaned.tips.length > 0);
-
-  if (!hasContent) {
+  if (bad.test(combined)) {
     return makeCard({
-      title: card?.title || "دليل العافية",
+      title: "تنبيه",
       category: card?.category || "general",
-      verdict: "أقدر أقدم معلومات عامة ونصائح نمط حياة بدون أدوية أو جرعات.",
-      tips: ["قل لي هدفك (أكل/نشاط/نوم/متابعة) وبأعطيك خطوات عملية."],
-      when_to_seek_help: "إذا أعراض شديدة: طوارئ فورًا.",
-      next_question: "وش تبغى نركز عليه؟",
-      quick_choices: ["أكل", "نشاط", "نوم", "متابعة عامة"],
+      verdict:
+        "أنا للتثقيف الصحي فقط. ما أقدر أوصف أدوية أو جرعات.\nإذا سؤالك علاجي/دوائي راجع طبيب/صيدلي.",
+      tips: ["اكتب للطبيب الأعراض ومدة المشكلة وأي أدوية تستخدمها.", "إذا أعراض شديدة: طوارئ."],
+      when_to_seek_help: "ألم صدر/ضيق نفس/إغماء/نزيف شديد: طوارئ فورًا.",
+      next_question: "هل تريد نصائح نمط حياة بدل العلاج؟",
+      quick_choices: ["نعم", "لا"],
     });
   }
-
-  return makeCard(cleaned);
-}
-
-/* =========================
-   Report simplifier (قاموس بسيط)
-========================= */
-function simplifyReportText(arText) {
-  let t = String(arText || "");
-  const map = [
-    [/hemoglobin|hb\b/gi, "الهيموغلوبين (مؤشر فقر الدم)"],
-    [/wbc/gi, "كريات الدم البيضاء (مناعة)"],
-    [/rbc/gi, "كريات الدم الحمراء"],
-    [/platelets|plt/gi, "الصفائح الدموية (التجلط)"],
-    [/hba1c/gi, "السكر التراكمي (متوسط 3 أشهر)"],
-    [/cholesterol/gi, "الكوليسترول (دهون الدم)"],
-    [/triglycerides/gi, "الدهون الثلاثية"],
-    [/creatinine/gi, "الكرياتينين (وظائف الكلى)"],
-    [/alt\b|sgpt/gi, "إنزيمات الكبد ALT"],
-    [/ast\b|sgot/gi, "إنزيمات الكبد AST"],
-    [/uric\s*acid/gi, "حمض اليوريك (النقرس)"],
-  ];
-  for (const [re, rep] of map) t = t.replace(re, rep);
-  return t;
+  return card;
 }
 
 /* =========================
    Routes
 ========================= */
 app.get("/", (req, res) => {
-  res.json({
-    ok: true,
-    service: "Dalil Alafiyah API",
-    routes: ["/chat", "/report", "/reset", "/metrics"],
-  });
+  res.json({ ok: true, service: "Dalil Alafiyah API", routes: ["/chat", "/report", "/reset", "/metrics"] });
 });
 
 app.get("/metrics", (req, res) => {
@@ -894,8 +793,8 @@ app.post("/chat", async (req, res) => {
   const message = String(req.body?.message || "").trim();
   if (!message) return res.status(400).json({ ok: false, error: "empty_message" });
 
-  // مسح
-  if (/^(إلغاء|الغاء|cancel|مسح|مسح المحادثة|ابدأ من جديد|ابدأ جديد)$/i.test(message)) {
+  // reset commands
+  if (/^(إلغاء|الغاء|cancel|مسح|مسح المحادثة|ابدأ من جديد|ابدأ جديد|رجوع للقائمة)$/i.test(message)) {
     resetFlow(session);
     const card = menuCard();
     session.lastCard = card;
@@ -904,13 +803,13 @@ app.post("/chat", async (req, res) => {
     return res.json({ ok: true, data: card });
   }
 
-  // طوارئ
+  // emergency
   if (isEmergencyText(message)) {
     METRICS.emergencyTriggers++;
     const card = makeCard({
       title: "⚠️ تنبيه طارئ",
       category: "emergency",
-      verdict: "الأعراض المذكورة قد تكون خطيرة. يُنصح بالتوجه لأقرب طوارئ أو الاتصال بالإسعاف فورًا.",
+      verdict: "الأعراض المذكورة قد تكون خطيرة. توجّه لأقرب طوارئ أو اتصل بالإسعاف فورًا.",
       tips: ["لا تنتظر.", "إذا معك شخص، اطلب مساعدته فورًا."],
       when_to_seek_help: "الآن.",
       next_question: "هل أنت في أمان الآن؟",
@@ -923,7 +822,7 @@ app.post("/chat", async (req, res) => {
     return res.json({ ok: true, data: card });
   }
 
-  // مواعيد شفاء
+  // appointments
   if (looksLikeAppointments(message)) {
     const card = appointmentsCard();
     session.lastCard = card;
@@ -933,17 +832,9 @@ app.post("/chat", async (req, res) => {
     return res.json({ ok: true, data: card });
   }
 
-  // زر افهم تقريرك (غير ذكي) — فقط هذا النص
-  if (/^📄\s*افهم\s*تقريرك$|^افهم\s*تقريرك$/i.test(message)) {
-    const card = makeCard({
-      title: "📄 افهم تقريرك",
-      category: "report",
-      verdict: "اضغط زر 📎 (إرفاق ملف) وارفع صورة أو PDF للتقرير، وسأشرح لك التقرير بلغة مبسطة.",
-      tips: ["حاول تكون الصورة واضحة ومقربة.", "إن أمكن أخفِ اسمك/رقمك قبل الرفع."],
-      when_to_seek_help: "إذا عندك أعراض شديدة أو ألم صدر/ضيق نفس/إغماء: طوارئ فورًا.",
-      next_question: "جاهز ترفق التقرير؟",
-      quick_choices: ["📎 إرفاق ملف", "إلغاء"],
-    });
+  // report button (fixed)
+  if (/^(📄\s*)?افهم\s*تقريرك$/i.test(message) || message === "📄 افهم تقريرك") {
+    const card = reportUploadCard();
     session.lastCard = card;
     bumpCategory("report");
     METRICS.chatOk++;
@@ -951,8 +842,21 @@ app.post("/chat", async (req, res) => {
     return res.json({ ok: true, data: card });
   }
 
-  // بدء مسارات
+  // If user is inside a flow: do NOT infer other categories (fix the drift)
+  if (session.flow && session.step > 0) {
+    const card = continueFlow(session, message);
+    if (card) {
+      session.lastCard = card;
+      METRICS.chatOk++;
+      updateAvgLatency(Date.now() - t0);
+      return res.json({ ok: true, data: card });
+    }
+    // if null -> we will use LLM fallback (other flows)
+  }
+
+  // start flows from menu / short triggers
   const inferred = inferCategoryFromMessage(message);
+
   const startMap = [
     { key: "sugar", match: /🩸|سكر|السكر/i },
     { key: "bp", match: /🫀|ضغط|الضغط/i },
@@ -984,43 +888,20 @@ app.post("/chat", async (req, res) => {
     }
   }
 
-  // متابعة المسار
-  if (session.flow && session.step > 0 && session.step < 4) {
-    const card = continueFlow(session, message);
-    if (card) {
-      session.lastCard = card;
-      METRICS.chatOk++;
-      updateAvgLatency(Date.now() - t0);
-      return res.json({ ok: true, data: card });
-    }
-  }
-
-  // نداء LLM
+  // LLM fallback (general chat / other flows)
   session.history.push({ role: "user", content: message });
   session.history = trimHistory(session.history, 8);
 
   const last = req.body?.context?.last || session.lastCard || null;
   const lastStr = last ? clampText(JSON.stringify(last), 1200) : "";
   const msgStr = clampText(message, 1200);
-  const profileStr =
-    session.flow && session.step === 4 ? clampText(JSON.stringify(session.profile), 1200) : "";
-
-  let forcedCategory = null;
-  if (session.flow === "sugar" && session.step === 4) forcedCategory = "sugar";
-  if (session.flow === "bp" && session.step === 4) forcedCategory = "bp";
-  if (session.flow === "bmi" && session.step === 4) forcedCategory = "bmi";
-  if (session.flow === "water" && session.step === 4) forcedCategory = "water";
-  if (session.flow === "calories" && session.step === 4) forcedCategory = "calories";
-  if (session.flow === "mental" && session.step === 4) forcedCategory = "mental";
-  if (session.flow === "first_aid" && session.step === 4) forcedCategory = "general";
-  if (session.flow === "general" && session.step === 4) forcedCategory = "general";
 
   const userPrompt =
-    (profileStr ? `بيانات تخصيص (اختيارات المستخدم):\n${profileStr}\n\n` : "") +
     (last ? `سياق آخر رد (استخدمه فقط إذا مرتبط):\n${lastStr}\n\n` : "") +
     `سؤال المستخدم:\n${msgStr}\n\n` +
-    "الالتزام: ممنوع تشخيص/أدوية/جرعات.\n" +
-    "اكتب عربي بسيط وخطوات عملية.\n";
+    "قيود مهمة: لا تشخيص، لا أدوية، لا جرعات.\n" +
+    "لغة مبسطة جدًا.\n" +
+    "قدّم نصائح عملية + متى يراجع الطبيب/الطوارئ.\n";
 
   try {
     const obj = await callGroqJSON({
@@ -1030,15 +911,8 @@ app.post("/chat", async (req, res) => {
     });
 
     let finalCategory = obj?.category || inferred || "general";
-    if (forcedCategory) {
-      finalCategory = forcedCategory;
-      METRICS.flows[`${session.flow}Completed`]++;
-      resetFlow(session);
-    } else {
-      if (inferred && finalCategory !== inferred && finalCategory !== "appointments") {
-        finalCategory = inferred;
-      }
-    }
+    // لا تغيّر السكر لأنه صار له مسار خاص
+    if (finalCategory === "sugar") finalCategory = "general";
 
     const card = makeCard({ ...obj, category: finalCategory });
     const safeCard = postFilterCard(card);
@@ -1085,7 +959,7 @@ app.post("/report", upload.single("file"), async (req, res) => {
           ok: false,
           error: "pdf_no_text",
           message:
-            "هذا PDF يبدو ممسوح (Scan) ولا يحتوي نص قابل للقراءة. ارفع صورة واضحة للتقرير.",
+            "هذا PDF يبدو ممسوح (Scan) ولا يحتوي نصًا قابلًا للنسخ. ارفع صورة واضحة للتقرير أو الصق النص.",
         });
       }
     } else if (file.mimetype.startsWith("image/")) {
@@ -1098,7 +972,7 @@ app.post("/report", upload.single("file"), async (req, res) => {
         return res.json({
           ok: false,
           error: "ocr_failed",
-          message: "الصورة غير واضحة للقراءة. حاول تصوير أوضح ومقرب.",
+          message: "الصورة لم تُقرأ بوضوح. حاول صورة أوضح.",
         });
       }
     } else {
@@ -1107,19 +981,18 @@ app.post("/report", upload.single("file"), async (req, res) => {
       return res.status(400).json({ ok: false, error: "unsupported_type" });
     }
 
-    // تبسيط النص قبل إرساله للموديل
-    const simplified = simplifyReportText(extracted);
-    const extractedClamped = clampText(simplified, 6500);
+    const extractedClamped = clampText(extracted, 6500);
 
     const userPrompt =
-      "هذا نص مستخرج من تقرير/تحاليل:\n" +
+      "هذا نص مستخرج من تقرير تحاليل.\n" +
+      "مطلوب: شرح مبسط جدًا للناس العاديين.\n" +
+      "إذا ظهر مصطلح إنجليزي أو طبي، اكتب معناه بالعربي بكلمات بسيطة.\n" +
+      "رتّب الشرح على شكل نقاط واضحة.\n\n" +
+      "النص:\n" +
       extractedClamped +
       "\n\n" +
-      "المطلوب:\n" +
-      "1) اشرح النتائج بلغة مبسطة جدًا لشخص عادي.\n" +
-      "2) اذكر إذا فيه أشياء قد تستدعي مراجعة طبيب (بدون تشخيص).\n" +
-      "3) أعطِ نصائح عامة آمنة.\n" +
-      "ممنوع: أدوية/جرعات/خطة علاج.\n";
+      "قيود: ممنوع تشخيص مؤكد أو أدوية/جرعات.\n" +
+      "اختم بمتى يراجع الطبيب أو الطوارئ.";
 
     const obj = await callGroqJSON({
       system: reportSystemPrompt(),
@@ -1142,7 +1015,7 @@ app.post("/report", upload.single("file"), async (req, res) => {
     return res.status(502).json({
       ok: false,
       error: "report_error",
-      message: "تعذر تحليل التقرير الآن. جرّب صورة أوضح أو PDF نصي.",
+      message: "تعذر تحليل التقرير الآن. جرّب صورة أوضح أو الصق النص.",
     });
   }
 });

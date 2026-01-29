@@ -25,7 +25,7 @@ const PORT = process.env.PORT || 8000;
 const GROQ_API_KEY = process.env.GROQ_API_KEY || "";
 const GROQ_MODEL = process.env.GROQ_MODEL || "openai/gpt-oss-120b";
 
-// Optional internal API key (for pilot)
+// Optional internal API key (pilot)
 const INTERNAL_API_KEY = process.env.INTERNAL_API_KEY || "";
 
 /* Official Shifaa links */
@@ -39,7 +39,7 @@ const SHIFAA_IOS =
 ========================= */
 app.use(helmet({ crossOriginResourcePolicy: false }));
 
-// Rate limit (ضروري للإنتاج/البايلوت)
+// Rate limit
 app.use(
   rateLimit({
     windowMs: 60 * 1000,
@@ -49,9 +49,9 @@ app.use(
   })
 );
 
-// API Key (اختياري) — فعّليه بالبيئة INTERNAL_API_KEY
+// API key (optional)
 function requireApiKey(req, res, next) {
-  if (!INTERNAL_API_KEY) return next(); // للتطوير
+  if (!INTERNAL_API_KEY) return next();
   const key = req.header("x-api-key");
   if (key !== INTERNAL_API_KEY) {
     return res.status(401).json({ ok: false, error: "unauthorized" });
@@ -60,7 +60,7 @@ function requireApiKey(req, res, next) {
 }
 app.use(requireApiKey);
 
-// CORS مضبوط
+// CORS
 const ALLOWED_ORIGINS = new Set([
   "https://alafya.netlify.app",
   "http://localhost:5173",
@@ -85,8 +85,7 @@ app.use(express.json({ limit: "2mb" }));
 app.use(express.urlencoded({ extended: true, limit: "2mb" }));
 
 /* =========================
-   Simple metrics (in-memory)
-   (لا نخزن بيانات شخصية)
+   Metrics (in-memory)
 ========================= */
 const METRICS = {
   startedAt: new Date().toISOString(),
@@ -99,6 +98,14 @@ const METRICS = {
   emergencyTriggers: 0,
   avgLatencyMs: 0,
   categoryCount: Object.create(null),
+  flows: {
+    sugarStarted: 0,
+    sugarCompleted: 0,
+    bpStarted: 0,
+    bpCompleted: 0,
+    bmiStarted: 0,
+    bmiCompleted: 0,
+  },
 };
 
 function bumpCategory(cat) {
@@ -107,15 +114,15 @@ function bumpCategory(cat) {
 }
 
 function updateAvgLatency(ms) {
-  // EWMA بسيطة
   const alpha = 0.2;
   METRICS.avgLatencyMs =
-    METRICS.avgLatencyMs === 0 ? ms : Math.round(alpha * ms + (1 - alpha) * METRICS.avgLatencyMs);
+    METRICS.avgLatencyMs === 0
+      ? ms
+      : Math.round(alpha * ms + (1 - alpha) * METRICS.avgLatencyMs);
 }
 
 /* =========================
    Sessions (in-memory) + TTL
-   userId -> { history, lastCard, flow, step, profile, ts }
 ========================= */
 const sessions = new Map();
 
@@ -125,7 +132,7 @@ function getSession(userId) {
     sessions.set(id, {
       history: [],
       lastCard: null,
-      flow: null,
+      flow: null, // "sugar" | "bp" | "bmi"
       step: 0,
       profile: {},
       ts: Date.now(),
@@ -139,9 +146,7 @@ function getSession(userId) {
 setInterval(() => {
   const now = Date.now();
   for (const [k, v] of sessions) {
-    if (now - (v.ts || 0) > 24 * 60 * 60 * 1000) {
-      sessions.delete(k);
-    }
+    if (now - (v.ts || 0) > 24 * 60 * 60 * 1000) sessions.delete(k);
   }
 }, 30 * 60 * 1000);
 
@@ -154,6 +159,7 @@ function trimHistory(history, max = 10) {
    OCR — tesseract.js (ara+eng)
 ========================= */
 let ocrWorkerPromise = null;
+
 async function getOcrWorker() {
   if (!ocrWorkerPromise) {
     ocrWorkerPromise = (async () => {
@@ -163,6 +169,7 @@ async function getOcrWorker() {
   }
   return ocrWorkerPromise;
 }
+
 async function ocrImageBuffer(buffer) {
   const worker = await getOcrWorker();
   const { data } = await worker.recognize(buffer);
@@ -195,7 +202,6 @@ function looksLikeAppointments(text) {
   return /موعد|مواعيد|حجز|احجز|حجوزات|حجزت|حجزي|appointment|booking/i.test(t);
 }
 
-// تصنيف من الرسالة (بدون هلوسة)
 function inferCategoryFromMessage(message) {
   const t = String(message || "");
 
@@ -207,24 +213,16 @@ function inferCategoryFromMessage(message) {
     return "emergency";
   }
 
-  if (looksLikeAppointments(t)) return "appointments";
-
+  if (looksLikeAppointments(t) || /شفاء/i.test(t)) return "appointments";
   if (/(تقرير|تحاليل|تحليل|نتيجة|cbc|hba1c|cholesterol|vitamin|lab|report)/i.test(t))
     return "report";
-
   if (/(قلق|توتر|اكتئاب|مزاج|نوم|أرق|panic|anxiety|depress)/i.test(t)) return "mental";
-
   if (/(bmi|كتلة الجسم|مؤشر كتلة|وزني|طولي)/i.test(t)) return "bmi";
-
   if (/(ضغط|ضغط الدم|systolic|diastolic|mmhg|ملم زئبقي)/i.test(t)) return "bp";
-
   if (/(سكر|سكري|glucose|mg\/dl|صائم|بعد الأكل|بعد الاكل|hba1c)/i.test(t)) return "sugar";
-
   if (/(ماء|سوائل|شرب|ترطيب|hydration)/i.test(t)) return "water";
-
   if (/(سعرات|calories|دايت|رجيم|تخسيس|تنحيف|زيادة وزن|نظام غذائي)/i.test(t))
     return "calories";
-
   return "general";
 }
 
@@ -264,7 +262,7 @@ function appointmentsCard() {
 }
 
 /* =========================
-   AI Card Schema (Structured)
+   Schema for Structured Output
 ========================= */
 const CARD_SCHEMA = {
   type: "object",
@@ -306,12 +304,11 @@ const CARD_SCHEMA = {
 function chatSystemPrompt() {
   return (
     "أنت أداة تثقيف صحي فقط، ولست طبيبًا ولا بديلاً عن الاستشارة الطبية.\n" +
-    "قدّم معلومات عامة عن الصحة ونمط الحياة بأسلوب عربي مهني، واضح، مختصر، وهادئ.\n" +
+    "قدّم معلومات عامة عن الصحة ونمط الحياة بأسلوب عربي مهني، واضح، مختصر.\n" +
     "ممنوع منعًا باتًا: التشخيص الطبي، وصف الأدوية، تحديد الجرعات، أو وضع خطط علاجية.\n" +
-    "لا تفسّر نتائج الفحوصات بشكل دقيق، بل قدّم توضيحًا عامًا فقط عند الحاجة.\n" +
-    "اذكر متى يُنصح بمراجعة الطبيب أو التوجّه للطوارئ عند ظهور أعراض خطيرة أو غير طبيعية.\n" +
+    "اذكر متى يُنصح بمراجعة الطبيب أو التوجّه للطوارئ عند أعراض خطيرة.\n" +
     "إذا لم تكن متأكدًا من المعلومة، قل بوضوح: لا أعلم.\n" +
-    "مهم جدًا: التزم بسؤال المستخدم فقط. لا تنتقل لموضوع آخر.\n" +
+    "التزم بسؤال المستخدم فقط.\n" +
     "أخرج JSON فقط بنفس مفاتيح البطاقة.\n"
   );
 }
@@ -320,7 +317,7 @@ function reportSystemPrompt() {
   return (
     "أنت مساعد تثقيف صحي عربي لشرح نتائج التحاليل/التقارير.\n" +
     "المدخل نص مُستخرج من صورة/ملف.\n" +
-    "اشرح المعنى بالعربية بشكل عام + نصائح عامة + متى يراجع الطبيب.\n" +
+    "اشرح بالعربية بشكل عام + نصائح عامة + متى يراجع الطبيب.\n" +
     "ممنوع: تشخيص مؤكد، جرعات، وصف علاج.\n" +
     "أخرج JSON فقط بنفس مفاتيح البطاقة.\n"
   );
@@ -336,11 +333,7 @@ async function callGroqJSON({ system, user, maxTokens = 1400 }) {
     max_tokens: maxTokens,
     response_format: {
       type: "json_schema",
-      json_schema: {
-        name: "dalil_alafiyah_card",
-        strict: true,
-        schema: CARD_SCHEMA,
-      },
+      json_schema: { name: "dalil_alafiyah_card", strict: true, schema: CARD_SCHEMA },
     },
     messages: [
       { role: "system", content: system },
@@ -351,10 +344,7 @@ async function callGroqJSON({ system, user, maxTokens = 1400 }) {
   for (let attempt = 0; attempt < 3; attempt++) {
     const res = await fetch(url, {
       method: "POST",
-      headers: {
-        Authorization: `Bearer ${GROQ_API_KEY}`,
-        "Content-Type": "application/json",
-      },
+      headers: { Authorization: `Bearer ${GROQ_API_KEY}`, "Content-Type": "application/json" },
       body: JSON.stringify(body),
     });
 
@@ -377,11 +367,12 @@ async function callGroqJSON({ system, user, maxTokens = 1400 }) {
 }
 
 /* =========================
-   AI Safety Post-Filter (P0)
-   يمنع زلات “جرعات/دواء”
+   Post Safety Filter
 ========================= */
 function postFilterCard(card) {
-  const bad = /(خذ|خذي|جرعة|مرتين يوميًا|مرتين يوميا|ثلاث مرات|حبوب|دواء|انسولين|metformin|ibuprofen|paracetamol)/i;
+  const bad =
+    /(خذ|خذي|جرعة|مرتين يوميًا|مرتين يوميا|ثلاث مرات|حبوب|دواء|انسولين|metformin|ibuprofen|paracetamol)/i;
+
   const combined =
     (card?.verdict || "") +
     "\n" +
@@ -395,7 +386,7 @@ function postFilterCard(card) {
       category: card?.category || "general",
       verdict:
         "أنا للتثقيف الصحي فقط. ما أقدر أوصف أدوية أو جرعات.\n" +
-        "إذا عندك استفسار علاجي أو دوائي، الأفضل تسأل طبيب/صيدلي أو تراجع المؤسسة الصحية.",
+        "إذا عندك استفسار علاجي/دوائي، راجع طبيب/صيدلي.",
       tips: [
         "اذكر للطبيب الأعراض ومدة المشكلة والأدوية الحالية إن وجدت.",
         "إذا الأعراض شديدة أو غير طبيعية: توجّه للطوارئ.",
@@ -410,14 +401,18 @@ function postFilterCard(card) {
 }
 
 /* =========================
-   Sugar Flow (تخصيص) — يجعل الشات بوت “يُحسب AI”
+   3 Smart Flows
+   flow: sugar | bp | bmi
 ========================= */
+
+// -------- Sugar
 function startSugarFlow(session) {
   session.flow = "sugar";
   session.step = 1;
   session.profile = {};
+  METRICS.flows.sugarStarted++;
   return makeCard({
-    title: "مسار السكر",
+    title: "مسار السكر الذكي",
     category: "sugar",
     verdict: "عشان أعطيك معلومات مناسبة، اختر فئتك العمرية:",
     tips: [],
@@ -429,12 +424,11 @@ function startSugarFlow(session) {
 
 function handleSugarFlow(session, message) {
   const m = String(message || "").trim();
-
   if (session.step === 1) {
     session.profile.ageGroup = m;
     session.step = 2;
     return makeCard({
-      title: "مسار السكر",
+      title: "مسار السكر الذكي",
       category: "sugar",
       verdict: "هل تم تشخيصك بالسكري من قبل؟",
       tips: [],
@@ -443,12 +437,11 @@ function handleSugarFlow(session, message) {
       quick_choices: ["نعم", "لا", "غير متأكد"],
     });
   }
-
   if (session.step === 2) {
     session.profile.diagnosed = m;
     session.step = 3;
     return makeCard({
-      title: "مسار السكر",
+      title: "مسار السكر الذكي",
       category: "sugar",
       verdict: "وش هدفك الآن؟",
       tips: [],
@@ -457,25 +450,133 @@ function handleSugarFlow(session, message) {
       quick_choices: ["أفهم السكري ببساطة", "أكل مناسب", "تقليل الارتفاعات", "متابعة عامة"],
     });
   }
-
   if (session.step === 3) {
     session.profile.goal = m;
-    session.step = 4; // جاهز لتوليد الرد المخصص
+    session.step = 4; // ready
     return null;
   }
-
   return null;
+}
+
+// -------- BP
+function startBpFlow(session) {
+  session.flow = "bp";
+  session.step = 1;
+  session.profile = {};
+  METRICS.flows.bpStarted++;
+  return makeCard({
+    title: "مسار الضغط الذكي",
+    category: "bp",
+    verdict: "اختر فئتك العمرية:",
+    tips: [],
+    when_to_seek_help: "",
+    next_question: "",
+    quick_choices: ["أقل من 18", "18–40", "41–60", "60+"],
+  });
+}
+
+function handleBpFlow(session, message) {
+  const m = String(message || "").trim();
+  if (session.step === 1) {
+    session.profile.ageGroup = m;
+    session.step = 2;
+    return makeCard({
+      title: "مسار الضغط الذكي",
+      category: "bp",
+      verdict: "هل تم تشخيصك بضغط الدم من قبل؟",
+      tips: [],
+      when_to_seek_help: "",
+      next_question: "",
+      quick_choices: ["نعم", "لا", "غير متأكد"],
+    });
+  }
+  if (session.step === 2) {
+    session.profile.diagnosed = m;
+    session.step = 3;
+    return makeCard({
+      title: "مسار الضغط الذكي",
+      category: "bp",
+      verdict: "هل عندك قراءة ضغط تقريبية الآن؟",
+      tips: ["إذا ما تعرف، اختار: ما أعرف."],
+      when_to_seek_help: "",
+      next_question: "",
+      quick_choices: ["عندي قراءة", "ما أعرف"],
+    });
+  }
+  if (session.step === 3) {
+    session.profile.hasReading = m;
+    session.step = 4; // ready
+    return null;
+  }
+  return null;
+}
+
+// -------- BMI
+function startBmiFlow(session) {
+  session.flow = "bmi";
+  session.step = 1;
+  session.profile = {};
+  METRICS.flows.bmiStarted++;
+  return makeCard({
+    title: "مسار BMI الذكي",
+    category: "bmi",
+    verdict: "اختر هدفك الآن:",
+    tips: [],
+    when_to_seek_help: "",
+    next_question: "",
+    quick_choices: ["إنقاص وزن", "زيادة وزن", "تحسين لياقة", "متابعة عامة"],
+  });
+}
+
+function handleBmiFlow(session, message) {
+  const m = String(message || "").trim();
+  if (session.step === 1) {
+    session.profile.goal = m;
+    session.step = 2;
+    return makeCard({
+      title: "مسار BMI الذكي",
+      category: "bmi",
+      verdict: "اختر فئتك العمرية:",
+      tips: [],
+      when_to_seek_help: "",
+      next_question: "",
+      quick_choices: ["أقل من 18", "18–40", "41–60", "60+"],
+    });
+  }
+  if (session.step === 2) {
+    session.profile.ageGroup = m;
+    session.step = 3;
+    return makeCard({
+      title: "مسار BMI الذكي",
+      category: "bmi",
+      verdict:
+        "هل تفضل حساب BMI؟\n" +
+        "إذا نعم: اكتب بصيغة (وزن 70 كجم، طول 170 سم) أو اضغط: أكتب البيانات.",
+      tips: ["بدون بيانات، أعطيك نصائح عامة حسب هدفك."],
+      when_to_seek_help: "",
+      next_question: "",
+      quick_choices: ["أكتب البيانات", "بدون حساب"],
+    });
+  }
+  if (session.step === 3) {
+    session.profile.calc = m;
+    session.step = 4; // ready
+    return null;
+  }
+  return null;
+}
+
+function resetFlow(session) {
+  session.flow = null;
+  session.step = 0;
+  session.profile = {};
 }
 
 /* =========================
    Routes
 ========================= */
 app.get("/", (req, res) => {
-  res.json({
-    ok: true,
-    service: "Dalil Alafiyah API",
-    routes: ["/chat", "/report", "/reset", "/metrics"],
-  });
+  res.json({ ok: true, service: "Dalil Alafiyah API", routes: ["/chat", "/report", "/reset", "/metrics"] });
 });
 
 app.get("/metrics", (req, res) => {
@@ -498,15 +599,13 @@ app.post("/chat", async (req, res) => {
   const message = String(req.body?.message || "").trim();
   if (!message) return res.status(400).json({ ok: false, error: "empty_message" });
 
-  // زر إلغاء/إعادة
+  // Cancel / restart flow
   if (/^(إلغاء|الغاء|cancel|ابدأ من جديد|ابدأ جديد)$/i.test(message)) {
-    session.flow = null;
-    session.step = 0;
-    session.profile = {};
+    resetFlow(session);
     const card = makeCard({
-      title: "تم",
+      title: "تم الإلغاء",
       category: "general",
-      verdict: "تم إلغاء المسار. تقدر تختار موضوع جديد.",
+      verdict: "تم إلغاء المسار. اختر مسارًا جديدًا:",
       tips: [],
       when_to_seek_help: "",
       next_question: "",
@@ -518,7 +617,7 @@ app.post("/chat", async (req, res) => {
     return res.json({ ok: true, data: card });
   }
 
-  // مواعيد: رد ثابت
+  // appointments route
   if (looksLikeAppointments(message) || /شفاء/i.test(message)) {
     const card = appointmentsCard();
     session.lastCard = card;
@@ -528,23 +627,41 @@ app.post("/chat", async (req, res) => {
     return res.json({ ok: true, data: card });
   }
 
-  // Emergency trigger counter
+  // emergency count
   if (inferCategoryFromMessage(message) === "emergency") METRICS.emergencyTriggers++;
 
-  // 1) إذا ليس داخل Flow و الرسالة تشير للسكر بشكل واضح -> ابدأ المسار
+  // START FLOW via short intents
   const inferred = inferCategoryFromMessage(message);
-  const shortSugarIntent =
-    inferred === "sugar" && message.length <= 20; // مثل "سكر" "السكر" "🩸 السكر"
-  if (!session.flow && shortSugarIntent) {
-    const card = startSugarFlow(session);
-    session.lastCard = card;
-    bumpCategory("sugar");
-    METRICS.chatOk++;
-    updateAvgLatency(Date.now() - t0);
-    return res.json({ ok: true, data: card });
+  const shortIntent = message.length <= 24;
+
+  if (!session.flow && shortIntent) {
+    if (/^(السكر|سكر|🩸 السكر)$/i.test(message) || inferred === "sugar") {
+      const card = startSugarFlow(session);
+      session.lastCard = card;
+      bumpCategory("sugar");
+      METRICS.chatOk++;
+      updateAvgLatency(Date.now() - t0);
+      return res.json({ ok: true, data: card });
+    }
+    if (/^(الضغط|ضغط|🫀 الضغط)$/i.test(message) || inferred === "bp") {
+      const card = startBpFlow(session);
+      session.lastCard = card;
+      bumpCategory("bp");
+      METRICS.chatOk++;
+      updateAvgLatency(Date.now() - t0);
+      return res.json({ ok: true, data: card });
+    }
+    if (/^(bmi|BMI|⚖️ BMI)$/i.test(message) || inferred === "bmi") {
+      const card = startBmiFlow(session);
+      session.lastCard = card;
+      bumpCategory("bmi");
+      METRICS.chatOk++;
+      updateAvgLatency(Date.now() - t0);
+      return res.json({ ok: true, data: card });
+    }
   }
 
-  // 2) إذا داخل مسار السكر: كمل الأسئلة
+  // CONTINUE FLOW
   if (session.flow === "sugar" && session.step > 0 && session.step < 4) {
     const card = handleSugarFlow(session, message);
     if (card) {
@@ -554,10 +671,31 @@ app.post("/chat", async (req, res) => {
       updateAvgLatency(Date.now() - t0);
       return res.json({ ok: true, data: card });
     }
-    // لو رجع null يعني وصلنا للـ step=4 وجاهزين للتوليد
   }
 
-  // 3) بناء سياق + تخصيص
+  if (session.flow === "bp" && session.step > 0 && session.step < 4) {
+    const card = handleBpFlow(session, message);
+    if (card) {
+      session.lastCard = card;
+      bumpCategory("bp");
+      METRICS.chatOk++;
+      updateAvgLatency(Date.now() - t0);
+      return res.json({ ok: true, data: card });
+    }
+  }
+
+  if (session.flow === "bmi" && session.step > 0 && session.step < 4) {
+    const card = handleBmiFlow(session, message);
+    if (card) {
+      session.lastCard = card;
+      bumpCategory("bmi");
+      METRICS.chatOk++;
+      updateAvgLatency(Date.now() - t0);
+      return res.json({ ok: true, data: card });
+    }
+  }
+
+  // LLM call
   session.history.push({ role: "user", content: message });
   session.history = trimHistory(session.history, 8);
 
@@ -565,11 +703,14 @@ app.post("/chat", async (req, res) => {
   const lastStr = last ? clampText(JSON.stringify(last), 1200) : "";
   const msgStr = clampText(message, 1200);
 
-  // profile (إذا موجود)
   const profileStr =
-    session.flow === "sugar" && session.step === 4
-      ? clampText(JSON.stringify(session.profile), 500)
-      : "";
+    session.flow && session.step === 4 ? clampText(JSON.stringify(session.profile), 700) : "";
+
+  // Decide category for flow completion
+  let flowCategory = null;
+  if (session.flow === "sugar" && session.step === 4) flowCategory = "sugar";
+  if (session.flow === "bp" && session.step === 4) flowCategory = "bp";
+  if (session.flow === "bmi" && session.step === 4) flowCategory = "bmi";
 
   const userPrompt =
     (profileStr
@@ -587,18 +728,19 @@ app.post("/chat", async (req, res) => {
       maxTokens: 1200,
     });
 
-    // تثبيت التصنيف بشكل منطقي
+    // Stabilize category
     let finalCategory = obj?.category || inferred || "general";
 
-    // إذا داخل مسار السكر وخلاص جمعنا البيانات، نخليها sugar
-    if (session.flow === "sugar" && session.step === 4) {
-      finalCategory = "sugar";
-      // بعد الرد نخرج من المسار
-      session.flow = null;
-      session.step = 0;
-      session.profile = {};
+    if (flowCategory) {
+      finalCategory = flowCategory;
+      // complete flow metrics
+      if (flowCategory === "sugar") METRICS.flows.sugarCompleted++;
+      if (flowCategory === "bp") METRICS.flows.bpCompleted++;
+      if (flowCategory === "bmi") METRICS.flows.bmiCompleted++;
+      // exit flow
+      resetFlow(session);
     } else {
-      // منع التصنيف العشوائي
+      // prevent random category
       if (inferred && finalCategory !== inferred && finalCategory !== "appointments") {
         finalCategory = inferred;
       }
@@ -608,7 +750,6 @@ app.post("/chat", async (req, res) => {
     const safeCard = postFilterCard(card);
 
     session.lastCard = safeCard;
-
     session.history.push({ role: "assistant", content: JSON.stringify(safeCard) });
     session.history = trimHistory(session.history, 10);
 

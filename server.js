@@ -1,11 +1,3 @@
-/**
- * Dalil Alafiyah API (Improved)
- * - أقل رفض للأسئلة العادية
- * - يسمح بذكر أسماء الأدوية (بدون جرعات/وصفات)
- * - يمنع فقط: الجرعات/الوصفات/طريقة الاستخدام
- * - يمرر history للنموذج لتحسين السياق
- */
-
 import "dotenv/config";
 import express from "express";
 import cors from "cors";
@@ -52,25 +44,43 @@ app.use(
 function requireApiKey(req, res, next) {
   if (!INTERNAL_API_KEY) return next();
   const key = req.header("x-api-key");
-  if (key !== INTERNAL_API_KEY) return res.status(401).json({ ok: false, error: "unauthorized" });
+  if (key !== INTERNAL_API_KEY)
+    return res.status(401).json({ ok: false, error: "unauthorized" });
   next();
 }
 app.use(requireApiKey);
 
-// عدّلها حسب نطاقك
+// ✅ CORS: يسمح لدومينك + netlify + localhost + (اختياري) koyeb domains
 const ALLOWED_ORIGINS = new Set([
   "https://alafya.netlify.app",
   "http://localhost:5173",
   "http://localhost:3000",
   "http://localhost:8000",
-  "http://192.168.0.182:8000",
 ]);
+
+function isAllowedOrigin(origin) {
+  try {
+    const u = new URL(origin);
+
+    // ✅ شدّد/عدّل هنا حسب احتياجك
+    if (ALLOWED_ORIGINS.has(origin)) return true;
+    if (u.hostname === "localhost") return true;
+    if (u.hostname.endsWith(".netlify.app")) return true;
+
+    // إذا عندك دومين ثابت للسيرفر أو فرونت ثاني، أضفه:
+    // if (u.hostname === "yourdomain.com") return true;
+
+    return false;
+  } catch {
+    return false;
+  }
+}
 
 app.use(
   cors({
     origin: (origin, cb) => {
-      if (!origin) return cb(null, true);
-      if (ALLOWED_ORIGINS.has(origin)) return cb(null, true);
+      if (!origin) return cb(null, true); // أدوات/بوستمان
+      if (isAllowedOrigin(origin)) return cb(null, true);
       return cb(new Error("CORS blocked: " + origin));
     },
     methods: ["GET", "POST", "OPTIONS"],
@@ -120,13 +130,25 @@ function bumpCategory(cat) {
 function updateAvgLatency(ms) {
   const alpha = 0.2;
   METRICS.avgLatencyMs =
-    METRICS.avgLatencyMs === 0 ? ms : Math.round(alpha * ms + (1 - alpha) * METRICS.avgLatencyMs);
+    METRICS.avgLatencyMs === 0
+      ? ms
+      : Math.round(alpha * ms + (1 - alpha) * METRICS.avgLatencyMs);
 }
 
 /* =========================
    Sessions (in-memory) + TTL
 ========================= */
 const sessions = new Map(); // userId -> { history, lastCard, flow, step, profile, ts }
+
+// ✅ حل خلط المستخدمين: لو ما في x-user-id، نستخدم ip + user-agent
+function getUserId(req) {
+  const headerId = req.header("x-user-id");
+  if (headerId) return headerId;
+
+  const ua = req.header("user-agent") || "na";
+  // قصّ الـUA لتجنب طول مبالغ فيه
+  return `anon:${req.ip}:${ua.slice(0, 60)}`;
+}
 
 function getSession(userId) {
   const id = userId || "anon";
@@ -203,9 +225,35 @@ function clampText(s, maxChars) {
   return t.slice(0, maxChars) + "\n...[تم قص النص لتفادي الأخطاء]";
 }
 
+// ✅ Greeting / Thanks handler (حل مشكلة السلام)
+function normalizeArabic(s) {
+  return String(s || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[\u064B-\u0652\u0670]/g, "") // تشكيل
+    .replace(/[أإآ]/g, "ا")
+    .replace(/ى/g, "ي")
+    .replace(/ة/g, "ه")
+    .replace(/\s+/g, " ");
+}
+
+function isGreeting(text) {
+  const t = normalizeArabic(text);
+  return /^(السلام عليكم|سلام عليكم|السلام|سلام|مرحبا|اهلا|هلا|صباح الخير|مساء الخير)([!؟. ]*)$/.test(
+    t
+  );
+}
+
+function isThanks(text) {
+  const t = normalizeArabic(text);
+  return /^(شكرا|شكرًا|مشكور|يعطيك العافيه|جزاك الله خير)([!؟. ]*)$/.test(t);
+}
+
 function looksLikeAppointments(text) {
   const t = String(text || "");
-  return /موعد|مواعيد|حجز|احجز|حجوزات|حجزت|حجزي|appointment|booking|شفاء/i.test(t);
+  return /موعد|مواعيد|حجز|احجز|حجوزات|حجزت|حجزي|appointment|booking|شفاء/i.test(
+    t
+  );
 }
 
 function isEmergencyText(text) {
@@ -219,14 +267,22 @@ function inferCategoryFromMessage(message) {
 
   if (isEmergencyText(t)) return "emergency";
   if (looksLikeAppointments(t)) return "appointments";
-  if (/(تقرير|تحاليل|تحليل|نتيجة|cbc|hba1c|cholesterol|vitamin|lab|report|pdf|صورة)/i.test(t))
+  if (
+    /(تقرير|تحاليل|تحليل|نتيجة|cbc|hba1c|cholesterol|vitamin|lab|report|pdf|صورة)/i.test(
+      t
+    )
+  )
     return "report";
-  if (/(قلق|توتر|اكتئاب|مزاج|نوم|أرق|panic|anxiety|depress)/i.test(t)) return "mental";
+  if (/(قلق|توتر|اكتئاب|مزاج|نوم|أرق|panic|anxiety|depress)/i.test(t))
+    return "mental";
   if (/(bmi|كتلة الجسم|مؤشر كتلة|وزني|طولي)/i.test(t)) return "bmi";
-  if (/(ضغط|ضغط الدم|systolic|diastolic|mmhg|ملم زئبقي)/i.test(t)) return "bp";
-  if (/(سكر|سكري|glucose|mg\/dl|صائم|بعد الأكل|بعد الاكل|hba1c)/i.test(t)) return "sugar";
+  if (/(ضغط|ضغط الدم|systolic|diastolic|mmhg|ملم زئبقي)/i.test(t))
+    return "bp";
+  if (/(سكر|سكري|glucose|mg\/dl|صائم|بعد الأكل|بعد الاكل|hba1c)/i.test(t))
+    return "sugar";
   if (/(ماء|سوائل|شرب|ترطيب|hydration)/i.test(t)) return "water";
-  if (/(سعرات|calories|دايت|رجيم|تخسيس|تنحيف|زيادة وزن|نظام غذائي)/i.test(t)) return "calories";
+  if (/(سعرات|calories|دايت|رجيم|تخسيس|تنحيف|زيادة وزن|نظام غذائي)/i.test(t))
+    return "calories";
   if (/(اسعافات|إسعافات|حروق|جرح|اختناق|إغماء|نزيف|كسر|first aid)/i.test(t))
     return "first_aid";
   return "general";
@@ -258,7 +314,8 @@ function menuCard() {
     category: "general",
     verdict: "اختر مسارًا (كلها ذكية بأسئلة تخصيص قصيرة):",
     tips: [],
-    when_to_seek_help: "إذا أعراض خطيرة (ألم صدر/ضيق نفس/إغماء/نزيف شديد): طوارئ فورًا.",
+    when_to_seek_help:
+      "إذا أعراض خطيرة (ألم صدر/ضيق نفس/إغماء/نزيف شديد): طوارئ فورًا.",
     next_question: "وش تحب تبدأ فيه؟",
     quick_choices: [
       "🩸 السكر",
@@ -271,6 +328,32 @@ function menuCard() {
       "📄 افهم تقريرك",
       "📅 مواعيد شفاء",
     ],
+  });
+}
+
+function greetingCard() {
+  return makeCard({
+    title: "دليل العافية",
+    category: "general",
+    verdict:
+      "وعليكم السلام ورحمة الله وبركاته 🌿\nأنا هنا للتثقيف الصحي. كيف أقدر أساعدك اليوم؟",
+    tips: ["اختر من المسارات السريعة أو اكتب سؤالك مباشرة."],
+    when_to_seek_help:
+      "إذا عندك ألم صدر/ضيق نفس/إغماء/نزيف شديد: طوارئ فورًا.",
+    next_question: "وش تبغى تبدأ فيه؟",
+    quick_choices: menuCard().quick_choices,
+  });
+}
+
+function thanksCard() {
+  return makeCard({
+    title: "دليل العافية",
+    category: "general",
+    verdict: "العفو 🌿 إذا تحب، اكتب سؤالك الصحي مباشرة أو اختر مسار من القائمة.",
+    tips: [],
+    when_to_seek_help: "إذا أعراض طارئة: طوارئ فورًا.",
+    next_question: "وش تحب تسأل؟",
+    quick_choices: ["🩸 السكر", "🫀 الضغط", "⚖️ BMI", "💧 شرب الماء"],
   });
 }
 
@@ -376,7 +459,7 @@ function startFlow(session, flowKey) {
   if (flowKey === "first_aid") {
     return makeCard({
       title: "🩹 مسار الإسعافات الأولية الذكي",
-      category: "first_aid",
+      category: "general",
       verdict: "اختر الموقف الأقرب:",
       tips: [],
       when_to_seek_help: "إذا فقدان وعي/نزيف شديد/صعوبة تنفس: اتصل بالإسعاف فورًا.",
@@ -390,11 +473,10 @@ function startFlow(session, flowKey) {
 
 function parseWeightHeight(text) {
   const t = String(text || "").toLowerCase();
+  const w = t.match(/(\d{2,3})\s*(kg|كجم|كغ|كيلو|كيلوجرام)?/i);
+  const h = t.match(/(\d{2,3})\s*(cm|سم|سنتيمتر)?/i);
   const w2 = t.match(/وزن\s*[:=]?\s*(\d{2,3})/i);
   const h2 = t.match(/طول\s*[:=]?\s*(\d{2,3})/i);
-
-  const w = t.match(/(\d{2,3})\s*(kg|كجم|كغ|كيلو|كيلوجرام)\b/i);
-  const h = t.match(/(\d{2,3})\s*(cm|سم|سنتيمتر)\b/i);
 
   const weight = w2 ? Number(w2[1]) : w ? Number(w[1]) : null;
   const height = h2 ? Number(h2[1]) : h ? Number(h[1]) : null;
@@ -415,9 +497,9 @@ function continueFlow(session, message) {
   const flow = session.flow;
   const step = session.step;
   const m = String(message || "").trim();
+
   const commonAge = ["أقل من 18", "18–40", "41–60", "60+"];
 
-  // sugar
   if (flow === "sugar") {
     if (step === 1) {
       session.profile.ageGroup = m;
@@ -452,7 +534,6 @@ function continueFlow(session, message) {
     }
   }
 
-  // bp
   if (flow === "bp") {
     if (step === 1) {
       session.profile.ageGroup = m;
@@ -505,7 +586,6 @@ function continueFlow(session, message) {
     }
   }
 
-  // bmi
   if (flow === "bmi") {
     if (step === 1) {
       session.profile.goal = m;
@@ -561,7 +641,6 @@ function continueFlow(session, message) {
     }
   }
 
-  // water
   if (flow === "water") {
     if (step === 1) {
       session.profile.activity = m;
@@ -602,7 +681,6 @@ function continueFlow(session, message) {
     }
   }
 
-  // calories
   if (flow === "calories") {
     if (step === 1) {
       session.profile.goal = m;
@@ -637,7 +715,6 @@ function continueFlow(session, message) {
     }
   }
 
-  // mental
   if (flow === "mental") {
     if (step === 1) {
       session.profile.mood = m;
@@ -672,7 +749,6 @@ function continueFlow(session, message) {
     }
   }
 
-  // first aid
   if (flow === "first_aid") {
     if (step === 1) {
       session.profile.scenario = m;
@@ -681,7 +757,6 @@ function continueFlow(session, message) {
     }
   }
 
-  // general
   if (flow === "general") {
     if (step === 1) {
       session.profile.intent = m;
@@ -714,7 +789,6 @@ const CARD_SCHEMA = {
         "sugar",
         "water",
         "calories",
-        "first_aid",
       ],
     },
     verdict: { type: "string" },
@@ -736,15 +810,13 @@ const CARD_SCHEMA = {
 
 function chatSystemPrompt() {
   return (
-    "أنت مساعد تثقيف صحي عربي.\n" +
-    "قدّم معلومات عامة وآمنة عن الأعراض الشائعة ونمط الحياة والوقاية وفهم المصطلحات الطبية.\n" +
-    "قيود صارمة:\n" +
-    "- لا تشخّص حالة المستخدم تشخيصًا مؤكدًا.\n" +
-    "- لا تكتب وصفة علاج شخصية أو جرعات أو طريقة استخدام دواء.\n" +
-    "- إذا طُلبت جرعات/أدوية: اشرح الفكرة بشكل عام واقترح مراجعة طبيب/صيدلي.\n" +
-    "- اسأل سؤال/سؤالين توضيحيين فقط عند الحاجة.\n" +
-    "دائمًا: اذكر علامات الخطر التي تستدعي الطوارئ.\n" +
-    "إذا السؤال غير طبي أو عام: أجب بشكل طبيعي.\n" +
+    "أنت مساعد تثقيف صحي فقط، ولست طبيبًا ولا بديلاً عن الاستشارة الطبية.\n" +
+    "إذا بدأ المستخدم بتحية، ابدأ برد اجتماعي قصير (مثل: وعليكم السلام) ثم انتقل للسؤال الصحي.\n" +
+    "قدّم معلومات عامة عن الصحة ونمط الحياة بأسلوب عربي واضح ومختصر.\n" +
+    "ممنوع منعًا باتًا: التشخيص، وصف الأدوية، الجرعات، أو خطة علاج.\n" +
+    "اذكر متى يجب مراجعة الطبيب/الطوارئ عند أعراض خطيرة.\n" +
+    "إذا لم تكن متأكدًا، قل: لا أعلم.\n" +
+    "التزم بسؤال المستخدم وبيانات التخصيص فقط.\n" +
     "أخرج JSON فقط بالمفاتيح المحددة.\n"
   );
 }
@@ -752,16 +824,14 @@ function chatSystemPrompt() {
 function reportSystemPrompt() {
   return (
     "أنت مساعد تثقيف صحي عربي لشرح نتائج التحاليل/التقارير.\n" +
-    "اشرح بالعربية معنى القيم بشكل عام، وما الذي قد يدل عليه بشكل احتمالي (غير مؤكد)، ونصائح عامة.\n" +
-    "قيود:\n" +
-    "- لا تشخيص مؤكد.\n" +
-    "- لا جرعات ولا وصف علاج.\n" +
-    "اذكر متى يجب مراجعة الطبيب/الطوارئ.\n" +
+    "المدخل نص مُستخرج من صورة/ملف.\n" +
+    "اشرح بالعربية بشكل عام + نصائح عامة + متى يراجع الطبيب.\n" +
+    "ممنوع: تشخيص مؤكد، جرعات، وصف علاج.\n" +
     "أخرج JSON فقط بنفس مفاتيح البطاقة.\n"
   );
 }
 
-async function callGroqJSON({ system, user, history = [], maxTokens = 1400 }) {
+async function callGroqJSON({ system, user, maxTokens = 1400 }) {
   if (!GROQ_API_KEY) throw new Error("Missing GROQ_API_KEY");
 
   const url = "https://api.groq.com/openai/v1/chat/completions";
@@ -771,11 +841,14 @@ async function callGroqJSON({ system, user, history = [], maxTokens = 1400 }) {
     max_tokens: maxTokens,
     response_format: {
       type: "json_schema",
-      json_schema: { name: "dalil_alafiyah_card", strict: true, schema: CARD_SCHEMA },
+      json_schema: {
+        name: "dalil_alafiyah_card",
+        strict: true,
+        schema: CARD_SCHEMA,
+      },
     },
     messages: [
       { role: "system", content: system },
-      ...history.slice(-6), // سياق مختصر
       { role: "user", content: user },
     ],
   };
@@ -783,7 +856,10 @@ async function callGroqJSON({ system, user, history = [], maxTokens = 1400 }) {
   for (let attempt = 0; attempt < 3; attempt++) {
     const res = await fetch(url, {
       method: "POST",
-      headers: { Authorization: `Bearer ${GROQ_API_KEY}`, "Content-Type": "application/json" },
+      headers: {
+        Authorization: `Bearer ${GROQ_API_KEY}`,
+        "Content-Type": "application/json",
+      },
       body: JSON.stringify(body),
     });
 
@@ -793,7 +869,8 @@ async function callGroqJSON({ system, user, history = [], maxTokens = 1400 }) {
     }
 
     const data = await res.json().catch(() => ({}));
-    if (!res.ok) throw new Error(`Groq API error: ${res.status} ${JSON.stringify(data)}`);
+    if (!res.ok)
+      throw new Error(`Groq API error: ${res.status} ${JSON.stringify(data)}`);
 
     const text = data?.choices?.[0]?.message?.content || "";
     const parsed = safeJsonParse(text);
@@ -806,45 +883,35 @@ async function callGroqJSON({ system, user, history = [], maxTokens = 1400 }) {
 }
 
 /* =========================
-   Safety post-filter (Improved)
-   - يسمح بذكر أسماء الأدوية
-   - يمنع فقط الجرعات/الوصفات/طريقة الاستخدام
+   Safety post-filter
 ========================= */
 function postFilterCard(card) {
-  const text =
+  const bad =
+    /(خذ|خذي|جرعة|مرتين يوميًا|مرتين يوميا|ثلاث مرات|حبوب|دواء|انسولين|metformin|ibuprofen|paracetamol)/i;
+
+  const combined =
     (card?.verdict || "") +
     "\n" +
     (Array.isArray(card?.tips) ? card.tips.join("\n") : "") +
     "\n" +
-    (card?.when_to_seek_help || "") +
-    "\n" +
-    (card?.next_question || "");
+    (card?.when_to_seek_help || "");
 
-  // إشارات جرعات/وصفة/طريقة استخدام (هذه فقط اللي نمنعها)
-  const dosingSignals =
-    /(جرعة|mg\b|ملغ|ملجم|mcg|ميكرو|قرص|حبوب|كبسول|شراب|مل\b|mL\b|مرة يوم|مرتين|ثلاث|كل\s*\d+\s*ساع|قبل الأكل|بعد الأكل|لمدة\s*\d+|يوميا|يوميًا|استمر|ابدأ|أوقف|زد|قلل|خذ|خذي|تناول|استخدم|ضع|يُؤخذ|يُستخدم)/i;
-
-  // جملة صريحة كـ "خذ الدواء الفلاني"
-  const directPrescription =
-    /(خذ|خذي|تناول|استخدم)\s+([^\n]{0,40})/i;
-
-  if (dosingSignals.test(text) || directPrescription.test(text)) {
+  if (bad.test(combined)) {
     return makeCard({
       title: "تنبيه",
       category: card?.category || "general",
       verdict:
-        "أقدر أساعد بمعلومات عامة، لكن ما أقدر أكتب جرعات أو وصفة دوائية أو طريقة استخدام.\n" +
-        "إذا تبي، قلّي: العمر + الأمراض المزمنة + الأدوية الحالية + الأعراض ومدة ظهورها، وأعطيك إرشادات عامة ومتى تحتاج طبيب.",
+        "أنا للتثقيف الصحي فقط. ما أقدر أوصف أدوية أو جرعات.\n" +
+        "إذا سؤالك علاجي أو دوائي، راجع طبيب/صيدلي.",
       tips: [
-        "إذا عندك حمل/حساسية/مرض مزمن: لا تستخدم أي دواء بدون مختص.",
-        "إذا الأعراض شديدة أو تتدهور بسرعة: توجه للطوارئ.",
+        "اكتب للطبيب الأعراض ومدة المشكلة والأدوية الحالية إن وجدت.",
+        "إذا أعراض شديدة: طوارئ.",
       ],
-      when_to_seek_help: "ألم صدر/ضيق نفس/إغماء/نزيف شديد/ضعف مفاجئ: طوارئ فورًا.",
-      next_question: "وش الأعراض وكم لها؟",
-      quick_choices: ["أعراض هضم", "صداع", "برد/زكام", "حساسية", "أخرى"],
+      when_to_seek_help: "ألم صدر/ضيق نفس/إغماء/نزيف شديد: طوارئ فورًا.",
+      next_question: "هل تريد نصائح نمط حياة بدل العلاج؟",
+      quick_choices: ["نعم", "لا"],
     });
   }
-
   return card;
 }
 
@@ -864,7 +931,7 @@ app.get("/metrics", (req, res) => {
 });
 
 app.post("/reset", (req, res) => {
-  const userId = req.header("x-user-id") || "anon";
+  const userId = getUserId(req);
   sessions.delete(userId);
   res.json({ ok: true });
 });
@@ -873,23 +940,35 @@ app.post("/chat", async (req, res) => {
   const t0 = Date.now();
   METRICS.chatRequests++;
 
-  const userId = req.header("x-user-id") || "anon";
+  const userId = getUserId(req);
   const session = getSession(userId);
 
   const message = String(req.body?.message || "").trim();
   if (!message) return res.status(400).json({ ok: false, error: "empty_message" });
 
-  // "مسح/إلغاء"
+  // ✅ تحية/شكر: رد جاهز بدون LLM (قبل أي شيء)
+  if (isGreeting(message)) {
+    const card = greetingCard();
+    session.lastCard = card;
+    bumpCategory("general");
+    METRICS.chatOk++;
+    updateAvgLatency(Date.now() - t0);
+    return res.json({ ok: true, data: card });
+  }
+  if (isThanks(message)) {
+    const card = thanksCard();
+    session.lastCard = card;
+    bumpCategory("general");
+    METRICS.chatOk++;
+    updateAvgLatency(Date.now() - t0);
+    return res.json({ ok: true, data: card });
+  }
+
+  // “مسح/إلغاء”
   if (/^(إلغاء|الغاء|cancel|مسح|مسح المحادثة|ابدأ من جديد|ابدأ جديد)$/i.test(message)) {
     resetFlow(session);
     const card = menuCard();
     session.lastCard = card;
-
-    // history
-    session.history.push({ role: "user", content: message });
-    session.history.push({ role: "assistant", content: JSON.stringify(card) });
-    session.history = trimHistory(session.history, 10);
-
     METRICS.chatOk++;
     updateAvgLatency(Date.now() - t0);
     return res.json({ ok: true, data: card });
@@ -909,14 +988,8 @@ app.post("/chat", async (req, res) => {
       next_question: "هل أنت في أمان الآن؟",
       quick_choices: ["نعم", "لا"],
     });
-
     session.lastCard = card;
     bumpCategory("emergency");
-
-    session.history.push({ role: "user", content: message });
-    session.history.push({ role: "assistant", content: JSON.stringify(card) });
-    session.history = trimHistory(session.history, 10);
-
     METRICS.chatOk++;
     updateAvgLatency(Date.now() - t0);
     return res.json({ ok: true, data: card });
@@ -927,41 +1000,30 @@ app.post("/chat", async (req, res) => {
     const card = appointmentsCard();
     session.lastCard = card;
     bumpCategory("appointments");
-
-    session.history.push({ role: "user", content: message });
-    session.history.push({ role: "assistant", content: JSON.stringify(card) });
-    session.history = trimHistory(session.history, 10);
-
     METRICS.chatOk++;
     updateAvgLatency(Date.now() - t0);
     return res.json({ ok: true, data: card });
   }
 
-  // توجيه للتقرير
+  // افهم تقريرك
   if (/افهم\s*تقريرك|تقرير|تحاليل/i.test(message) && message.length <= 30) {
     const card = makeCard({
       title: "📄 افهم تقريرك",
       category: "report",
-      verdict: "تمام. اضغط زر 📎 (إضافة مرفق) وارفع صورة أو PDF للتقرير، وأنا أشرح لك بشكل عام.",
+      verdict:
+        "تمام. اضغط زر 📎 (إضافة مرفق) وارفع صورة أو PDF للتقرير، وأنا أشرح لك بشكل عام.",
       tips: ["لا ترفع بيانات شخصية حساسة إن أمكن."],
       when_to_seek_help: "إذا أعراض شديدة مع التقرير: راجع الطبيب/الطوارئ.",
       next_question: "جاهز ترفع التقرير؟",
       quick_choices: ["📎 إضافة مرفق", "إلغاء"],
     });
-
     session.lastCard = card;
     bumpCategory("report");
-
-    session.history.push({ role: "user", content: message });
-    session.history.push({ role: "assistant", content: JSON.stringify(card) });
-    session.history = trimHistory(session.history, 10);
-
     METRICS.chatOk++;
     updateAvgLatency(Date.now() - t0);
     return res.json({ ok: true, data: card });
   }
 
-  // بدء مسار من “المنيو”
   const inferred = inferCategoryFromMessage(message);
 
   const startMap = [
@@ -981,11 +1043,6 @@ app.post("/chat", async (req, res) => {
     if (short && matched) {
       const card = startFlow(session, matched.key);
       session.lastCard = card;
-
-      session.history.push({ role: "user", content: message });
-      session.history.push({ role: "assistant", content: JSON.stringify(card) });
-      session.history = trimHistory(session.history, 10);
-
       METRICS.chatOk++;
       updateAvgLatency(Date.now() - t0);
       return res.json({ ok: true, data: card });
@@ -993,41 +1050,31 @@ app.post("/chat", async (req, res) => {
 
     if (
       short &&
-      ["sugar", "bp", "bmi", "water", "calories", "mental", "first_aid"].includes(inferred)
+      ["sugar", "bp", "bmi", "water", "calories", "mental", "first_aid"].includes(
+        inferred
+      )
     ) {
       const card = startFlow(session, inferred);
       session.lastCard = card;
-
-      session.history.push({ role: "user", content: message });
-      session.history.push({ role: "assistant", content: JSON.stringify(card) });
-      session.history = trimHistory(session.history, 10);
-
       METRICS.chatOk++;
       updateAvgLatency(Date.now() - t0);
       return res.json({ ok: true, data: card });
     }
   }
 
-  // متابعة مسار
   if (session.flow && session.step > 0 && session.step < 4) {
     const card = continueFlow(session, message);
     if (card) {
       session.lastCard = card;
-
-      session.history.push({ role: "user", content: message });
-      session.history.push({ role: "assistant", content: JSON.stringify(card) });
-      session.history = trimHistory(session.history, 10);
-
       METRICS.chatOk++;
       updateAvgLatency(Date.now() - t0);
       return res.json({ ok: true, data: card });
     }
-    // null => step=4 وجاهزين للتوليد
   }
 
-  // طلب LLM (عام أو نهاية مسار)
+  // طلب LLM
   session.history.push({ role: "user", content: message });
-  session.history = trimHistory(session.history, 10);
+  session.history = trimHistory(session.history, 8);
 
   const last = req.body?.context?.last || session.lastCard || null;
   const lastStr = last ? clampText(JSON.stringify(last), 1200) : "";
@@ -1036,7 +1083,6 @@ app.post("/chat", async (req, res) => {
   const profileStr =
     session.flow && session.step === 4 ? clampText(JSON.stringify(session.profile), 1200) : "";
 
-  // forced category عند نهاية المسار
   let forcedCategory = null;
   if (session.flow === "sugar" && session.step === 4) forcedCategory = "sugar";
   if (session.flow === "bp" && session.step === 4) forcedCategory = "bp";
@@ -1044,36 +1090,32 @@ app.post("/chat", async (req, res) => {
   if (session.flow === "water" && session.step === 4) forcedCategory = "water";
   if (session.flow === "calories" && session.step === 4) forcedCategory = "calories";
   if (session.flow === "mental" && session.step === 4) forcedCategory = "mental";
-  if (session.flow === "first_aid" && session.step === 4) forcedCategory = "first_aid";
+  if (session.flow === "first_aid" && session.step === 4) forcedCategory = "general";
   if (session.flow === "general" && session.step === 4) forcedCategory = "general";
 
   const userPrompt =
     (profileStr ? `بيانات تخصيص (اختيارات المستخدم):\n${profileStr}\n\n` : "") +
     (last ? `سياق آخر رد (استخدمه فقط إذا مرتبط):\n${lastStr}\n\n` : "") +
     `سؤال المستخدم:\n${msgStr}\n\n` +
-    "مهم:\n" +
-    "- لا تكتب جرعات/وصفات/طريقة استخدام أدوية.\n" +
-    "- مسموح ذكر أسماء أدوية بشكل عام (مثل: هذا يُستخدم عادةً لـ... بدون جرعات).\n" +
-    "- قدّم نصائح عملية عامة + متى يلزم طبيب/طوارئ.\n";
+    "الالتزام: لا تشخيص، لا أدوية، لا جرعات.\n" +
+    "قدّم نصائح عامة عملية + متى يراجع الطبيب/الطوارئ.\n";
 
   try {
     const obj = await callGroqJSON({
       system: chatSystemPrompt(),
       user: userPrompt,
-      history: session.history,
       maxTokens: 1200,
     });
 
     let finalCategory = obj?.category || inferred || "general";
-
     if (forcedCategory) {
       finalCategory = forcedCategory;
       METRICS.flows[`${session.flow}Completed`]++;
       resetFlow(session);
     } else {
-      // تثبيت فقط للفئات الحساسة
-      const strictCats = new Set(["emergency", "appointments", "report"]);
-      if (inferred && strictCats.has(inferred)) finalCategory = inferred;
+      if (inferred && finalCategory !== inferred && finalCategory !== "appointments") {
+        finalCategory = inferred;
+      }
     }
 
     const card = makeCard({ ...obj, category: finalCategory });
@@ -1100,7 +1142,7 @@ app.post("/report", upload.single("file"), async (req, res) => {
   const t0 = Date.now();
   METRICS.reportRequests++;
 
-  const userId = req.header("x-user-id") || "anon";
+  const userId = getUserId(req);
   const session = getSession(userId);
 
   const file = req.file;
@@ -1149,21 +1191,18 @@ app.post("/report", upload.single("file"), async (req, res) => {
       "نص مستخرج من تقرير/تحاليل:\n" +
       extractedClamped +
       "\n\n" +
-      "اشرح بالعربية بشكل عام معنى النتائج + احتمالات عامة (بدون تشخيص مؤكد) + نصائح عامة + متى يراجع الطبيب.\n" +
-      "ممنوع: جرعات أو وصف علاج.";
+      "اشرح بالعربية بشكل عام: ماذا يعني + نصائح عامة + متى يراجع الطبيب.\n" +
+      "التزم بما ورد في التقرير فقط.\n" +
+      "ممنوع تشخيص مؤكد أو جرعات أو وصف علاج.";
 
     const obj = await callGroqJSON({
       system: reportSystemPrompt(),
       user: userPrompt,
-      history: session.history,
       maxTokens: 1600,
     });
 
     const card = postFilterCard(makeCard({ ...obj, category: "report" }));
     session.lastCard = card;
-
-    session.history.push({ role: "assistant", content: JSON.stringify(card) });
-    session.history = trimHistory(session.history, 10);
 
     bumpCategory("report");
     METRICS.reportOk++;

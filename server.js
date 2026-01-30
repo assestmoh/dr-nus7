@@ -1181,8 +1181,9 @@ app.post("/chat", async (req, res) => {
     return res.json({ ok: true, data: card });
   }
 
-  // رسالة قصيرة/غامضة
-  if (isTooVague(message)) {
+  // رسالة قصيرة/غامضة (✅ لا نطبقها عند اكتمال مسار step=4)
+  const inCompletedFlow = session.flow && session.step === 4;
+  if (!inCompletedFlow && isTooVague(message)) {
     const card = makeCard({
       title: "توضيح سريع",
       category: inferred === "emergency" ? "emergency" : inferred || "general",

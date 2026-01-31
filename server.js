@@ -132,7 +132,7 @@ function updateAvgLatency(ms) {
 /* =========================
    Sessions (in-memory) + TTL
 ========================= */
-const sessions = new Map(); // userId -> { history, lastCard, flow, step, profile, ts }
+const sessions = new Map(); // userId -> { history, lastCard, flow, step, profile, ts, lastMsg, lastMsgAt, lastResponse }
 
 /** حل خلط المستخدمين إذا ما في x-user-id */
 function getUserId(req) {
@@ -152,6 +152,10 @@ function getSession(userId) {
       step: 0,
       profile: {},
       ts: Date.now(),
+      // ✅ لمنع تكرار الطلب/الرد
+      lastMsg: null,
+      lastMsgAt: 0,
+      lastResponse: null,
     });
   }
   const s = sessions.get(id);
@@ -269,14 +273,6 @@ function inferCategoryFromMessage(message) {
   if (/(اسعافات|إسعافات|حروق|جرح|اختناق|إغماء|نزيف|كسر|first aid)/i.test(t))
     return "first_aid";
   return "general";
-}
-
-/** ✅ جديد: إذا المستخدم ضغط زر من أزرار البطاقة */
-function isQuickChoiceHit(session, message) {
-  const m = String(message || "").trim();
-  const choices = session?.lastCard?.quick_choices;
-  if (!Array.isArray(choices) || choices.length === 0) return false;
-  return choices.some((c) => String(c).trim() === m);
 }
 
 /** ✅ مهم: استثناء المسارات من "غامض" */
@@ -544,17 +540,39 @@ function startFlow(session, flowKey) {
 
   if (flowKey === "first_aid") {
     return makeCard({
-      title: "🩹 مسار الإسعافات الأولية الذكي",
+      title: "🩹 إسعافات أولية (محكومة)",
       category: "general",
-      verdict: "اختر الموقف الأقرب:",
-      tips: [],
-      when_to_seek_help: "إذا فقدان وعي/نزيف شديد/صعوبة تنفس: اتصل بالإسعاف فورًا.",
-      next_question: "",
-      quick_choices: ["حروق بسيطة", "جرح/نزيف بسيط", "اختناق", "إغماء", "التواء/كدمة"],
+      verdict: "أقدّم إرشادات عامة وبسيطة فقط.\n🚨 علامات خطر تستدعي الطوارئ فورًا: ألم صدر، ضيق نفس، نزيف شديد، فقدان وعي، تشنجات، حساسية شديدة.\nإذا ما في علامات خطر، اختر حالة بسيطة:",
+      tips: ["لا تعتمد على البوت في الحالات الخطيرة."],
+      when_to_seek_help: "أي علامة خطورة: الآن.",
+      next_question: "وش الحالة الأقرب؟",
+      quick_choices: ["حرق خفيف", "جرح بسيط", "التواء/كدمة", "القائمة الرئيسية"],
     });
   }
 
   return menuCard();
+}
+
+function parseWeightHeight(text) {
+  const t = String(text || "").toLowerCase();
+  const w = t.match(/(\d{2,3})\s*(kg|كجم|كغ|كيلو|كيلوجرام)?/i);
+  const h = t.match(/(\d{2,3})\s*(cm|سم|سنتيمتر)?/i);
+  const w2 = t.match(/وزن\s*[:=]?\s*(\d{2,3})/i);
+  const h2 = t.match(/طول\s*[:=]?\s*(\d{2,3})/i);
+
+  const weight = w2 ? Number(w2[1]) : w ? Number(w[1]) : null;
+  const height = h2 ? Number(h2[1]) : h ? Number(h[1]) : null;
+
+  const W = weight && weight >= 25 && weight <= 250 ? weight : null;
+  const H = height && height >= 100 && height <= 220 ? height : null;
+
+  return { weightKg: W, heightCm: H };
+}
+
+function bmiFrom(weightKg, heightCm) {
+  const h = heightCm / 100;
+  const bmi = weightKg / (h * h);
+  return Math.round(bmi * 10) / 10;
 }
 
 function continueFlow(session, message) {
@@ -563,6 +581,221 @@ function continueFlow(session, message) {
   const m = String(message || "").trim();
 
   const commonAge = ["أقل من 18", "18–40", "41–60", "60+"];
+
+  if (flow === "sugar") {
+    if (step === 1) {
+      session.profile.ageGroup = m;
+      session.step = 2;
+      return makeCard({
+        title: "🩸 مسار السكر الذكي",
+        category: "sugar",
+        verdict: "هل تم تشخيصك بالسكري من قبل؟",
+        tips: [],
+        when_to_seek_help: "",
+        next_question: "",
+        quick_choices: ["نعم", "لا", "غير متأكد"],
+      });
+    }
+    if (step === 2) {
+      session.profile.diagnosed = m;
+      session.step = 3;
+      return makeCard({
+        title: "🩸 مسار السكر الذكي",
+        category: "sugar",
+        verdict: "وش هدفك الآن؟",
+        tips: [],
+        when_to_seek_help: "",
+        next_question: "",
+        quick_choices: ["فهم مبسط", "أكل مناسب", "تقليل الارتفاعات", "متابعة عامة"],
+      });
+    }
+    if (step === 3) {
+      session.profile.goal = m;
+      session.step = 4;
+      return null;
+    }
+  }
+
+  if (flow === "bp") {
+    if (step === 1) {
+      session.profile.ageGroup = m;
+      session.step = 2;
+      return makeCard({
+        title: "🫀 مسار الضغط الذكي",
+        category: "bp",
+        verdict: "هل تم تشخيصك بضغط الدم من قبل؟",
+        tips: [],
+        when_to_seek_help: "",
+        next_question: "",
+        quick_choices: ["نعم", "لا", "غير متأكد"],
+      });
+    }
+    if (step === 2) {
+      session.profile.diagnosed = m;
+      session.step = 3;
+      return makeCard({
+        title: "🫀 مسار الضغط الذكي",
+        category: "bp",
+        verdict: "هل لديك قراءة ضغط الآن/مؤخرًا؟ (اختياري)",
+        tips: ["إذا تعرفها، اكتبها مثل: 120/80. أو اختر: ما أعرف."],
+        when_to_seek_help: "",
+        next_question: "",
+        quick_choices: ["أكتب القراءة", "ما أعرف"],
+      });
+    }
+    if (step === 3) {
+      if (/ما\s*أعرف/i.test(m)) {
+        session.profile.reading = "unknown";
+        session.step = 4;
+        return null;
+      }
+      session.profile.reading = "pending";
+      session.step = 31;
+      return makeCard({
+        title: "🫀 مسار الضغط الذكي",
+        category: "bp",
+        verdict: "اكتب قراءة الضغط بالشكل (انقباضي/انبساطي) مثل: 120/80",
+        tips: [],
+        when_to_seek_help: "",
+        next_question: "",
+        quick_choices: ["إلغاء"],
+      });
+    }
+    if (step === 31) {
+      session.profile.readingValue = m;
+      session.step = 4;
+      return null;
+    }
+  }
+
+  if (flow === "bmi") {
+    if (step === 1) {
+      session.profile.goal = m;
+      session.step = 2;
+      return makeCard({
+        title: "⚖️ مسار BMI الذكي",
+        category: "bmi",
+        verdict: "اختر فئتك العمرية:",
+        tips: [],
+        when_to_seek_help: "",
+        next_question: "",
+        quick_choices: commonAge,
+      });
+    }
+    if (step === 2) {
+      session.profile.ageGroup = m;
+      session.step = 3;
+      return makeCard({
+        title: "⚖️ مسار BMI الذكي",
+        category: "bmi",
+        verdict: "هل تبي أحسب BMI؟",
+        tips: ["إذا نعم: اكتب وزن وطول مثل: وزن 70، طول 170"],
+        when_to_seek_help: "",
+        next_question: "",
+        quick_choices: ["أحسب", "بدون حساب"],
+      });
+    }
+    if (step === 3) {
+      if (/بدون/i.test(m)) {
+        session.profile.calc = "no";
+        session.step = 4;
+        return null;
+      }
+      session.profile.calc = "yes";
+      session.step = 32;
+      return makeCard({
+        title: "⚖️ مسار BMI الذكي",
+        category: "bmi",
+        verdict: "اكتب الوزن والطول مثل: وزن 70، طول 170",
+        tips: [],
+        when_to_seek_help: "",
+        next_question: "",
+        quick_choices: ["إلغاء"],
+      });
+    }
+    if (step === 32) {
+      const { weightKg, heightCm } = parseWeightHeight(m);
+      session.profile.weightKg = weightKg;
+      session.profile.heightCm = heightCm;
+      if (weightKg && heightCm) session.profile.bmi = bmiFrom(weightKg, heightCm);
+      session.step = 4;
+      return null;
+    }
+  }
+
+  if (flow === "water") {
+    if (step === 1) {
+      session.profile.activity = m;
+      session.step = 2;
+      return makeCard({
+        title: "💧 مسار شرب الماء الذكي",
+        category: "water",
+        verdict: "كيف الجو عندك غالبًا هذه الفترة؟",
+        tips: [],
+        when_to_seek_help: "",
+        next_question: "",
+        quick_choices: ["معتدل", "حار", "مكيف أغلب الوقت"],
+      });
+    }
+    if (step === 2) {
+      session.profile.climate = m;
+      session.step = 3;
+      return makeCard({
+        title: "💧 مسار شرب الماء الذكي",
+        category: "water",
+        verdict: "لو تقدر: اكتب وزنك بالكيلو (اختياري) أو اختر: تخطي",
+        tips: ["مثال: 70"],
+        when_to_seek_help: "",
+        next_question: "",
+        quick_choices: ["تخطي"],
+      });
+    }
+    if (step === 3) {
+      if (/تخطي/i.test(m)) {
+        session.profile.weightKg = null;
+        session.step = 4;
+        return null;
+      }
+      const n = Number(String(m).match(/\d{2,3}/)?.[0]);
+      session.profile.weightKg = n && n >= 25 && n <= 250 ? n : null;
+      session.step = 4;
+      return null;
+    }
+  }
+
+  if (flow === "calories") {
+    if (step === 1) {
+      session.profile.goal = m;
+      session.step = 2;
+      return makeCard({
+        title: "🔥 مسار السعرات الذكي",
+        category: "calories",
+        verdict: "مستوى نشاطك اليومي؟",
+        tips: [],
+        when_to_seek_help: "",
+        next_question: "",
+        quick_choices: ["خفيف", "متوسط", "عالي"],
+      });
+    }
+    if (step === 2) {
+      session.profile.activity = m;
+      session.step = 3;
+      return makeCard({
+        title: "🔥 مسار السعرات الذكي",
+        category: "calories",
+        verdict: "اختر فئتك العمرية:",
+        tips: [],
+        when_to_seek_help: "",
+        next_question: "",
+        quick_choices: commonAge,
+      });
+    }
+    if (step === 3) {
+      session.profile.ageGroup = m;
+      session.step = 4;
+      return null;
+    }
+  }
 
   if (flow === "mental") {
     if (step === 1) {
@@ -598,13 +831,17 @@ function continueFlow(session, message) {
     }
   }
 
-  // (باقي مساراتك كما هي – ما حذفتها من سيرفرك الأصلي)
-  // ملاحظة: أنت أرسلت الكود كامل سابقاً وفيه السكر/الضغط/BMI/الماء/السعرات/الإسعافات.. اتركها كما كانت عندك.
-  // هنا أنا فقط ضفت mental لضمان مثال الصورة يشتغل.
-
   if (flow === "first_aid") {
     if (step === 1) {
       session.profile.scenario = m;
+      session.step = 4;
+      return null;
+    }
+  }
+
+  if (flow === "general") {
+    if (step === 1) {
+      session.profile.intent = m;
       session.step = 4;
       return null;
     }
@@ -722,12 +959,10 @@ async function callGroqJSON({ system, user, maxTokens = 1400 }) {
 }
 
 /* =========================
-   Safety post-filter
+   Safety post-filter (FIXED)
 ========================= */
 function postFilterCard(card) {
-  const bad =
-    /(خذ|خذي|جرعة|مرتين يوميًا|مرتين يوميا|ثلاث مرات|حبوب|دواء|انسولين|metformin|ibuprofen|paracetamol)/i;
-
+  // ✅ فلتر “وصف/جرعات” الحقيقي — مو أي كلمة (دواء/جرعة) داخل تثقيف عام
   const combined =
     (card?.verdict || "") +
     "\n" +
@@ -735,22 +970,43 @@ function postFilterCard(card) {
     "\n" +
     (card?.when_to_seek_help || "");
 
-  if (bad.test(combined)) {
+  const hasDoseNumber =
+    /(\b\d{1,4}\b)\s*(mg|مل|ml|mcg|µg|g|جرام|غم|حبة|قرص|كبسولة|ملعقة|قطرة)/i.test(combined);
+
+  const hasFrequency =
+    /(كل\s*\d+\s*(ساعه|ساعة|ساعات)|مرتين\s*(يوميا|يوميًا)|ثلاث\s*مرات|أربع\s*مرات|مرة\s*يوميًا|قبل\s*الأكل|بعد\s*الأكل|عند\s*اللزوم|لمدة\s*\d+\s*(يوم|أيام|اسبوع|أسبوع))/i.test(
+      combined
+    );
+
+  const hasTakeVerb =
+    /(خذ|خذي|تناول|تناولي|استخدم|استخدمي|ضع|ضعي|حقن|احقن|جرعه|جرعة)\s+/i.test(combined);
+
+  // أسماء أدوية كمؤشر إضافي (اختياري)
+  const hasDrugName =
+    /\b(metformin|ibuprofen|paracetamol|acetaminophen|amoxicillin|augmentin|insulin)\b/i.test(
+      combined
+    );
+
+  // يفلتر إذا فيه “سلوك وصف/جرعة” فعلي
+  const shouldBlock = (hasTakeVerb && (hasDoseNumber || hasFrequency)) || (hasDrugName && hasTakeVerb);
+
+  if (shouldBlock) {
     return makeCard({
       title: "تنبيه",
       category: card?.category || "general",
       verdict:
         "أنا للتثقيف الصحي فقط. ما أقدر أوصف أدوية أو جرعات.\n" +
-        "إذا سؤالك علاجي أو دوائي، راجع طبيب/صيدلي.",
+        "إذا سؤالك علاجي/دوائي، راجع طبيب/صيدلي.",
       tips: [
-        "اكتب للطبيب الأعراض ومدة المشكلة والأدوية الحالية إن وجدت.",
+        "اكتب للطبيب: الأعراض + مدتها + الأمراض المزمنة + الأدوية الحالية + الحساسية إن وجدت.",
         "إذا أعراض شديدة: طوارئ.",
       ],
       when_to_seek_help: "ألم صدر/ضيق نفس/إغماء/نزيف شديد: طوارئ فورًا.",
-      next_question: "هل تريد نصائح نمط حياة بدل العلاج؟",
-      quick_choices: ["نعم", "لا"],
+      next_question: "هل تريد معلومات تثقيفية عامة بدل العلاج؟",
+      quick_choices: ["نعم", "لا", "القائمة الرئيسية"],
     });
   }
+
   return card;
 }
 
@@ -785,21 +1041,35 @@ app.post("/chat", async (req, res) => {
   const message = String(req.body?.message || "").trim();
   if (!message) return res.status(400).json({ ok: false, error: "empty_message" });
 
+  // ✅✅ FIX #1: منع تكرار نفس الطلب (يعالج مشكلة الردّين)
+  const now = Date.now();
+  if (session.lastMsg === message && now - (session.lastMsgAt || 0) < 1200) {
+    const replay = session.lastResponse || session.lastCard || menuCard();
+    return res.json({ ok: true, data: replay });
+  }
+
+  function rememberResponse(card) {
+    session.lastMsg = message;
+    session.lastMsgAt = now;
+    session.lastResponse = card;
+    session.lastCard = card;
+  }
+
   // تحية/شكر
   if (isGreeting(message)) {
     const card = greetingCard();
-    session.lastCard = card;
     bumpCategory("general");
     METRICS.chatOk++;
     updateAvgLatency(Date.now() - t0);
+    rememberResponse(card);
     return res.json({ ok: true, data: card });
   }
   if (isThanks(message)) {
     const card = thanksCard();
-    session.lastCard = card;
     bumpCategory("general");
     METRICS.chatOk++;
     updateAvgLatency(Date.now() - t0);
+    rememberResponse(card);
     return res.json({ ok: true, data: card });
   }
 
@@ -807,9 +1077,9 @@ app.post("/chat", async (req, res) => {
   if (/^(إلغاء|الغاء|cancel|مسح|مسح المحادثة|ابدأ من جديد|ابدأ جديد)$/i.test(message)) {
     resetFlow(session);
     const card = menuCard();
-    session.lastCard = card;
     METRICS.chatOk++;
     updateAvgLatency(Date.now() - t0);
+    rememberResponse(card);
     return res.json({ ok: true, data: card });
   }
 
@@ -827,20 +1097,20 @@ app.post("/chat", async (req, res) => {
       next_question: "هل أنت في أمان الآن؟",
       quick_choices: ["نعم", "لا"],
     });
-    session.lastCard = card;
     bumpCategory("emergency");
     METRICS.chatOk++;
     updateAvgLatency(Date.now() - t0);
+    rememberResponse(card);
     return res.json({ ok: true, data: card });
   }
 
   // مواعيد
   if (looksLikeAppointments(message)) {
     const card = appointmentsCard();
-    session.lastCard = card;
     bumpCategory("appointments");
     METRICS.chatOk++;
     updateAvgLatency(Date.now() - t0);
+    rememberResponse(card);
     return res.json({ ok: true, data: card });
   }
 
@@ -848,10 +1118,10 @@ app.post("/chat", async (req, res) => {
   if (/^(القائمة الرئيسية|القائمه الرئيسيه|منيو|قائمة|ابدأ|ابدء)$/i.test(message)) {
     resetFlow(session);
     const card = menuCard();
-    session.lastCard = card;
     bumpCategory("general");
     METRICS.chatOk++;
     updateAvgLatency(Date.now() - t0);
+    rememberResponse(card);
     return res.json({ ok: true, data: card });
   }
 
@@ -864,24 +1134,24 @@ app.post("/chat", async (req, res) => {
       tips: ["لا ترفع بيانات شخصية حساسة إن أمكن."],
       when_to_seek_help: "إذا أعراض شديدة مع التقرير: راجع الطبيب/الطوارئ.",
       next_question: "جاهز ترفع التقرير؟",
-      quick_choices: ["📎 إضافة مرفق", "إلغاء"],
+      quick_choices: ["📎 إضافة مرفق", "إلغاء", "القائمة الرئيسية"],
     });
-    session.lastCard = card;
     bumpCategory("report");
     METRICS.chatOk++;
     updateAvgLatency(Date.now() - t0);
+    rememberResponse(card);
     return res.json({ ok: true, data: card });
   }
 
   const inferred = inferCategoryFromMessage(message);
 
-  // ✅✅ متابعة المسار أولًا قبل أي yes/no guards وأي "غامض"
+  // ✅✅ متابعة المسار أولًا قبل أي guards
   if (session.flow && session.step > 0 && session.step < 4) {
     const card = continueFlow(session, message);
     if (card) {
-      session.lastCard = card;
       METRICS.chatOk++;
       updateAvgLatency(Date.now() - t0);
+      rememberResponse(card);
       return res.json({ ok: true, data: card });
     }
   }
@@ -903,9 +1173,9 @@ app.post("/chat", async (req, res) => {
     const matched = startMap.find((x) => x.match.test(message));
     if (short && matched) {
       const card = startFlow(session, matched.key);
-      session.lastCard = card;
       METRICS.chatOk++;
       updateAvgLatency(Date.now() - t0);
+      rememberResponse(card);
       return res.json({ ok: true, data: card });
     }
 
@@ -914,24 +1184,24 @@ app.post("/chat", async (req, res) => {
       ["sugar", "bp", "bmi", "water", "calories", "mental", "first_aid"].includes(inferred)
     ) {
       const card = startFlow(session, inferred);
-      session.lastCard = card;
       METRICS.chatOk++;
       updateAvgLatency(Date.now() - t0);
+      rememberResponse(card);
       return res.json({ ok: true, data: card });
     }
   }
 
-  // YES/NO Router
+  // YES/NO Router (بعد المسارات)
   const yn = yesNoRouter(session, message);
   if (yn) {
-    session.lastCard = yn;
     bumpCategory(yn.category);
     METRICS.chatOk++;
     updateAvgLatency(Date.now() - t0);
+    rememberResponse(yn);
     return res.json({ ok: true, data: yn });
   }
 
-  // Bare yes/no فقط إذا ما في Flow
+  // Bare yes/no فقط إذا ما في next_question
   if (!session.flow && isBareYesNo(message) && !session.lastCard?.next_question) {
     const card = makeCard({
       title: "دليل العافية",
@@ -942,17 +1212,22 @@ app.post("/chat", async (req, res) => {
       next_question: "وش تبغى تسأل؟",
       quick_choices: menuCard().quick_choices,
     });
-    session.lastCard = card;
     METRICS.chatOk++;
     updateAvgLatency(Date.now() - t0);
+    rememberResponse(card);
     return res.json({ ok: true, data: card });
   }
 
-  // ✅✅ إصلاح الغموض: إذا الرد زر من quick_choices لا تعتبره غامض
-  const hitChoice = isQuickChoiceHit(session, message);
-  const inCompletedFlow = session.flow && session.step === 4;
+  // ✅✅ FIX #2: لا تعتبر “نعم/لا” أو “زر من quick_choices” غموض
+  const lastChoices = Array.isArray(session.lastCard?.quick_choices)
+    ? session.lastCard.quick_choices
+    : [];
+  const isChoiceClick = lastChoices.includes(message);
+  const isYesNoForQuestion = isBareYesNo(message) && !!session.lastCard?.next_question;
 
-  if (!hitChoice && !inCompletedFlow && isTooVague(message)) {
+  // رسالة قصيرة/غامضة (✅ لا نطبقها عند اكتمال مسار step=4) + ولا عند ضغط أزرار/نعم-لا لسؤال
+  const inCompletedFlow = session.flow && session.step === 4;
+  if (!inCompletedFlow && !isChoiceClick && !isYesNoForQuestion && isTooVague(message)) {
     const card = makeCard({
       title: "توضيح سريع",
       category: inferred === "emergency" ? "emergency" : inferred || "general",
@@ -962,9 +1237,9 @@ app.post("/chat", async (req, res) => {
       next_question: "وش الأعراض بالضبط ومتى بدأت؟",
       quick_choices: ["أعراض بدأت اليوم", "من يومين", "أسبوع+", "القائمة الرئيسية"],
     });
-    session.lastCard = card;
     METRICS.chatOk++;
     updateAvgLatency(Date.now() - t0);
+    rememberResponse(card);
     return res.json({ ok: true, data: card });
   }
 
@@ -1004,7 +1279,7 @@ app.post("/chat", async (req, res) => {
     `سؤال المستخدم:\n${msgStr}\n\n` +
     "الالتزام: لا تشخيص، لا أدوية، لا جرعات.\n" +
     "قدّم نصائح عامة عملية + متى يراجع الطبيب/الطوارئ.\n" +
-    "مهم: لا تعيد نفس البطاقة السابقة إذا كان جواب المستخدم قصيرًا.\n";
+    "مهم: إذا المستخدم ضغط نعم/لا لسؤال سابق، اعتبرها إجابة مباشرة على ذلك السؤال.\n";
 
   try {
     const obj = await callGroqJSON({
@@ -1027,7 +1302,6 @@ app.post("/chat", async (req, res) => {
     const card = makeCard({ ...obj, category: finalCategory });
     const safeCard = postFilterCard(card);
 
-    session.lastCard = safeCard;
     session.history.push({ role: "assistant", content: JSON.stringify(safeCard) });
     session.history = trimHistory(session.history, 10);
 
@@ -1035,6 +1309,7 @@ app.post("/chat", async (req, res) => {
     METRICS.chatOk++;
     updateAvgLatency(Date.now() - t0);
 
+    rememberResponse(safeCard);
     return res.json({ ok: true, data: safeCard });
   } catch (err) {
     console.error("[chat] FAILED:", err?.message || err);

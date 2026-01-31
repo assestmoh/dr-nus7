@@ -132,9 +132,8 @@ function updateAvgLatency(ms) {
 /* =========================
    Sessions (in-memory) + TTL
 ========================= */
-const sessions = new Map(); // userId -> { history, lastCard, flow, step, profile, ts, lastMsg, lastMsgAt, lastResponse }
+const sessions = new Map(); // userId -> { history, lastCard, flow, step, profile, ts, lastInText, lastInAt }
 
-/** حل خلط المستخدمين إذا ما في x-user-id */
 function getUserId(req) {
   const headerId = req.header("x-user-id");
   if (headerId) return headerId;
@@ -152,10 +151,9 @@ function getSession(userId) {
       step: 0,
       profile: {},
       ts: Date.now(),
-      // ✅ لمنع تكرار الطلب/الرد
-      lastMsg: null,
-      lastMsgAt: 0,
-      lastResponse: null,
+      // ✅ منع الازدواج (double submit)
+      lastInText: "",
+      lastInAt: 0,
     });
   }
   const s = sessions.get(id);
@@ -276,8 +274,12 @@ function inferCategoryFromMessage(message) {
 }
 
 /** ✅ مهم: استثناء المسارات من "غامض" */
-function isTooVague(text) {
+function isTooVague(text, session) {
   const t = String(text || "").trim();
+
+  // ✅ إذا كانت إجابة نعم/لا على سؤال سابق (next_question)، لا تعتبرها غامضة
+  const hasPendingQ = !!session?.lastCard?.next_question;
+  if (hasPendingQ && /^(نعم|لا)$/i.test(t)) return false;
 
   // رموز المسارات
   if (/(🩸|🫀|⚖️|💧|🔥|🧠|🩹|📄|📅)/.test(t)) return false;
@@ -540,13 +542,16 @@ function startFlow(session, flowKey) {
 
   if (flowKey === "first_aid") {
     return makeCard({
-      title: "🩹 إسعافات أولية (محكومة)",
+      title: "🩹 مسار الإسعافات الأولية الذكي",
       category: "general",
-      verdict: "أقدّم إرشادات عامة وبسيطة فقط.\n🚨 علامات خطر تستدعي الطوارئ فورًا: ألم صدر، ضيق نفس، نزيف شديد، فقدان وعي، تشنجات، حساسية شديدة.\nإذا ما في علامات خطر، اختر حالة بسيطة:",
-      tips: ["لا تعتمد على البوت في الحالات الخطيرة."],
-      when_to_seek_help: "أي علامة خطورة: الآن.",
+      verdict:
+        "أقدم إرشادات عامة وبسيطة فقط.\n" +
+        "🚨 علامات خطر تستدعي الطوارئ فورًا: ألم صدر شديد/ضيق نفس شديد/نزيف شديد/فقدان وعي/تشنجات/حساسية شديدة.\n" +
+        "إذا ما في علامات خطر، اختر الحالة الأقرب:",
+      tips: [],
+      when_to_seek_help: "إذا فقدان وعي/نزيف شديد/صعوبة تنفس: اتصل بالإسعاف فورًا.",
       next_question: "وش الحالة الأقرب؟",
-      quick_choices: ["حرق خفيف", "جرح بسيط", "التواء/كدمة", "القائمة الرئيسية"],
+      quick_choices: ["حروق بسيطة", "جرح/نزيف بسيط", "اختناق", "إغماء", "التواء/كدمة", "القائمة الرئيسية"],
     });
   }
 
@@ -833,6 +838,11 @@ function continueFlow(session, message) {
 
   if (flow === "first_aid") {
     if (step === 1) {
+      // ✅ لا تقبل أي نص عشوائي هنا (عشان لا يُكمل المسار بالغلط عند تكرار الإرسال)
+      const allowed = new Set(["حروق بسيطة", "جرح/نزيف بسيط", "اختناق", "إغماء", "التواء/كدمة"]);
+      if (!allowed.has(m)) {
+        return startFlow(session, "first_aid"); // أعد نفس بطاقة الاختيار
+      }
       session.profile.scenario = m;
       session.step = 4;
       return null;
@@ -959,10 +969,10 @@ async function callGroqJSON({ system, user, maxTokens = 1400 }) {
 }
 
 /* =========================
-   Safety post-filter (FIXED)
+   Safety post-filter (✅ أقل حساسية)
 ========================= */
 function postFilterCard(card) {
-  // ✅ فلتر “وصف/جرعات” الحقيقي — مو أي كلمة (دواء/جرعة) داخل تثقيف عام
+  // ✅ نمنع فقط "وصفة/جرعة فعلية" (أرقام + mg/ملغ/مرة يوميًا.. أو أمر مباشر)
   const combined =
     (card?.verdict || "") +
     "\n" +
@@ -971,26 +981,14 @@ function postFilterCard(card) {
     (card?.when_to_seek_help || "");
 
   const hasDoseNumber =
-    /(\b\d{1,4}\b)\s*(mg|مل|ml|mcg|µg|g|جرام|غم|حبة|قرص|كبسولة|ملعقة|قطرة)/i.test(combined);
+    /(\b\d{1,4}\b)\s*(mg|ملغ|mcg|µg|g|جرام|مل|ml|cc)\b/i.test(combined) ||
+    /(\bمرة\b|\bمرتين\b|\bثلاث\b)\s*(يوميا|يوميًا|بالday|في اليوم)/i.test(combined);
 
-  const hasFrequency =
-    /(كل\s*\d+\s*(ساعه|ساعة|ساعات)|مرتين\s*(يوميا|يوميًا)|ثلاث\s*مرات|أربع\s*مرات|مرة\s*يوميًا|قبل\s*الأكل|بعد\s*الأكل|عند\s*اللزوم|لمدة\s*\d+\s*(يوم|أيام|اسبوع|أسبوع))/i.test(
-      combined
-    );
+  const hasDirectPrescriptionVerb =
+    /(خذ|خذي|تناول|تناولي|استخدم|استخدمي|ابدأ|ابدا)\s+/i.test(combined) &&
+    /(دواء|حبوب|قرص|كبسول|شراب|بخاخ|انسولين|antibiotic|metformin|ibuprofen|paracetamol)/i.test(combined);
 
-  const hasTakeVerb =
-    /(خذ|خذي|تناول|تناولي|استخدم|استخدمي|ضع|ضعي|حقن|احقن|جرعه|جرعة)\s+/i.test(combined);
-
-  // أسماء أدوية كمؤشر إضافي (اختياري)
-  const hasDrugName =
-    /\b(metformin|ibuprofen|paracetamol|acetaminophen|amoxicillin|augmentin|insulin)\b/i.test(
-      combined
-    );
-
-  // يفلتر إذا فيه “سلوك وصف/جرعة” فعلي
-  const shouldBlock = (hasTakeVerb && (hasDoseNumber || hasFrequency)) || (hasDrugName && hasTakeVerb);
-
-  if (shouldBlock) {
+  if (hasDoseNumber || hasDirectPrescriptionVerb) {
     return makeCard({
       title: "تنبيه",
       category: card?.category || "general",
@@ -998,11 +996,11 @@ function postFilterCard(card) {
         "أنا للتثقيف الصحي فقط. ما أقدر أوصف أدوية أو جرعات.\n" +
         "إذا سؤالك علاجي/دوائي، راجع طبيب/صيدلي.",
       tips: [
-        "اكتب للطبيب: الأعراض + مدتها + الأمراض المزمنة + الأدوية الحالية + الحساسية إن وجدت.",
+        "اكتب للطبيب الأعراض ومدة المشكلة والأدوية الحالية إن وجدت.",
         "إذا أعراض شديدة: طوارئ.",
       ],
       when_to_seek_help: "ألم صدر/ضيق نفس/إغماء/نزيف شديد: طوارئ فورًا.",
-      next_question: "هل تريد معلومات تثقيفية عامة بدل العلاج؟",
+      next_question: "هل تريد نصائح نمط حياة عامة بدل العلاج؟",
       quick_choices: ["نعم", "لا", "القائمة الرئيسية"],
     });
   }
@@ -1041,35 +1039,30 @@ app.post("/chat", async (req, res) => {
   const message = String(req.body?.message || "").trim();
   if (!message) return res.status(400).json({ ok: false, error: "empty_message" });
 
-  // ✅✅ FIX #1: منع تكرار نفس الطلب (يعالج مشكلة الردّين)
+  // ✅ Dedup: إذا نفس النص انرسل مرتين بسرعة (أقل من 900ms) رجّع آخر بطاقة
   const now = Date.now();
-  if (session.lastMsg === message && now - (session.lastMsgAt || 0) < 1200) {
-    const replay = session.lastResponse || session.lastCard || menuCard();
-    return res.json({ ok: true, data: replay });
+  if (session.lastInText === message && now - (session.lastInAt || 0) < 900) {
+    const fallback = session.lastCard || menuCard();
+    return res.json({ ok: true, data: fallback, dedup: true });
   }
-
-  function rememberResponse(card) {
-    session.lastMsg = message;
-    session.lastMsgAt = now;
-    session.lastResponse = card;
-    session.lastCard = card;
-  }
+  session.lastInText = message;
+  session.lastInAt = now;
 
   // تحية/شكر
   if (isGreeting(message)) {
     const card = greetingCard();
+    session.lastCard = card;
     bumpCategory("general");
     METRICS.chatOk++;
     updateAvgLatency(Date.now() - t0);
-    rememberResponse(card);
     return res.json({ ok: true, data: card });
   }
   if (isThanks(message)) {
     const card = thanksCard();
+    session.lastCard = card;
     bumpCategory("general");
     METRICS.chatOk++;
     updateAvgLatency(Date.now() - t0);
-    rememberResponse(card);
     return res.json({ ok: true, data: card });
   }
 
@@ -1077,9 +1070,9 @@ app.post("/chat", async (req, res) => {
   if (/^(إلغاء|الغاء|cancel|مسح|مسح المحادثة|ابدأ من جديد|ابدأ جديد)$/i.test(message)) {
     resetFlow(session);
     const card = menuCard();
+    session.lastCard = card;
     METRICS.chatOk++;
     updateAvgLatency(Date.now() - t0);
-    rememberResponse(card);
     return res.json({ ok: true, data: card });
   }
 
@@ -1097,20 +1090,20 @@ app.post("/chat", async (req, res) => {
       next_question: "هل أنت في أمان الآن؟",
       quick_choices: ["نعم", "لا"],
     });
+    session.lastCard = card;
     bumpCategory("emergency");
     METRICS.chatOk++;
     updateAvgLatency(Date.now() - t0);
-    rememberResponse(card);
     return res.json({ ok: true, data: card });
   }
 
   // مواعيد
   if (looksLikeAppointments(message)) {
     const card = appointmentsCard();
+    session.lastCard = card;
     bumpCategory("appointments");
     METRICS.chatOk++;
     updateAvgLatency(Date.now() - t0);
-    rememberResponse(card);
     return res.json({ ok: true, data: card });
   }
 
@@ -1118,10 +1111,10 @@ app.post("/chat", async (req, res) => {
   if (/^(القائمة الرئيسية|القائمه الرئيسيه|منيو|قائمة|ابدأ|ابدء)$/i.test(message)) {
     resetFlow(session);
     const card = menuCard();
+    session.lastCard = card;
     bumpCategory("general");
     METRICS.chatOk++;
     updateAvgLatency(Date.now() - t0);
-    rememberResponse(card);
     return res.json({ ok: true, data: card });
   }
 
@@ -1136,22 +1129,22 @@ app.post("/chat", async (req, res) => {
       next_question: "جاهز ترفع التقرير؟",
       quick_choices: ["📎 إضافة مرفق", "إلغاء", "القائمة الرئيسية"],
     });
+    session.lastCard = card;
     bumpCategory("report");
     METRICS.chatOk++;
     updateAvgLatency(Date.now() - t0);
-    rememberResponse(card);
     return res.json({ ok: true, data: card });
   }
 
   const inferred = inferCategoryFromMessage(message);
 
-  // ✅✅ متابعة المسار أولًا قبل أي guards
+  // ✅ متابعة المسار أولًا قبل أي حمايات
   if (session.flow && session.step > 0 && session.step < 4) {
     const card = continueFlow(session, message);
     if (card) {
+      session.lastCard = card;
       METRICS.chatOk++;
       updateAvgLatency(Date.now() - t0);
-      rememberResponse(card);
       return res.json({ ok: true, data: card });
     }
   }
@@ -1173,9 +1166,9 @@ app.post("/chat", async (req, res) => {
     const matched = startMap.find((x) => x.match.test(message));
     if (short && matched) {
       const card = startFlow(session, matched.key);
+      session.lastCard = card;
       METRICS.chatOk++;
       updateAvgLatency(Date.now() - t0);
-      rememberResponse(card);
       return res.json({ ok: true, data: card });
     }
 
@@ -1184,9 +1177,9 @@ app.post("/chat", async (req, res) => {
       ["sugar", "bp", "bmi", "water", "calories", "mental", "first_aid"].includes(inferred)
     ) {
       const card = startFlow(session, inferred);
+      session.lastCard = card;
       METRICS.chatOk++;
       updateAvgLatency(Date.now() - t0);
-      rememberResponse(card);
       return res.json({ ok: true, data: card });
     }
   }
@@ -1194,14 +1187,14 @@ app.post("/chat", async (req, res) => {
   // YES/NO Router (بعد المسارات)
   const yn = yesNoRouter(session, message);
   if (yn) {
+    session.lastCard = yn;
     bumpCategory(yn.category);
     METRICS.chatOk++;
     updateAvgLatency(Date.now() - t0);
-    rememberResponse(yn);
     return res.json({ ok: true, data: yn });
   }
 
-  // Bare yes/no فقط إذا ما في next_question
+  // Bare yes/no فقط إذا ما في سؤال سابق
   if (!session.flow && isBareYesNo(message) && !session.lastCard?.next_question) {
     const card = makeCard({
       title: "دليل العافية",
@@ -1212,22 +1205,15 @@ app.post("/chat", async (req, res) => {
       next_question: "وش تبغى تسأل؟",
       quick_choices: menuCard().quick_choices,
     });
+    session.lastCard = card;
     METRICS.chatOk++;
     updateAvgLatency(Date.now() - t0);
-    rememberResponse(card);
     return res.json({ ok: true, data: card });
   }
 
-  // ✅✅ FIX #2: لا تعتبر “نعم/لا” أو “زر من quick_choices” غموض
-  const lastChoices = Array.isArray(session.lastCard?.quick_choices)
-    ? session.lastCard.quick_choices
-    : [];
-  const isChoiceClick = lastChoices.includes(message);
-  const isYesNoForQuestion = isBareYesNo(message) && !!session.lastCard?.next_question;
-
-  // رسالة قصيرة/غامضة (✅ لا نطبقها عند اكتمال مسار step=4) + ولا عند ضغط أزرار/نعم-لا لسؤال
+  // رسالة قصيرة/غامضة (✅ لا نطبقها لو كانت إجابة نعم/لا على سؤال سابق)
   const inCompletedFlow = session.flow && session.step === 4;
-  if (!inCompletedFlow && !isChoiceClick && !isYesNoForQuestion && isTooVague(message)) {
+  if (!inCompletedFlow && isTooVague(message, session)) {
     const card = makeCard({
       title: "توضيح سريع",
       category: inferred === "emergency" ? "emergency" : inferred || "general",
@@ -1237,9 +1223,9 @@ app.post("/chat", async (req, res) => {
       next_question: "وش الأعراض بالضبط ومتى بدأت؟",
       quick_choices: ["أعراض بدأت اليوم", "من يومين", "أسبوع+", "القائمة الرئيسية"],
     });
+    session.lastCard = card;
     METRICS.chatOk++;
     updateAvgLatency(Date.now() - t0);
-    rememberResponse(card);
     return res.json({ ok: true, data: card });
   }
 
@@ -1279,7 +1265,7 @@ app.post("/chat", async (req, res) => {
     `سؤال المستخدم:\n${msgStr}\n\n` +
     "الالتزام: لا تشخيص، لا أدوية، لا جرعات.\n" +
     "قدّم نصائح عامة عملية + متى يراجع الطبيب/الطوارئ.\n" +
-    "مهم: إذا المستخدم ضغط نعم/لا لسؤال سابق، اعتبرها إجابة مباشرة على ذلك السؤال.\n";
+    "مهم: لا تعيد نفس البطاقة السابقة إذا كان جواب المستخدم قصيرًا.\n";
 
   try {
     const obj = await callGroqJSON({
@@ -1302,6 +1288,7 @@ app.post("/chat", async (req, res) => {
     const card = makeCard({ ...obj, category: finalCategory });
     const safeCard = postFilterCard(card);
 
+    session.lastCard = safeCard;
     session.history.push({ role: "assistant", content: JSON.stringify(safeCard) });
     session.history = trimHistory(session.history, 10);
 
@@ -1309,7 +1296,6 @@ app.post("/chat", async (req, res) => {
     METRICS.chatOk++;
     updateAvgLatency(Date.now() - t0);
 
-    rememberResponse(safeCard);
     return res.json({ ok: true, data: safeCard });
   } catch (err) {
     console.error("[chat] FAILED:", err?.message || err);

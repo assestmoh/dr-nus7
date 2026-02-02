@@ -1519,25 +1519,28 @@ function postFilterCard(card) {
     "\n" +
     (card?.when_to_seek_help || "");
 
-    // 1) نميّز بين "سياق دوائي عام" و"اسم دواء محدد"
-  //    الهدف: تقليل التنبيه الزائد عند نصائح عامة (مثل: "غذاء مناسب")
-  const hasMedGeneric =
-    /(دواء|ادويه|حبوب|قرص|كبسول|كبسولة|شراب|بخاخ|انسولين|مضاد|antibiotic|metformin|ibuprofen|paracetamol)/i.test(
-      combined
-    );
-
-  // أسماء أدوية/علامات شائعة (اختياري — عدّل القائمة حسب احتياجك)
-  const hasSpecificDrug =
-    /(paracetamol|acetaminophen|ibuprofen|amoxicillin|metformin|insulin|panadol|brufen|augmentin|voltaren|بنادول|بروفين|اوغمنتين|فولتارين|اميكسيل|اموكسيسيلين)/i.test(
+  // 1) لازم وجود سياق دوائي فعلي
+  const hasMedContext =
+    /(دواء|ادويه|حبوب|قرص|كبسول|كبسولة|شراب|بخاخ|انسولين|مضاد|مسكن|antibiotic|metformin|ibuprofen|paracetamol)/i.test(
       combined
     );
 
   // 2) أنماط جرعات واضحة
-if (
-    !isLifestyleOnly &&
-    (((hasDoseUnit || hasDailyFrequency) && (hasMedGeneric || hasSpecificDrug)) ||
-      (hasSpecificDrug && hasDirectPrescriptionVerb))
-  ) {
+  const hasDoseUnit =
+    /(\b\d{1,4}\b)\s*(mg|ملغ|mcg|µg|g|جرام|مل|ml|cc)\b/i.test(combined);
+
+  const hasDailyFrequency =
+    /(مرة|مرتين|ثلاث|4)\s*(يوميا|يوميًا|في اليوم)/i.test(combined);
+
+  // 3) أفعال وصف مباشر + سياق دوائي
+  const hasDirectPrescriptionVerb =
+    /(خذ|خذي|تناول|تناولي|استخدم|استخدمي|ابدأ|ابدا)\s+/i.test(combined) && hasMedContext;
+
+  // ✅ استثناء نمط حياة
+  const isLifestyleOnly =
+    !hasMedContext && /(ماء|نوم|رياضة|نشاط|وجبات|خضار|سعرات|ضغط|سكر)/i.test(combined);
+
+  if (!isLifestyleOnly && hasMedContext && (hasDoseUnit || hasDailyFrequency || hasDirectPrescriptionVerb)) {
     return makeCard({
       title: "تنبيه",
       category: card?.category || "general",
@@ -1818,13 +1821,25 @@ app.post("/chat", async (req, res) => {
     return res.json({ ok: true, data: card });
   }
 
-  // رسالة قصيرة/غامضة (✅ خففناها: الآن لا نوقف الرد)
-// سابقًا كنا نرجّع بطاقة "توضيح سريع" قبل ما نكمل.
-// الآن: نعتبرها إشارة فقط ونخلي النموذج يجاوب مباشرة، وإذا احتاج يسأل سؤال واحد في نهاية البطاقة.
+  // رسالة قصيرة/غامضة
   const inCompletedFlow = session.flow && session.step === 4;
-  const isVagueMessage = !inCompletedFlow && isTooVague(message, session);
+  if (!inCompletedFlow && isTooVague(message, session)) {
+    const card = makeCard({
+      title: "توضيح سريع",
+      category: inferred === "emergency" ? "emergency" : inferred || "general",
+      verdict: "أقدر أساعدك، بس أحتاج تفاصيل بسيطة عشان ما أعطيك رد عام.",
+      tips: ["اكتب: العمر التقريبي + الأعراض + مدتها + هل فيه حرارة/ألم شديد؟"],
+      when_to_seek_help: "إذا ألم صدر/ضيق نفس/إغماء/نزيف شديد: طوارئ فورًا.",
+      next_question: "وش الأعراض بالضبط ومتى بدأت؟",
+      quick_choices: ["أعراض بدأت اليوم", "من يومين", "أسبوع+", "القائمة الرئيسية"],
+    });
+    session.lastCard = card;
+    METRICS.chatOk++;
+    updateAvgLatency(Date.now() - t0);
+    return res.json({ ok: true, data: card });
+  }
 
-// ====== LLM fallback ======
+  // ====== LLM fallback ======
   session.history.push({ role: "user", content: message });
   session.history = trimHistory(session.history, 10);
 
@@ -1860,10 +1875,7 @@ app.post("/chat", async (req, res) => {
     `سؤال المستخدم:\n${msgStr}\n\n` +
     "الالتزام: لا تشخيص، لا أدوية، لا جرعات.\n" +
     "قدّم نصائح عامة عملية + متى يراجع الطبيب/الطوارئ.\n" +
-    "مهم: لا تعيد نفس البطاقة السابقة إذا كان جواب المستخدم قصيرًا.\n" +
-    (isVagueMessage
-      ? "إذا رسالة المستخدم مختصرة/عامة: قدّم إجابة عامة مفيدة مباشرة، ثم اسأل سؤال واحد فقط لتحديد التفاصيل إن احتجت.\n"
-      : "");
+    "مهم: لا تعيد نفس البطاقة السابقة إذا كان جواب المستخدم قصيرًا.\n";
 
   try {
     const obj = await callGroqJSON({

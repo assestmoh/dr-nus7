@@ -8,6 +8,16 @@ import fs from "fs";
 
 const app = express();
 
+// CORS + preflight (works on Express 5 / path-to-regexp v6)
+app.use((req, res, next) => {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET,POST,PUT,PATCH,DELETE,OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  if (req.method === "OPTIONS") return res.sendStatus(204);
+  next();
+});
+
+
 // ====== إعدادات عامة ======
 app.disable("x-powered-by");
 app.use(express.json({ limit: "1mb" }));
@@ -21,7 +31,6 @@ const corsMw = cors({
   maxAge: 86400,
 });
 app.use(corsMw);
-app.options("*", corsMw);
 
 // ====== ثوابت مسارات الملفات الثابتة ======
 const ROOT = process.cwd();
@@ -157,7 +166,7 @@ async function handleChat(req, res) {
 app.post(["/chat", "/api/chat"], handleChat);
 
 // ====== SPA fallback (لو عندك مسارات داخلية) ======
-app.get("*", (req, res) => {
+app.get(/.*/, (req, res) => {
   // لا تكسر مسارات API
   if (req.path.startsWith("/api/") || req.path === "/chat") return res.status(404).end();
   const p = path.join(PUBLIC_DIR, "index.html");

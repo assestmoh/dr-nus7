@@ -12,11 +12,7 @@ const require = createRequire(import.meta.url);
 const pdfParse = require("pdf-parse");
 
 const app = express();
-
-// ✅ Koyeb/Reverse proxy: allow Express to trust X-Forwarded-* headers
-// This fixes express-rate-limit ERR_ERL_UNEXPECTED_X_FORWARDED_FOR
 app.set("trust proxy", 1);
-
 const upload = multer({ limits: { fileSize: 8 * 1024 * 1024 } });
 
 /* =========================
@@ -521,15 +517,20 @@ function startInstitutionalFlow(session, route) {
   }
 
   if (route === "shifaa_appointments") {
-    return makeCard({
-      title: "📅 مواعيد شفاء — روابط التحميل",
-      category: "appointments",
-      verdict: "روابط التحميل الرسمية لتطبيق شفاء:",
-      tips: [`أندرويد: ${SHIFAA_ANDROID}`, `آيفون: ${SHIFAA_IOS}`],
-      when_to_seek_help: "إذا أعراض طارئة: الطوارئ أولًا.",
-      next_question: "تحب ترجع للقائمة الرئيسية؟",
-      quick_choices: ["القائمة الرئيسية"],
-    });
+  // حسب طلبك: بطاقة روابط تحميل فقط (بدون خيارات إضافية)
+  return makeCard({
+    title: "📅 مواعيد شفاء — روابط التحميل",
+    category: "appointments",
+    verdict: "روابط تحميل تطبيق شفاء الرسمية:",
+    tips: [
+      "Android: Google Play",
+      "iOS: App Store",
+    ],
+    when_to_seek_help: "",
+    next_question: "",
+    quick_choices: ["القائمة الرئيسية"],
+  });
+});
   }
 
   // fallback
@@ -807,6 +808,19 @@ function continueInstitutionalFlow(session, message) {
     resetFlow(session);
     return menuCard();
   }
+
+  if (flow === "shifaa_appointments") {
+    if (m === "روابط التحميل") {
+      return makeCard({
+        title: "📅 شفاء — روابط التحميل",
+        category: "appointments",
+        verdict: "روابط التحميل الرسمية:",
+        tips: [`أندرويد: ${SHIFAA_ANDROID}`, `آيفون: ${SHIFAA_IOS}`],
+        when_to_seek_help: "إذا أعراض طارئة: الطوارئ أولًا.",
+        next_question: "تبغى بطاقة ثانية؟",
+        quick_choices: ["خطوات حجز موعد", "عن برنامج شفاء", "القائمة الرئيسية"],
+      });
+    }
 
     if (m === "خطوات حجز موعد") {
       return makeCard({
@@ -1379,7 +1393,7 @@ function reportSystemPrompt() {
   );
 }
 
-async function callGroqJSON({ system, user, maxTokens = 2048 }) {
+async function callGroqJSON({ system, user, maxTokens = 1400 }) {
   if (!GROQ_API_KEY) throw new Error("Missing GROQ_API_KEY");
 
   const url = "https://api.groq.com/openai/v1/chat/completions";

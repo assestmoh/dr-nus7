@@ -12,6 +12,11 @@ const require = createRequire(import.meta.url);
 const pdfParse = require("pdf-parse");
 
 const app = express();
+
+// ✅ Koyeb/Reverse proxy: allow Express to trust X-Forwarded-* headers
+// This fixes express-rate-limit ERR_ERL_UNEXPECTED_X_FORWARDED_FOR
+app.set("trust proxy", 1);
+
 const upload = multer({ limits: { fileSize: 8 * 1024 * 1024 } });
 
 /* =========================
@@ -1374,7 +1379,7 @@ function reportSystemPrompt() {
   );
 }
 
-async function callGroqJSON({ system, user, maxTokens = 1400 }) {
+async function callGroqJSON({ system, user, maxTokens = 2048 }) {
   if (!GROQ_API_KEY) throw new Error("Missing GROQ_API_KEY");
 
   const url = "https://api.groq.com/openai/v1/chat/completions";
@@ -1797,7 +1802,7 @@ app.post("/chat", async (req, res) => {
     const obj = await callGroqJSON({
       system: chatSystemPrompt(),
       user: userPrompt,
-      maxTokens: 1200,
+      maxTokens: 2048,
     });
 
     let finalCategory = obj?.category || inferred || "general";
@@ -1891,7 +1896,7 @@ app.post("/report", upload.single("file"), async (req, res) => {
     const obj = await callGroqJSON({
       system: reportSystemPrompt(),
       user: userPrompt,
-      maxTokens: 1600,
+      maxTokens: 2048,
     });
 
     const card = postFilterCard(makeCard({ ...obj, category: "report" }), "");

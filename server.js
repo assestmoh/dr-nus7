@@ -145,6 +145,48 @@ function updateAvgLatency(ms) {
 ========================= */
 const sessions = new Map(); // userId -> { history, lastCard, flow, step, profile, ts, lastInText, lastInAt }
 
+/* =========================
+   Response cache (in-memory) + TTL 5min (token saver)
+========================= */
+const responseCache = new Map(); // key -> { card, ts }
+
+function makeCacheKey({ userId, message, session }) {
+  const last = session?.lastCard || null;
+  const base = {
+    u: String(userId || ""),
+    m: String(message || "").trim(),
+    f: session?.flow || "",
+    st: session?.step || 0,
+    p: session?.profile || {},
+    l: last ? { t: last.title, c: last.category, q: last.next_question } : null,
+  };
+  const raw = JSON.stringify(base);
+  // base64 keeps key short-ish without crypto cost
+  return "k_" + Buffer.from(raw).toString("base64").slice(0, 900);
+}
+
+function cacheGet(key) {
+  const v = responseCache.get(key);
+  if (!v) return null;
+  if (Date.now() - (v.ts || 0) > 5 * 60 * 1000) {
+    responseCache.delete(key);
+    return null;
+  }
+  return v.card || null;
+}
+
+function cacheSet(key, card) {
+  responseCache.set(key, { card, ts: Date.now() });
+}
+
+// periodic cleanup
+setInterval(() => {
+  const now = Date.now();
+  for (const [k, v] of responseCache) {
+    if (now - (v.ts || 0) > 6 * 60 * 1000) responseCache.delete(k);
+  }
+}, 90 * 1000);
+
 function getUserId(req) {
   const headerId = req.header("x-user-id");
   if (headerId) return headerId;
@@ -347,6 +389,82 @@ function makeCard({
   };
 }
 
+/* =========================
+   Quick choices: deterministic + relevant (UI cards)
+========================= */
+const QUICK_PRESETS = {
+  menu: () => menuCard().quick_choices,
+  emergency_yesno: ["نعم", "لا"],
+  report_upload: ["📎 إضافة مرفق", "القائمة الرئيسية"],
+  appointments: ["📅 مواعيد شفاء", "القائمة الرئيسية"],
+  sugar: ["صائم", "بعد الأكل", "HbA1c", "القائمة الرئيسية"],
+  bp: ["قراءة جديدة", "أعراض مرافقة", "القائمة الرئيسية"],
+  bmi: ["أحسب BMI", "نصائح وزن", "القائمة الرئيسية"],
+  water: ["كم أشرب؟", "علامات الجفاف", "القائمة الرئيسية"],
+  calories: ["تنحيف", "زيادة وزن", "القائمة الرئيسية"],
+  mental: ["قلق", "توتر", "نوم", "القائمة الرئيسية"],
+  first_aid: ["حروق بسيطة", "جرح/نزيف بسيط", "اختناق", "إغماء", "القائمة الرئيسية"],
+  general: ["🩸 السكر", "🫀 الضغط", "⚖️ BMI", "💧 شرب الماء", "🔥 السعرات", "🧠 طمّنا على مزاجك", "القائمة الرئيسية"],
+};
+
+function uniqTrim(arr, max = 7) {
+  const out = [];
+  for (const x of Array.isArray(arr) ? arr : []) {
+    const t = String(x || "").trim();
+    if (!t) continue;
+    if (out.includes(t)) continue;
+    out.push(t);
+    if (out.length >= max) break;
+  }
+  return out;
+}
+
+function normalizeChoices({ message, inferred, session, card }) {
+  const msg = String(message || "").trim();
+  const lastQ = String(session?.lastCard?.next_question || "").trim();
+
+  // طوارئ: نعم/لا
+  if (session?.lastCard?.category === "emergency") return QUICK_PRESETS.emergency_yesno;
+
+  // تقارير: حافظ على خيار المرفق
+  if (/(تقرير|تحاليل|report|pdf|صورة)/i.test(msg) || inferred === "report") return QUICK_PRESETS.report_upload;
+
+  // مواعيد
+  if (looksLikeAppointments(msg) || inferred === "appointments") return QUICK_PRESETS.appointments;
+
+  // إذا كان السؤال السابق يطلب اختيارًا محددًا، لا نرمي المستخدم لقائمة عامة
+  if (lastQ && /اختر|أي|وش|ما هو|ماهي|ايش|أي فئة/i.test(lastQ)) {
+    // هنا نستخدم quick_choices التي رجّعها النموذج إن كانت قصيرة وواضحة
+    const modelChoices = uniqTrim(card?.quick_choices, 7);
+    if (modelChoices.length && modelChoices.every((x) => String(x).length <= 22)) return modelChoices;
+  }
+
+  const cat = String(card?.category || inferred || "general");
+  if (QUICK_PRESETS[cat]) return QUICK_PRESETS[cat];
+
+  return QUICK_PRESETS.general;
+}
+
+function normalizeCardForUI({ card, message, inferred, session }) {
+  const c = makeCard(card || {});
+  c.title = clampText(c.title, 80);
+  c.verdict = clampText(c.verdict, 900);
+  c.when_to_seek_help = clampText(c.when_to_seek_help, 420);
+  c.next_question = clampText(c.next_question, 220);
+
+  c.tips = uniqTrim(c.tips, 5).map((t) => clampText(t, 160));
+
+  const chosen = uniqTrim(c.quick_choices, 7);
+  c.quick_choices = chosen.length ? chosen : normalizeChoices({ message, inferred, session, card: c });
+
+  // إذا كانت الخيارات طويلة/تشبه نصوص: استبدالها
+  if (c.quick_choices.some((x) => String(x).length > 28)) {
+    c.quick_choices = normalizeChoices({ message, inferred, session, card: c });
+  }
+
+  return c;
+}
+
 function menuCard() {
   return makeCard({
     title: "دليل العافية",
@@ -427,6 +545,20 @@ function startInstitutionalFlow(session, route) {
     });
   }
 
+  if (route === "lab_preparation") {
+    return makeCard({
+      title: "🧪 المختبر والتحاليل",
+      category: "report",
+      verdict: "اختر مسار داخل المختبر:",
+      tips: [
+        "إذا عندك تعليمات خاصة من الطبيب/المختبر فهي الأولى بالتطبيق.",
+        "بعض التحاليل تحتاج صيام وبعضها لا.",
+      ],
+      when_to_seek_help: "إذا عندك دوخة شديدة/إغماء بعد السحب: راجع الطاقم فورًا.",
+      next_question: "وش تبي؟",
+      quick_choices: ["🧪 التحضير للمختبر", "📄 افهم تقريرك", "القائمة الرئيسية"],
+    });
+  }
 
   if (route === "common_conditions_education") {
     return makeCard({
@@ -470,17 +602,46 @@ function startInstitutionalFlow(session, route) {
     });
   }
 
+  if (route === "facility_navigation") {
+    return makeCard({
+      title: "🏥 التوجيه داخل مستشفى جعلان بني بو حسن",
+      category: "general",
+      verdict:
+        "**معلومات دخول وخدمات  :**\n" +
+        "• أحضر **بطاقة الشخصية** و **البطاقة البنكية**.\n" +
+        "• تأكد من **تجديد/دفع الاشتراك السنوي** ؛ مثال توضيحي: **1 ريال و200 بيسة سنويًا**.\n" +
+        "• أغلب العيادات تكون **تحويل من المركز الصحي**، وبعضها قد يتطلب **موعد**.\n" +
+        `• لحجز/استفسار المواعيد عبر واتساب: **${WHATSAPP_APPOINTMENTS}**\n\n` +
+        "**العيادات الخارجية المتوفرة لدينا:**\n" +
+        "• عيادة أطفال\n" +
+        "• الجلدية\n" +
+        "• أذن وأنف وحنجرة\n" +
+        "• العيون\n" +
+        "• فاحص بصريات\n" +
+        "• التغذية\n" +
+        "• العظام\n" +
+        "• الجراحة\n" +
+        "• الباطنية\n" +
+        "• الأشعة التفصيلية للحوامل\n",
+      tips: [
+        "إذا الحالة **طارئة/ضرورية**: قد يمكن الحضور مباشرة حسب سياسات المؤسسة.",
+        "احتفظ بأسماء الأدوية والحساسيات إن وجدت لتسريع الإجراءات.",
+      ],
+      when_to_seek_help: "إذا أعراض خطيرة: توجه للطوارئ فورًا او اتصل على رقم الطوارىء **25534005**.",
+      next_question: "تحب ترجع للقائمة الرئيسية؟",
+      quick_choices: ["القائمة الرئيسية"],
+    });
+  }
+
   if (route === "shifaa_appointments") {
     return makeCard({
-      title: "📅 تطبيق شفاء",
+      title: "📅 مواعيد شفاء",
       category: "appointments",
-      verdict:
-        "تطبيق **شفاء** هو برنامج وزارة الصحة في سلطنة عُمان لإدارة الملف الصحي والمواعيد.\n" +
-        "اختر بطاقة:",
-      tips: ["هذه معلومات عامة داخل التطبيق."],
+      verdict: "روابط التحميل الرسمية لتطبيق **شفاء**:",
+      tips: [`أندرويد: ${SHIFAA_ANDROID}`, `آيفون: ${SHIFAA_IOS}`],
       when_to_seek_help: "إذا حالة طارئة: الطوارئ أولًا.",
-      next_question: "وش تبغى؟",
-      quick_choices: ["روابط التحميل", "القائمة الرئيسية"],
+      next_question: "تحب ترجع للقائمة الرئيسية؟",
+      quick_choices: ["القائمة الرئيسية"],
     });
   }
 
@@ -556,6 +717,70 @@ function continueInstitutionalFlow(session, message) {
         when_to_seek_help: "إذا أعراض شديدة مع التقرير: راجع الطبيب/الطوارئ.",
         next_question: "جاهز ترفع التقرير؟",
         quick_choices: ["📎 إضافة مرفق", "القائمة الرئيسية"],
+      });
+    }
+
+    if (m === "🧪 التحضير للمختبر") {
+      return makeCard({
+        title: "🧪 التحضير للمختبر والتحاليل",
+        category: "report",
+        verdict: "اختر نوع التحضير:",
+        tips: [
+          "إذا الطبيب طلب صيام: عادة يكون ماء فقط مسموح (حسب تعليمات المختبر).",
+          "أخبر المختبر عن الأدوية المزمنة/الحمل/الحساسية.",
+        ],
+        when_to_seek_help: "دوخة شديدة/إغماء بعد السحب: راجع الطاقم فورًا.",
+        next_question: "وش التحليل الأقرب؟",
+        quick_choices: ["تحاليل صيام", "تحاليل بول", "تحاليل براز", "تحاليل دهون", "القائمة الرئيسية"],
+      });
+    }
+
+    if (m === "تحاليل صيام") {
+      return makeCard({
+        title: "🧪 تحاليل صيام",
+        category: "report",
+        verdict:
+          "**إرشادات عامة للصيام قبل التحاليل:**\n" +
+          "• اتبع مدة الصيام التي يحددها المختبر/الطبيب.\n" +
+          "• غالبًا يُسمح بالماء فقط.\n" +
+          "• تجنب مجهود شديد قبل التحليل.\n" +
+          "• أخبر المختبر عن الأدوية المزمنة (لا توقف شيء من نفسك).\n",
+        tips: ["نم جيدًا قبل التحليل.", "اشرب ماء لتسهيل سحب الدم إن سمح."],
+        when_to_seek_help: "إذا شعرت بدوخة شديدة أو إغماء: اطلب مساعدة فورًا.",
+        next_question: "تبغى نوع تحاليل ثانية؟",
+        quick_choices: ["تحاليل بول", "تحاليل براز", "تحاليل دهون", "القائمة الرئيسية"],
+      });
+    }
+
+    if (m === "تحاليل بول") {
+      return makeCard({
+        title: "🧪 تحاليل بول",
+        category: "report",
+        verdict:
+          "**إرشادات عامة لعينة البول:**\n" +
+          "• استخدم علبة معقمة.\n" +
+          "• في كثير من الحالات: عينة منتصف البول (midstream) تكون أفضل.\n" +
+          "• سلّم العينة بسرعة للمختبر حسب التعليمات.\n",
+        tips: ["اغسل اليدين قبل وبعد.", "لا تلمس داخل العلبة."],
+        when_to_seek_help: "إذا ألم شديد/حرارة عالية/دم واضح في البول: راجع الطبيب.",
+        next_question: "تبغى نوع تحاليل ثانية؟",
+        quick_choices: ["تحاليل صيام", "تحاليل براز", "تحاليل دهون", "القائمة الرئيسية"],
+      });
+    }
+
+    if (m === "تحاليل دهون") {
+      return makeCard({
+        title: "🧪 تحاليل دهون",
+        category: "report",
+        verdict:
+          "**إرشادات عامة لتحليل الدهون:**\n" +
+          "• بعض فحوصات الدهون قد تحتاج صيام حسب سياسة المختبر.\n" +
+          "• تجنب وجبة دسمة قبل التحليل.\n" +
+          "• أخبر المختبر عن الأدوية المزمنة.\n",
+        tips: ["اتبع تعليمات المختبر حرفيًا."],
+        when_to_seek_help: "إذا لديك ألم صدر/ضيق نفس: طوارئ فورًا.",
+        next_question: "تبغى نوع تحاليل ثانية؟",
+        quick_choices: ["تحاليل صيام", "تحاليل بول", "تحاليل براز", "القائمة الرئيسية"],
       });
     }
 
@@ -697,41 +922,7 @@ function continueInstitutionalFlow(session, message) {
   }
 
   if (flow === "shifaa_appointments") {
-    if (m === "روابط التحميل") {
-      return makeCard({
-        title: "📅 شفاء — روابط التحميل",
-        category: "appointments",
-        verdict: "روابط التحميل الرسمية:",
-        tips: [`أندرويد: ${SHIFAA_ANDROID}`, `آيفون: ${SHIFAA_IOS}`],
-        when_to_seek_help: "إذا أعراض طارئة: الطوارئ أولًا.",
-        next_question: "تبغى بطاقة ثانية؟",
-options: ["القائمة الرئيسية"],
-
-
-      });
-    }
-
-  
-    if (m === "عن برنامج شفاء") {
-      return makeCard({
-        title: "📌 عن برنامج شفاء",
-        category: "appointments",
-        verdict:
-          "شفاء برنامج في سلطنة عُمان يساعدك بإدارة ملفك الصحي.\n" +
-          "**أبرز الخيارات داخل شفاء (حسب ما طلبت):**",
-        tips: [
-          "السجلات الطبية: عرض زياراتك والتاريخ الطبي والحساسية والتشخيص النهائي.",
-          "أفراد العائلة: تقدر تشوف بيانات أفراد العائلة إذا أعمارهم **أقل من 18**. (فوق 18 يحمل التطبيق بنفسة بنفسه).",
-          "الفحوصات المخبرية: تقدر تصور الشاشة وتستخدم **دليل العافية** لفهم التقرير.",
-          "المستندات: طباعة الإجازات ونحوها (حسب الإتاحة).",
-          "التبرع بالأعضاء: خيار ضمن الخدمات (حسب الإتاحة).",
-        ],
-        when_to_seek_help: "إذا ظهرت نتائج مقلقة أو أعراض قوية: راجع الطبيب/الطوارئ.",
-        next_question: "تبغى بطاقة ثانية؟",
-        quick_choices: ["روابط التحميل" , "القائمة الرئيسية"],
-      });
-    }
-
+    // ✅ حسب طلبك: بطاقة روابط تحميل فقط
     return startInstitutionalFlow(session, "shifaa_appointments");
   }
 
@@ -1245,13 +1436,18 @@ const CARD_SCHEMA = {
 
 function chatSystemPrompt() {
   return (
-    "أنت مساعد تثقيف صحي فقط، ولست طبيبًا ولا بديلاً عن الاستشارة الطبية.\n" +
-    "إذا بدأ المستخدم بتحية، ابدأ برد اجتماعي قصير ثم انتقل للسؤال الصحي.\n" +
-    "قدّم معلومات عامة عن الصحة ونمط الحياة بأسلوب عربي واضح ومختصر.\n" +
-    "ممنوع منعًا باتًا: التشخيص، وصف الأدوية، الجرعات، أو خطة علاج.\n" +
-    "اذكر متى يجب مراجعة الطبيب/الطوارئ عند أعراض خطيرة.\n" +
-    "إذا لم تكن متأكدًا، قل: لا أعلم.\n" +
-    "أخرج JSON فقط بالمفاتيح المحددة.\n"
+    "أنت مساعد تثقيف صحي عربي (معلومات عامة فقط).
+" +
+    "ممنوع: التشخيص، وصف الأدوية، الجرعات، أو خطة علاج.
+" +
+    "اذكر متى يجب مراجعة الطبيب/الطوارئ عند علامات خطورة.
+" +
+    "اكتب بإيجاز وبشكل عملي.
+" +
+    "مهم: quick_choices لازم تكون مرتبطة مباشرة بسؤال المستخدم أو بالسؤال التالي، ولا تكون عشوائية.
+" +
+    "أخرج JSON فقط بالمفاتيح المحددة.
+"
   );
 }
 
@@ -1265,7 +1461,7 @@ function reportSystemPrompt() {
   );
 }
 
-async function callGroqJSON({ system, user, maxTokens = 1400 }) {
+async function callGroqJSON({ system, user, maxTokens = 900 }) {
   if (!GROQ_API_KEY) throw new Error("Missing GROQ_API_KEY");
 
   const url = "https://api.groq.com/openai/v1/chat/completions";
@@ -1363,8 +1559,14 @@ function postFilterCard(card, userMessage = "") {
     return makeCard({
       title: "تنبيه",
       category: card?.category || "general",
-      verdict:
-        "أنا للتثقيف الصحي فقط. ما أقدر أوصف أدوية أو جرعات." 
+      verdict: "أنا للتثقيف الصحي فقط. ما أقدر أوصف أدوية أو جرعات.",
+      tips: [
+        "إذا سؤالك عن استخدام دواء: راجع الطبيب/الصيدلي.",
+        "إذا ظهرت حساسية شديدة (تورم/ضيق نفس): طوارئ فورًا.",
+      ],
+      when_to_seek_help: "إذا أعراض خطرة: طوارئ فورًا.",
+      next_question: "تحب معلومات عامة عن الأعراض/الحالة بدل الأدوية؟",
+      quick_choices: ["نعم", "لا", "القائمة الرئيسية"],
     });
   }
 
@@ -1406,10 +1608,23 @@ app.post("/chat", async (req, res) => {
   const message = String(req.body?.message || "").trim();
   if (!message) return res.status(400).json({ ok: false, error: "empty_message" });
 
+  const inferredNow = inferCategoryFromMessage(message);
+
+  // ✅ Cache: نفس السؤال + نفس السياق خلال 5 دقائق
+  const cacheKey = makeCacheKey({ userId, message, session });
+  const cached = cacheGet(cacheKey);
+  if (cached) {
+    METRICS.chatOk++;
+    updateAvgLatency(Date.now() - t0);
+    return res.json({ ok: true, data: cached, cached: true });
+  }
+
   // ✅ Dedup
   const now = Date.now();
   if (session.lastInText === message && now - (session.lastInAt || 0) < 900) {
     const fallback = session.lastCard || menuCard();
+    fallback = normalizeCardForUI({ card: fallback, message, inferred: inferredNow, session });
+    cacheSet(cacheKey, fallback);
     return res.json({ ok: true, data: fallback, dedup: true });
   }
   session.lastInText = message;
@@ -1433,6 +1648,8 @@ app.post("/chat", async (req, res) => {
       bumpCategory(card.category);
       METRICS.chatOk++;
       updateAvgLatency(Date.now() - t0);
+      card = normalizeCardForUI({ card, message, inferred: inferredNow, session });
+      cacheSet(cacheKey, card);
       return res.json({ ok: true, data: card });
     }
   }
@@ -1444,7 +1661,9 @@ app.post("/chat", async (req, res) => {
     bumpCategory("general");
     METRICS.chatOk++;
     updateAvgLatency(Date.now() - t0);
-    return res.json({ ok: true, data: card });
+    card = normalizeCardForUI({ card, message, inferred: inferredNow, session });
+      cacheSet(cacheKey, card);
+      return res.json({ ok: true, data: card });
   }
   if (isThanks(message)) {
     const card = thanksCard();
@@ -1452,7 +1671,9 @@ app.post("/chat", async (req, res) => {
     bumpCategory("general");
     METRICS.chatOk++;
     updateAvgLatency(Date.now() - t0);
-    return res.json({ ok: true, data: card });
+    card = normalizeCardForUI({ card, message, inferred: inferredNow, session });
+      cacheSet(cacheKey, card);
+      return res.json({ ok: true, data: card });
   }
 
   // مسح/إلغاء
@@ -1462,7 +1683,9 @@ app.post("/chat", async (req, res) => {
     session.lastCard = card;
     METRICS.chatOk++;
     updateAvgLatency(Date.now() - t0);
-    return res.json({ ok: true, data: card });
+    card = normalizeCardForUI({ card, message, inferred: inferredNow, session });
+      cacheSet(cacheKey, card);
+      return res.json({ ok: true, data: card });
   }
 
   // طوارئ
@@ -1483,7 +1706,9 @@ app.post("/chat", async (req, res) => {
     bumpCategory("emergency");
     METRICS.chatOk++;
     updateAvgLatency(Date.now() - t0);
-    return res.json({ ok: true, data: card });
+    card = normalizeCardForUI({ card, message, inferred: inferredNow, session });
+      cacheSet(cacheKey, card);
+      return res.json({ ok: true, data: card });
   }
 
   // مواعيد (الكتابة الحرة)
@@ -1493,7 +1718,9 @@ app.post("/chat", async (req, res) => {
     bumpCategory("appointments");
     METRICS.chatOk++;
     updateAvgLatency(Date.now() - t0);
-    return res.json({ ok: true, data: card });
+    card = normalizeCardForUI({ card, message, inferred: inferredNow, session });
+      cacheSet(cacheKey, card);
+      return res.json({ ok: true, data: card });
   }
 
   // القائمة الرئيسية
@@ -1504,7 +1731,9 @@ app.post("/chat", async (req, res) => {
     bumpCategory("general");
     METRICS.chatOk++;
     updateAvgLatency(Date.now() - t0);
-    return res.json({ ok: true, data: card });
+    card = normalizeCardForUI({ card, message, inferred: inferredNow, session });
+      cacheSet(cacheKey, card);
+      return res.json({ ok: true, data: card });
   }
 
   // ✅✅✅ FIX: لا نخلي "تحاليل" يخطف خيارات المختبر
@@ -1531,10 +1760,12 @@ app.post("/chat", async (req, res) => {
     bumpCategory("report");
     METRICS.chatOk++;
     updateAvgLatency(Date.now() - t0);
-    return res.json({ ok: true, data: card });
+    card = normalizeCardForUI({ card, message, inferred: inferredNow, session });
+      cacheSet(cacheKey, card);
+      return res.json({ ok: true, data: card });
   }
 
-  const inferred = inferCategoryFromMessage(message);
+  const inferred = inferredNow;
 
   // ✅ متابعة المسار أولًا
   // 1) institutional flows
@@ -1555,6 +1786,8 @@ app.post("/chat", async (req, res) => {
       bumpCategory(card.category);
       METRICS.chatOk++;
       updateAvgLatency(Date.now() - t0);
+      card = normalizeCardForUI({ card, message, inferred: inferredNow, session });
+      cacheSet(cacheKey, card);
       return res.json({ ok: true, data: card });
     }
   }
@@ -1566,6 +1799,8 @@ app.post("/chat", async (req, res) => {
       session.lastCard = card;
       METRICS.chatOk++;
       updateAvgLatency(Date.now() - t0);
+      card = normalizeCardForUI({ card, message, inferred: inferredNow, session });
+      cacheSet(cacheKey, card);
       return res.json({ ok: true, data: card });
     }
   }
@@ -1590,6 +1825,8 @@ app.post("/chat", async (req, res) => {
       session.lastCard = card;
       METRICS.chatOk++;
       updateAvgLatency(Date.now() - t0);
+      card = normalizeCardForUI({ card, message, inferred: inferredNow, session });
+      cacheSet(cacheKey, card);
       return res.json({ ok: true, data: card });
     }
 
@@ -1601,6 +1838,8 @@ app.post("/chat", async (req, res) => {
       session.lastCard = card;
       METRICS.chatOk++;
       updateAvgLatency(Date.now() - t0);
+      card = normalizeCardForUI({ card, message, inferred: inferredNow, session });
+      cacheSet(cacheKey, card);
       return res.json({ ok: true, data: card });
     }
   }
@@ -1629,7 +1868,9 @@ app.post("/chat", async (req, res) => {
     session.lastCard = card;
     METRICS.chatOk++;
     updateAvgLatency(Date.now() - t0);
-    return res.json({ ok: true, data: card });
+    card = normalizeCardForUI({ card, message, inferred: inferredNow, session });
+      cacheSet(cacheKey, card);
+      return res.json({ ok: true, data: card });
   }
 
   // رسالة قصيرة/غامضة
@@ -1643,7 +1884,9 @@ app.post("/chat", async (req, res) => {
     session.lastCard = card;
     METRICS.chatOk++;
     updateAvgLatency(Date.now() - t0);
-    return res.json({ ok: true, data: card });
+    card = normalizeCardForUI({ card, message, inferred: inferredNow, session });
+      cacheSet(cacheKey, card);
+      return res.json({ ok: true, data: card });
   }
 
   // ====== LLM fallback ======
@@ -1651,19 +1894,32 @@ app.post("/chat", async (req, res) => {
   session.history = trimHistory(session.history, 10);
 
   const last = req.body?.context?.last || session.lastCard || null;
-  const lastStr = last ? clampText(JSON.stringify(last), 1200) : "";
-  const msgStr = clampText(message, 1200);
 
+  function lastCardSummary(card) {
+    if (!card) return "";
+    return clampText(
+      JSON.stringify({
+        title: card.title,
+        category: card.category,
+        verdict: card.verdict ? String(card.verdict).slice(0, 220) : "",
+        next_question: card.next_question || "",
+      }),
+      520
+    );
+  }
+
+  const msgStr = clampText(message, 900);
   const profileStr =
-    session.flow && session.step === 4 ? clampText(JSON.stringify(session.profile), 1200) : "";
+    session.flow && session.step === 4 ? clampText(JSON.stringify(session.profile || {}), 500) : "";
 
-  const historyStr = clampText(
-    session.history
-      .slice(-6)
-      .map((x) => `${x.role === "user" ? "المستخدم" : "المساعد"}: ${x.content}`)
-      .join("\n"),
-    1800
-  );
+  // ✅ أقل توكنز: آخر 3 رسائل مستخدم فقط (بدون ردود JSON كاملة)
+  const recentUserMsgs = session.history
+    .filter((x) => x.role === "user")
+    .slice(-3)
+    .map((x) => clampText(x.content, 220))
+    .join(" | ");
+
+  const lastSummary = lastCardSummary(last);
 
   let forcedCategory = null;
   if (session.flow === "sugar" && session.step === 4) forcedCategory = "sugar";
@@ -1676,19 +1932,24 @@ app.post("/chat", async (req, res) => {
   if (session.flow === "general" && session.step === 4) forcedCategory = "general";
 
   const userPrompt =
-    (historyStr ? `سياق المحادثة (آخر رسائل):\n${historyStr}\n\n` : "") +
-    (profileStr ? `بيانات تخصيص (اختيارات المستخدم):\n${profileStr}\n\n` : "") +
-    (last ? `سياق آخر بطاقة (لا تكررها حرفيًا، استخدمها فقط إذا مرتبطة):\n${lastStr}\n\n` : "") +
-    `سؤال المستخدم:\n${msgStr}\n\n` +
-    "الالتزام: لا تشخيص، لا أدوية، لا جرعات.\n" +
-    "قدّم نصائح عامة عملية + متى يراجع الطبيب/الطوارئ.\n" +
-    "مهم: لا تعيد نفس البطاقة السابقة إذا كان جواب المستخدم قصيرًا.\n";
+    (recentUserMsgs ? `آخر رسائل المستخدم (مختصر): ${recentUserMsgs}
+` : "") +
+    (profileStr ? `اختيارات المستخدم (مختصر): ${profileStr}
+` : "") +
+    (lastSummary ? `آخر بطاقة (مختصر): ${lastSummary}
+` : "") +
+    `سؤال المستخدم: ${msgStr}
+` +
+    "الالتزام: لا تشخيص، لا أدوية، لا جرعات.
+" +
+    "أعد بطاقة تثقيف قصيرة وعملية.
+";
 
   try {
     const obj = await callGroqJSON({
       system: chatSystemPrompt(),
       user: userPrompt,
-      maxTokens: 1200,
+      maxTokens: 650,
     });
 
     let finalCategory = obj?.category || inferred || "general";
@@ -1705,7 +1966,7 @@ app.post("/chat", async (req, res) => {
     const card = makeCard({ ...obj, category: finalCategory });
     const safeCard = postFilterCard(card, message);
 
-    session.lastCard = safeCard;
+    // lastCard سيتم تعيينها بعد normalize
     session.history.push({ role: "assistant", content: JSON.stringify(safeCard) });
     session.history = trimHistory(session.history, 10);
 
@@ -1713,7 +1974,10 @@ app.post("/chat", async (req, res) => {
     METRICS.chatOk++;
     updateAvgLatency(Date.now() - t0);
 
-    return res.json({ ok: true, data: safeCard });
+    const normalized = normalizeCardForUI({ card: safeCard, message, inferred: inferredNow, session });
+    session.lastCard = normalized;
+    cacheSet(cacheKey, normalized);
+    return res.json({ ok: true, data: normalized });
   } catch (err) {
     console.error("[chat] FAILED:", err?.message || err);
     METRICS.chatFail++;
@@ -1775,24 +2039,26 @@ app.post("/report", upload.single("file"), async (req, res) => {
       "نص مستخرج من تقرير/تحاليل:\n" +
       extractedClamped +
       "\n\n" +
-      "اشرح بالعربية بلغة بسيطة لمواطن عادي ما يعرف المصطلحات الطبية: ماذا يعني + نصائح عامة + متى يراجع الطبيب.\n" +
+      "اشرح بالعربية بشكل عام: ماذا يعني + نصائح عامة + متى يراجع الطبيب.\n" +
       "التزم بما ورد في التقرير فقط.\n" +
       "ممنوع تشخيص مؤكد أو جرعات أو وصف علاج.";
 
     const obj = await callGroqJSON({
       system: reportSystemPrompt(),
       user: userPrompt,
-      maxTokens: 1600,
+      maxTokens: 1100,
     });
 
     const card = postFilterCard(makeCard({ ...obj, category: "report" }), "");
-    session.lastCard = card;
+    const normalized = normalizeCardForUI({ card, message: "تقرير", inferred: "report", session });
+    session.lastCard = normalized;
 
     bumpCategory("report");
     METRICS.reportOk++;
     updateAvgLatency(Date.now() - t0);
 
-    return res.json({ ok: true, data: card });
+    const normalized = normalizeCardForUI({ card, message: "تقرير", inferred: "report", session });
+    return res.json({ ok: true, data: normalized });
   } catch (err) {
     console.error("[report] FAILED:", err?.message || err);
     METRICS.reportFail++;

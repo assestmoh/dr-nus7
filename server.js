@@ -2047,8 +2047,6 @@ app.post("/report", upload.single("file"), async (req, res) => {
     bumpCategory("report");
     METRICS.reportOk++;
     updateAvgLatency(Date.now() - t0);
-
-    const normalized = normalizeCardForUI({ card, message: "تقرير", inferred: "report", session });
     return res.json({ ok: true, data: normalized });
   } catch (err) {
     console.error("[report] FAILED:", err?.message || err);

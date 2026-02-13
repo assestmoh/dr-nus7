@@ -1576,21 +1576,21 @@ app.get("/", (req, res) => {
   });
 });
 
-app.get("/health", (req, res) => {
+app.get(["/health","/healthz","/api/health","/api/healthz"], (req, res) => {
   res.json({ ok: true });
 });
 
-app.get("/metrics", (req, res) => {
+app.get(["/metrics","/api/metrics"], (req, res) => {
   res.json({ ok: true, data: METRICS });
 });
 
-app.post("/reset", (req, res) => {
+app.post(["/reset","/api/reset"], (req, res) => {
   const userId = getUserId(req);
   sessions.delete(userId);
   res.json({ ok: true });
 });
 
-app.post("/chat", async (req, res) => {
+app.post(["/chat","/api/chat"], async (req, res) => {
   const t0 = Date.now();
   METRICS.chatRequests++;
 
@@ -2063,6 +2063,6 @@ app.post("/report", upload.single("file"), async (req, res) => {
 /* =========================
    Start
 ========================= */
-app.listen(PORT, () => {
+app.listen(PORT, "0.0.0.0", () => {
   console.log(`🚀 Dalil Alafiyah API يعمل على http://localhost:${PORT}`);
 });

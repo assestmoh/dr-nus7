@@ -1614,7 +1614,7 @@ app.post(["/chat","/api/chat"], async (req, res) => {
   // ✅ Dedup
   const now = Date.now();
   if (session.lastInText === message && now - (session.lastInAt || 0) < 900) {
-    const fallback = session.lastCard || menuCard();
+    let fallback = session.lastCard || menuCard();
     fallback = normalizeCardForUI({ card: fallback, message, inferred: inferredNow, session });
     cacheSet(cacheKey, fallback);
     return res.json({ ok: true, data: fallback, dedup: true });
@@ -1635,7 +1635,7 @@ app.post(["/chat","/api/chat"], async (req, res) => {
     ]);
 
     if (institutionalRoutes.has(route)) {
-      const card = startInstitutionalFlow(session, route);
+      let card = startInstitutionalFlow(session, route);
       session.lastCard = card;
       bumpCategory(card.category);
       METRICS.chatOk++;
@@ -1648,7 +1648,7 @@ app.post(["/chat","/api/chat"], async (req, res) => {
 
   // تحية/شكر
   if (isGreeting(message)) {
-    const card = greetingCard();
+    let card = greetingCard();
     session.lastCard = card;
     bumpCategory("general");
     METRICS.chatOk++;
@@ -1658,7 +1658,7 @@ app.post(["/chat","/api/chat"], async (req, res) => {
       return res.json({ ok: true, data: card });
   }
   if (isThanks(message)) {
-    const card = thanksCard();
+    let card = thanksCard();
     session.lastCard = card;
     bumpCategory("general");
     METRICS.chatOk++;
@@ -1671,7 +1671,7 @@ app.post(["/chat","/api/chat"], async (req, res) => {
   // مسح/إلغاء
   if (/^(إلغاء|الغاء|cancel|مسح|مسح المحادثة|ابدأ من جديد|ابدأ جديد)$/i.test(message)) {
     resetFlow(session);
-    const card = menuCard();
+    let card = menuCard();
     session.lastCard = card;
     METRICS.chatOk++;
     updateAvgLatency(Date.now() - t0);
@@ -1683,7 +1683,7 @@ app.post(["/chat","/api/chat"], async (req, res) => {
   // طوارئ
   if (isEmergencyText(message)) {
     METRICS.emergencyTriggers++;
-    const card = makeCard({
+    let card = makeCard({
       title: "⚠️ تنبيه طارئ",
       category: "emergency",
       verdict:
@@ -1705,7 +1705,7 @@ app.post(["/chat","/api/chat"], async (req, res) => {
 
   // مواعيد (الكتابة الحرة)
   if (looksLikeAppointments(message)) {
-    const card = startInstitutionalFlow(session, "shifaa_appointments");
+    let card = startInstitutionalFlow(session, "shifaa_appointments");
     session.lastCard = card;
     bumpCategory("appointments");
     METRICS.chatOk++;
@@ -1718,7 +1718,7 @@ app.post(["/chat","/api/chat"], async (req, res) => {
   // القائمة الرئيسية
   if (/^(القائمة الرئيسية|القائمه الرئيسيه|منيو|قائمة|ابدأ|ابدء)$/i.test(message)) {
     resetFlow(session);
-    const card = menuCard();
+    let card = menuCard();
     session.lastCard = card;
     bumpCategory("general");
     METRICS.chatOk++;
@@ -1739,7 +1739,7 @@ app.post(["/chat","/api/chat"], async (req, res) => {
     /(افهم\s*تقريرك|تقرير)/i.test(message) &&
     message.length <= 30
   ) {
-    const card = makeCard({
+    let card = makeCard({
       title: "📄 افهم تقريرك",
       category: "report",
       verdict: "تمام. ارفع صورة أو PDF للتقرير في زر المرفق، وأنا أشرح بشكل عام.",
@@ -1772,7 +1772,7 @@ app.post(["/chat","/api/chat"], async (req, res) => {
       "shifaa_appointments",
     ].includes(session.flow)
   ) {
-    const card = continueInstitutionalFlow(session, message);
+    let card = continueInstitutionalFlow(session, message);
     if (card) {
       session.lastCard = card;
       bumpCategory(card.category);
@@ -1786,7 +1786,7 @@ app.post(["/chat","/api/chat"], async (req, res) => {
 
   // 2) existing smart flows
   if (session.flow && session.step > 0 && session.step < 4) {
-    const card = continueFlow(session, message);
+    let card = continueFlow(session, message);
     if (card) {
       session.lastCard = card;
       METRICS.chatOk++;
@@ -1813,7 +1813,7 @@ app.post(["/chat","/api/chat"], async (req, res) => {
     const short = message.length <= 40;
     const matched = startMap.find((x) => x.match.test(message));
     if (short && matched) {
-      const card = startFlow(session, matched.key);
+      let card = startFlow(session, matched.key);
       session.lastCard = card;
       METRICS.chatOk++;
       updateAvgLatency(Date.now() - t0);
@@ -1826,7 +1826,7 @@ app.post(["/chat","/api/chat"], async (req, res) => {
       short &&
       ["sugar", "bp", "bmi", "water", "calories", "mental", "first_aid"].includes(inferred)
     ) {
-      const card = startFlow(session, inferred);
+      let card = startFlow(session, inferred);
       session.lastCard = card;
       METRICS.chatOk++;
       updateAvgLatency(Date.now() - t0);
@@ -1848,7 +1848,7 @@ app.post(["/chat","/api/chat"], async (req, res) => {
 
   // Bare yes/no فقط إذا ما في سؤال سابق
   if (!session.flow && isBareYesNo(message) && !session.lastCard?.next_question) {
-    const card = makeCard({
+    let card = makeCard({
       title: "دليل العافية",
       category: "general",
       verdict: "وضح لي أكثر 😊",
@@ -1868,7 +1868,7 @@ app.post(["/chat","/api/chat"], async (req, res) => {
   // رسالة قصيرة/غامضة
   const inCompletedFlow = session.flow && session.step === 4;
   if (!inCompletedFlow && isTooVague(message, session)) {
-    const card = makeCard({
+    let card = makeCard({
       title: "توضيح سريع",
       category: inferred === "emergency" ? "emergency" : inferred || "general",
       verdict: "أقدر أساعدك، بس أحتاج تفاصيل بسيطة عشان ما أعطيك رد عام.",
@@ -1954,7 +1954,7 @@ app.post(["/chat","/api/chat"], async (req, res) => {
       }
     }
 
-    const card = makeCard({ ...obj, category: finalCategory });
+    let card = makeCard({ ...obj, category: finalCategory });
     const safeCard = postFilterCard(card, message);
 
     // lastCard سيتم تعيينها بعد normalize
@@ -1977,7 +1977,7 @@ app.post(["/chat","/api/chat"], async (req, res) => {
   }
 });
 
-app.post("/report", upload.single("file"), async (req, res) => {
+app.post(["/report","/api/report"], upload.single("file"), async (req, res) => {
   const t0 = Date.now();
   METRICS.reportRequests++;
 

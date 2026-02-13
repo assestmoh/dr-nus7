@@ -768,7 +768,7 @@ function continueInstitutionalFlow(session, message) {
         verdict: "روابط التحميل الرسمية:",
         tips: [`أندرويد: ${SHIFAA_ANDROID}`, `آيفون: ${SHIFAA_IOS}`],
         when_to_seek_help: "إذا أعراض طارئة: الطوارئ أولًا.",
-        next_question: "تبغى بطاقة ثانية؟",, "عن برنامج شفاء", "القائمة الرئيسية"],
+        next_question: "تبغى بطاقة ثانية؟" , "عن برنامج شفاء", "القائمة الرئيسية"],
       });
     }
 

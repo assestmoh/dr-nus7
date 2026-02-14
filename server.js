@@ -34,7 +34,7 @@ app.use(
   cors({
     origin: true,
     methods: ["GET", "POST", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization", "x-user-id", "X-User-Id"],
+    allowedHeaders: ["Content-Type","Authorization","x-user-id","X-User-Id","x-api-key","X-Api-Key"],
   })
 );
 app.use(bodyParser.json({ limit: "2mb" }));
@@ -150,7 +150,7 @@ function calculatorsMenuCard() {
   return card({
     category: "calculators",
     title: "🧮 الحاسبات",
-    verdict: "اختر الحاسبة اللي تبيها (كلها ردود جاهزة لتوفير التوكنز):",
+    verdict: "اختر الحاسبة التي تريدها (كلها ردود جاهزة لتوفير التوكنز):",
     next_question: "أي حاسبة نبدأ؟",
     quick_choices: [
       "🔥 حاسبة السعرات",
@@ -315,7 +315,7 @@ function continueCalc(session, message) {
         category: "calculators",
         title: "⚖️ نتيجة BMI",
         verdict: `BMI = **${bmi}** (${label})`,
-        next_question: "تبغى نصائح لنمط الحياة حسب النتيجة؟",
+        next_question: "تريد نصائح لنمط الحياة حسب النتيجة؟",
         quick_choices: ["نعم", "لا", "🧮 الحاسبات"],
         tips: [
           "النتيجة تقديرية ولا تكفي وحدها لتقييم الصحة.",
@@ -459,7 +459,7 @@ function continueCalc(session, message) {
         category: "calculators",
         title: "🔥 نتيجة السعرات",
         verdict: `احتياجك اليومي التقريبي = **${tdee}** سعرة/يوم.\nالهدف (${note}) ≈ **${target}** سعرة/يوم.`,
-        next_question: "تبغى نصائح سريعة للأكل؟",
+        next_question: "تريد نصائح سريعة للأكل؟",
         quick_choices: ["نعم", "لا", "🧮 الحاسبات"],
         tips: ["الأرقام تقديرية وقد تختلف حسب الحالة الصحية.", "قسّم البروتين/الخضار/الكربوهيدرات بشكل متوازن."],
         when_to_seek_help: "إذا لديك مرض مزمن أو فقدان وزن غير مبرر: استشر الطبيب/أخصائي تغذية.",
@@ -534,7 +534,7 @@ function continueCalc(session, message) {
         category: "calculators",
         title: "💧 نتيجة الماء",
         verdict: `احتياجك التقريبي من الماء ≈ **${liters} لتر/يوم**.`,
-        next_question: "تبغى طريقة توزيعها خلال اليوم؟",
+        next_question: "تريد طريقة توزيعها خلال اليوم؟",
         quick_choices: ["نعم", "لا", "🧮 الحاسبات"],
         tips: ["لون البول الفاتح غالبًا علامة ترطيب جيد.", "زد الماء مع الرياضة/الحر."],
         when_to_seek_help: "إذا لديك فشل كلوي/قصور قلب: استشر طبيبك قبل زيادة السوائل.",
@@ -637,10 +637,10 @@ function continueCalc(session, message) {
 
       session.calc = null;
       return card({
-        category: cls.includes("مرتفع جدًا") ? "calculators" : "calculators",
+        category: "calculators",
         title: "🩸 نتيجة السكر",
         verdict: `قراءة السكر ≈ **${mg} mg/dL** (${cls}).`,
-        next_question: "تبغى نصائح غذائية قصيرة؟",
+        next_question: "تريد نصائح غذائية قصيرة؟",
         quick_choices: ["نعم", "لا", "🧮 الحاسبات"],
         tips: [
           "القراءة الواحدة لا تكفي للتشخيص.",
@@ -699,7 +699,7 @@ function continueCalc(session, message) {
         category: "calculators",
         title: "🧠 نتيجة المزاج",
         verdict: `مزاجك: **${mood}** — نومك: **${hrs} ساعة**.`,
-        next_question: "تبغى خطة بسيطة لليوم؟",
+        next_question: "تريد خطة بسيطة لليوم؟",
         quick_choices: ["نعم", "لا", "🧮 الحاسبات"],
         tips: tips.length ? tips : ["حافظ على ماء/أكل منتظم + مشي 10 دقائق."],
         when_to_seek_help: seek,
@@ -774,39 +774,36 @@ async function callGroq(messages) {
       headers: { Authorization: `Bearer ${GROQ_API_KEY}`, "Content-Type": "application/json" },
       body: JSON.stringify(payload2),
     });
-    if (!res.ok) throw new Error("Groq API error");
   }
 
-  const data = await res.json().catch(() => ({}));
-  const txt = data.choices?.[0]?.message?.content || "";
-  return txt;
+  const data = await res.json();
+  const text = data?.choices?.[0]?.message?.content || "";
+  return text;
 }
 
 function extractJson(text) {
-  let s = String(text || "").trim();
-  s = s.replace(/^```(?:json)?/i, "").replace(/```$/i, "").trim();
-  try { return JSON.parse(s); } catch {}
-  const a = s.indexOf("{");
-  const b = s.lastIndexOf("}");
-  if (a === -1 || b === -1 || b <= a) return null;
-  try { return JSON.parse(s.slice(a, b + 1)); } catch { return null; }
+  try {
+    return JSON.parse(text);
+  } catch {}
+  // fallback: حاول استخراج أول { ... }
+  const m = String(text || "").match(/\{[\s\S]*\}/);
+  if (!m) return null;
+  try {
+    return JSON.parse(m[0]);
+  } catch {}
+  return null;
 }
 
-function sanitizeText(v) {
-  let s = typeof v === "string" ? v : "";
-  s = s.replace(/```[\s\S]*?```/g, "").replace(/`+/g, "").trim();
-  return s;
-}
-
-function normalize(obj) {
+function normalize(x) {
+  const v = x || {};
   return card({
-    category: sanitizeText(obj?.category) || "general",
-    title: sanitizeText(obj?.title) || "دليل العافية",
-    verdict: sanitizeText(obj?.verdict),
-    next_question: sanitizeText(obj?.next_question),
-    quick_choices: Array.isArray(obj?.quick_choices) ? obj.quick_choices.map(sanitizeText) : [],
-    tips: Array.isArray(obj?.tips) ? obj.tips.map(sanitizeText) : [],
-    when_to_seek_help: sanitizeText(obj?.when_to_seek_help),
+    category: v.category || "general",
+    title: v.title || "دليل العافية",
+    verdict: v.verdict || "",
+    next_question: v.next_question || "",
+    quick_choices: Array.isArray(v.quick_choices) ? v.quick_choices : [],
+    tips: Array.isArray(v.tips) ? v.tips : [],
+    when_to_seek_help: v.when_to_seek_help || "",
   });
 }
 
@@ -814,37 +811,23 @@ function fallbackCard() {
   return card({
     category: "general",
     title: "دليل العافية",
-    verdict: "لم أفهم سؤالك بالكامل. اكتب عرضك ومدة الأعراض.",
-    next_question: "ما هو العرض الأساسي؟ وكم له؟",
-    quick_choices: ["🧮 الحاسبات", "📄 افهم تقريرك", "إلغاء"],
-    tips: [],
-    when_to_seek_help: "إذا ألم صدر/ضيق نفس/إغماء/نزيف شديد: طوارئ فورًا.",
+    verdict: "تعذر الحصول على رد واضح الآن. اكتب سؤالك بصيغة أبسط.",
+    next_question: "ما هو سؤالك؟",
+    quick_choices: ["🧮 الحاسبات", "📄 افهم تقريرك", "🩹 إسعافات أولية"],
+    tips: ["اذكر العمر/الأعراض/المدة بدون معلومات حساسة."],
+    when_to_seek_help: "إذا كانت أعراضك شديدة أو مفاجئة: راجع الطبيب/الطوارئ.",
   });
-}
-
-// ===============================
-// OCR + Report
-// ===============================
-let ocrWorkerPromise = null;
-async function getOcrWorker() {
-  if (!createWorker) return null;
-  if (!ocrWorkerPromise) {
-    ocrWorkerPromise = (async () => await createWorker("eng+ara"))();
-  }
-  return ocrWorkerPromise;
-}
-async function ocrImage(buffer) {
-  const w = await getOcrWorker();
-  if (!w) return "";
-  const { data } = await w.recognize(buffer);
-  return data?.text ? String(data.text) : "";
 }
 
 // ===============================
 // Routes
 // ===============================
-app.get("/", (_req, res) => {
-  res.json({ ok: true, service: "Dalil Alafiyah API", routes: ["/chat", "/report"] });
+app.get("/", (_req, res) => res.send("OK"));
+
+app.post("/reset", (req, res) => {
+  const userId = getUserId(req);
+  sessions.delete(userId);
+  return res.json({ ok: true });
 });
 
 app.post("/chat", async (req, res) => {
@@ -853,6 +836,161 @@ app.post("/chat", async (req, res) => {
 
   const msg = String(req.body?.message || "").trim();
   if (!msg) return res.status(400).json({ ok: false, error: "empty_message" });
+
+  const metaRoute = String(req.body?.meta?.route || "").trim();
+
+  // ====== مسارات مؤسسية (بطاقات جاهزة بدون LLM) ======
+  // (هذه المسارات تُرسل من الواجهة عبر meta.route)
+  if (metaRoute === "medication_general_guidance") {
+    session.calc = null;
+    return res.json({
+      ok: true,
+      data: card({
+        category: "general",
+        title: "💊 تثقيف أدوية عام",
+        verdict:
+          "اختصار مفيد قبل استخدام أي دواء: اقرأ النشرة، التزم بالجرعة الموصوفة، ولا تجمع أدوية متعددة لنفس العرض بدون استشارة مختص.",
+        next_question: "تريد تثقيف عام عن أي نقطة؟",
+        quick_choices: ["✅ استخدام آمن", "⚠️ آثار جانبية شائعة", "🔁 تداخلات دوائية", "⛔ متى أتجنب الدواء؟", "إلغاء"],
+        tips: [
+          "لا أقدّم جرعات أو وصفات علاج.",
+          "للحامل/المرضع/الأطفال/الأمراض المزمنة: اسأل الطبيب/الصيدلي قبل أي دواء.",
+        ],
+        when_to_seek_help: "إذا ظهرت حساسية شديدة (تورّم/ضيق نفس/طفح منتشر): طوارئ فورًا.",
+      }),
+    });
+  }
+
+  if (metaRoute === "common_conditions_education") {
+    session.calc = null;
+    return res.json({
+      ok: true,
+      data: card({
+        category: "general",
+        title: "🩺 تثقيف عن أمراض شائعة",
+        verdict: "اختر موضوعًا شائعًا للتثقيف العام:",
+        next_question: "أي موضوع تختار؟",
+        quick_choices: ["الضغط", "السكر", "الزكام/الإنفلونزا", "الربو", "آلام الظهر", "إلغاء"],
+        tips: ["الشرح للتوعية العامة وليس تشخيصًا."],
+        when_to_seek_help: "إذا أعراض شديدة أو مفاجئة: راجع الطبيب/الطوارئ.",
+      }),
+    });
+  }
+
+  if (metaRoute === "prevention_lifestyle") {
+    session.calc = null;
+    return res.json({
+      ok: true,
+      data: card({
+        category: "general",
+        title: "🌿 نمط الحياة",
+        verdict: "اختر محورًا لنصائح نمط الحياة:",
+        next_question: "نبدأ بأي محور؟",
+        quick_choices: ["🍽️ تغذية", "🏃 نشاط بدني", "😴 نوم", "🧘 ضغط نفسي", "🚭 إقلاع عن التدخين", "إلغاء"],
+        tips: ["نصائح عملية قصيرة وقابلة للتطبيق."],
+        when_to_seek_help: "",
+      }),
+    });
+  }
+
+  // ====== إسعافات أولية (جاهز بدون LLM) ======
+  if (/إسعافات\s*أولية|🩹/i.test(msg)) {
+    session.calc = null;
+    return res.json({
+      ok: true,
+      data: card({
+        category: "first_aid",
+        title: "🩹 إسعافات أولية",
+        verdict: "اختر الحالة للحصول على خطوات إسعاف أولي عامة:",
+        next_question: "أي حالة؟",
+        quick_choices: ["🔥 حروق بسيطة", "🩸 نزيف/جرح", "🤕 التواء/كدمة", "😵 إغماء", "🧒 اختناق", "إلغاء"],
+        tips: ["إذا الحالة خطيرة أو تتدهور: اطلب طوارئ فورًا."],
+        when_to_seek_help: "ضيق نفس/ألم صدر/نزيف شديد/فقدان وعي طويل: طوارئ فورًا.",
+      }),
+    });
+  }
+
+  // ردود إسعاف أولي جاهزة (تُستدعى من أزرار القائمة)
+  if (/^🔥\s*حروق بسيطة$/i.test(msg)) {
+    return res.json({
+      ok: true,
+      data: card({
+        category: "first_aid",
+        title: "🔥 حروق بسيطة",
+        verdict:
+          "1) برّد مكان الحرق بماء جارٍ فاتر/بارد لمدة 10–20 دقيقة.\n2) انزع الإكسسوارات القريبة (خواتم) إذا ممكن قبل التورّم.\n3) غطِّ الحرق بضماد/شاش نظيف غير لاصق.\n4) لا تضع معجون/زيوت/ثلج مباشر.\n5) لا تفقع الفقاعات.",
+        next_question: "هل الحرق كبير أو في الوجه/اليد/الأعضاء التناسلية؟",
+        quick_choices: ["نعم", "لا", "🩹 إسعافات أولية", "إلغاء"],
+        tips: ["إذا الألم شديد: يمكن مسكن مناسب حسب الإرشادات العامة (بدون جرعات هنا)."],
+        when_to_seek_help:
+          "إذا الحرق كبير، أو كيميائي/كهربائي، أو مع فقاعات واسعة، أو على الوجه/المفاصل/اليدين: راجع الطوارئ.",
+      }),
+    });
+  }
+
+  if (/^🩸\s*نزيف\/جرح$/i.test(msg)) {
+    return res.json({
+      ok: true,
+      data: card({
+        category: "first_aid",
+        title: "🩸 نزيف/جرح",
+        verdict:
+          "1) اضغط بقطعة قماش/شاش نظيف مباشرة على الجرح 10 دقائق دون رفعها.\n2) ارفع الطرف المصاب إن أمكن.\n3) إذا تشبّع الشاش: أضف طبقة فوقه ولا تنزع الأولى.\n4) بعد توقف النزيف: نظّف حول الجرح وغطّه بضماد.",
+        next_question: "هل النزيف غزير أو لا يتوقف بعد 10 دقائق ضغط؟",
+        quick_choices: ["نعم", "لا", "🩹 إسعافات أولية", "إلغاء"],
+        tips: ["للجروح العميقة/المتسخة قد تحتاج تطعيم كزاز."],
+        when_to_seek_help: "نزيف غزير/جرح عميق/أجسام مغروسة/دوخة شديدة: طوارئ فورًا.",
+      }),
+    });
+  }
+
+  if (/^🤕\s*التواء\/كدمة$/i.test(msg)) {
+    return res.json({
+      ok: true,
+      data: card({
+        category: "first_aid",
+        title: "🤕 التواء/كدمة",
+        verdict:
+          "قاعدة RICE خلال 24–48 ساعة:\n- Rest: راحة\n- Ice: كمادات باردة 15–20 دقيقة كل 2–3 ساعات\n- Compression: رباط ضاغط خفيف\n- Elevation: رفع الطرف\nتجنب التدليك القوي أول يوم.",
+        next_question: "هل يوجد تشوّه واضح أو عدم قدرة على المشي/استخدام الطرف؟",
+        quick_choices: ["نعم", "لا", "🩹 إسعافات أولية", "إلغاء"],
+        tips: ["إذا الألم يزيد أو تورّم شديد: قيّم لدى طبيب."],
+        when_to_seek_help: "تشوه/خدر/ألم شديد جدًا/اشتباه كسر: طوارئ أو أشعة.",
+      }),
+    });
+  }
+
+  if (/^😵\s*إغماء$/i.test(msg)) {
+    return res.json({
+      ok: true,
+      data: card({
+        category: "first_aid",
+        title: "😵 إغماء",
+        verdict:
+          "1) مدد الشخص على ظهره وارفع قدميه قليلًا.\n2) فكّ الملابس الضيقة وتأكد من التهوية.\n3) إذا استعاد وعيه: اجعله يجلس تدريجيًا واشرب ماء إذا قادر.\n4) إذا لا يستجيب أو لا يتنفس: اتصل بالطوارئ وابدأ إنعاش قلبي رئوي إن كنت مدرّبًا.",
+        next_question: "هل فقد الوعي أكثر من دقيقة أو حدث مع ألم صدر/ضيق نفس؟",
+        quick_choices: ["نعم", "لا", "🩹 إسعافات أولية", "إلغاء"],
+        tips: ["لا تُعطه شيئًا بالفم إذا غير واعٍ."],
+        when_to_seek_help: "فقدان وعي مطوّل/تشنجات/ألم صدر/ضيق نفس/إصابة رأس: طوارئ فورًا.",
+      }),
+    });
+  }
+
+  if (/^🧒\s*اختناق$/i.test(msg)) {
+    return res.json({
+      ok: true,
+      data: card({
+        category: "first_aid",
+        title: "🧒 اختناق",
+        verdict:
+          "إذا كان الشخص يسعل بقوة: شجّعه على السعال.\nإذا لا يستطيع الكلام/التنفس: اطلب طوارئ فورًا وابدأ مناورة هيمليك (للبالغين) أو ضربات ظهر/ضغطات صدر للرضع حسب التدريب.",
+        next_question: "العمر: رضيع أم طفل/بالغ؟",
+        quick_choices: ["رضيع", "طفل/بالغ", "🩹 إسعافات أولية", "إلغاء"],
+        tips: ["التدريب العملي على الإسعافات مهم جدًا."],
+        when_to_seek_help: "اختناق شديد دائمًا حالة طارئة.",
+      }),
+    });
+  }
 
   // ====== تقرير (ثابت) ======
   if (isReportIntent(msg) && msg.length <= 40) {
@@ -886,7 +1024,7 @@ app.post("/chat", async (req, res) => {
   if (/حاسبة\s*كتلة|حاسبة\s*bmi/i.test(msg)) return res.json({ ok: true, data: startCalc(session, "bmi") });
   if (/حاسبة\s*المزاج/i.test(msg)) return res.json({ ok: true, data: startCalc(session, "mood") });
 
-  // ====== fallback إلى LLM (فقط لغير الحاسبات) ======
+  // ====== fallback إلى LLM (فقط لغير الحاسبات/التقرير) ======
   try {
     const raw = await callGroq([
       { role: "system", content: buildSystemPrompt() },
@@ -904,87 +1042,56 @@ app.post("/chat", async (req, res) => {
 app.post("/report", upload.single("file"), async (req, res) => {
   try {
     const file = req.file;
-    if (!file) return res.status(400).json({ ok: false, error: "missing_file" });
+    if (!file) return res.status(400).json({ ok: false, error: "no_file" });
 
-    const mime = String(file.mimetype || "");
-    let extractedText = "";
+    // محتوى التقرير: PDF parse أو OCR للصورة
+    let text = "";
 
-    if (mime === "application/pdf") {
-      if (!pdfParse) {
-        return res.json({
-          ok: true,
-          data: card({
-            category: "report",
-            title: "افهم تقريرك",
-            verdict: "استلمت PDF لكن الخادم لا يدعم قراءة PDF حالياً.",
-            next_question: "هل تقدر تلصق نص التقرير هنا؟",
-            quick_choices: ["ألصق النص", "إلغاء"],
-            tips: ["إذا PDF صورة (scan) الأفضل ترفع صورة واضحة."],
-            when_to_seek_help: "إذا أعراض شديدة: راجع الطبيب/الطوارئ.",
-          }),
-        });
-      }
-      const parsed = await pdfParse(file.buffer).catch(() => null);
-      extractedText = (parsed?.text || "").replace(/\s+/g, " ").trim();
-    } else if (mime.startsWith("image/")) {
-      extractedText = (await ocrImage(file.buffer)).replace(/\s+/g, " ").trim();
-    } else {
-      return res.status(400).json({ ok: false, error: "unsupported_type" });
+    // PDF
+    const isPdf = /pdf/i.test(file.mimetype) || /\.pdf$/i.test(file.originalname);
+    if (isPdf && pdfParse) {
+      const pdf = await pdfParse(file.buffer);
+      text = String(pdf?.text || "").trim();
     }
 
-    if (!extractedText || extractedText.length < 40) {
+    // Image OCR
+    if (!text) {
+      if (!createWorker) throw new Error("OCR_unavailable");
+      const worker = await createWorker("eng");
+      const out = await worker.recognize(file.buffer);
+      await worker.terminate();
+      text = String(out?.data?.text || "").trim();
+    }
+
+    // إذا فاضي
+    if (!text) {
       return res.json({
         ok: true,
         data: card({
           category: "report",
           title: "افهم تقريرك",
-          verdict: "استلمت الملف لكن ما قدرت أقرأ نص كافي (قد يكون غير واضح).",
-          next_question: "تقدر ترفع صورة أوضح أو تلصق أهم النتائج هنا؟",
-          quick_choices: ["📎 إضافة مرفق", "ألصق النتائج"],
-          tips: ["صوّر النتائج بإضاءة جيدة وبدون قصّ.", "اخفِ البيانات الشخصية إن أمكن."],
-          when_to_seek_help: "إذا أعراض شديدة: راجع الطبيب/الطوارئ.",
-        }),
-      });
-    }
-
-    // لتقليل التوكنز: قص النص
-    const clipped = extractedText.slice(0, 5000);
-
-    // شرح عام بالـ LLM (اختياري)
-    if (!GROQ_API_KEY) {
-      return res.json({
-        ok: true,
-        data: card({
-          category: "report",
-          title: "افهم تقريرك",
-          verdict: "تم استخراج نص من التقرير، لكن مفتاح GROQ غير مضبوط لتحليل النص.",
-          next_question: "الصق أهم سطرين من النتائج وسأشرحها بشكل عام.",
-          quick_choices: ["ألصق النتائج", "إلغاء"],
-          tips: ["لا ترفع بيانات حساسة."],
-          when_to_seek_help: "إذا أعراض شديدة: راجع الطبيب/الطوارئ.",
-        }),
-      });
-    }
-
-    const raw = await callGroq([
-      { role: "system", content: `أنت مساعد تثقيف صحي عربي لشرح تقارير التحاليل بشكل عام. ممنوع: تشخيص/أدوية/جرعات. أخرج JSON بنفس مفاتيح البطاقة.` },
-      { role: "user", content: "نص التقرير:\n" + clipped + "\n\nاشرح بشكل عام وباختصار." },
-    ]);
-
-    const parsed = extractJson(raw);
-    const out = parsed
-      ? normalize({ ...parsed, category: "report" })
-      : card({
-          category: "report",
-          title: "افهم تقريرك",
-          verdict: "تعذر تحليل التقرير الآن.",
-          next_question: "جرّب صورة أوضح أو الصق النص.",
+          verdict: "لم أتمكن من قراءة محتوى واضح من الملف.",
+          next_question: "جرّب صورة أوضح أو PDF نصّي قابل للنسخ.",
           quick_choices: ["📎 إضافة مرفق", "إلغاء"],
-          tips: ["لا ترفع بيانات حساسة."],
+          tips: ["تصوير مباشر بإضاءة جيدة يساعد كثيرًا."],
           when_to_seek_help: "إذا أعراض شديدة: راجع الطبيب/الطوارئ.",
-        });
+        }),
+      });
+    }
 
-    return res.json({ ok: true, data: out });
+    // رد عام بسيط (بدون LLM): أعط المستخدم مسار “الصق النص” أو “حدد التحليل”
+    return res.json({
+      ok: true,
+      data: card({
+        category: "report",
+        title: "افهم تقريرك",
+        verdict: "تم استخراج نص من التقرير. (شرح عام)\nالصق اسم التحليل الذي تريد فهمه مثل: HbA1c أو Cholesterol أو CBC.",
+        next_question: "ما اسم التحليل الذي تريد شرحه؟",
+        quick_choices: ["إلغاء"],
+        tips: ["للدقة: اذكر القيم + الوحدة + المرجع إن وجد."],
+        when_to_seek_help: "إذا القيم عالية جدًا مع أعراض: راجع الطبيب.",
+      }),
+    });
   } catch (e) {
     console.error(e);
     return res.status(500).json({

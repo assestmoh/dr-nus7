@@ -1,9 +1,8 @@
 // ===============================
-// server.js — Dalil Alafiyah API
-// آخر نسخة: تحسين الجودة + منع الأكواد + Retry واحد + تمرير السياق
-// + Partial Recovery عند فشل JSON
-// + منع ردود "إعادة صياغة JSON" (Meta JSON) في الـ retry
-// (بدون تغيير الواجهة/الفكرة)
+// server.js — Dalil Alafiyah API (FINAL)
+// Stable: context pass + strict JSON parsing + partial recovery
+// + retry re-ask (NOT "fix JSON") to avoid meta technical replies
+// + prevent code/JSON leakage to UI
 // ===============================
 
 import "dotenv/config";
@@ -45,7 +44,7 @@ async function fetchWithTimeout(url, options = {}, ms = 15000) {
 }
 
 /**
- * تنظيف JSON "شبه صحيح" + حالات شائعة تسبب فشل JSON.parse:
+ * تنظيف JSON "شبه صحيح":
  * - ```json ... ```
  * - اقتباسات ذكية “ ”
  * - trailing commas
@@ -53,56 +52,44 @@ async function fetchWithTimeout(url, options = {}, ms = 15000) {
 function cleanJsonish(s) {
   let t = String(s || "").trim();
 
-  // إزالة code fences
   if (t.startsWith("```")) {
     t = t.replace(/^```[a-zA-Z]*\s*/m, "").replace(/```$/m, "").trim();
   }
 
-  // اقتباسات ذكية
   t = t.replace(/[“”]/g, '"').replace(/[‘’]/g, "'");
-
-  // trailing commas
   t = t.replace(/,\s*([}\]])/g, "$1");
 
   return t;
 }
 
-/**
- * استخراج JSON من رد النموذج في عدة صيغ محتملة:
- * 1) JSON مباشر: { ... }
- * 2) JSON داخل code block
- * 3) JSON stringified: "{\"title\":\"...\"}"
- * 4) JSON ضمن نص أطول -> اقتناص { ... }
- * 5) JSON فيه escaping مثل \" و \\n
- */
 function extractJson(text) {
   const s0 = String(text || "");
   let s = cleanJsonish(s0);
 
-  // محاولة 1: parse كامل الرد
+  // 1) parse كامل الرد
   try {
     const first = JSON.parse(s);
     if (first && typeof first === "object") return first;
 
+    // 2) لو كان stringified JSON
     if (typeof first === "string") {
       const second = JSON.parse(cleanJsonish(first));
       if (second && typeof second === "object") return second;
     }
   } catch {}
 
-  // محاولة 2: اقتناص { ... }
+  // 3) اقتناص { ... }
   const a = s.indexOf("{");
   const b = s.lastIndexOf("}");
   if (a === -1 || b === -1 || b <= a) return null;
 
   let chunk = cleanJsonish(s.slice(a, b + 1));
 
-  // parse عادي
   try {
     return JSON.parse(chunk);
   } catch {}
 
-  // محاولة 3: فك escaping الشائع ثم parse
+  // 4) فك escaping الشائع
   const unescaped = cleanJsonish(
     chunk
       .replace(/\\"/g, '"')
@@ -118,15 +105,12 @@ function extractJson(text) {
   }
 }
 
-// محاولة استخراج "verdict" بنمط Regex إذا فشل JSON.parse
 function extractVerdictLoosely(raw) {
   const s = String(raw || "");
 
-  // "verdict": "...."
   const m = s.match(/"verdict"\s*:\s*"([^"]+)"/);
   if (m && m[1]) return m[1].replace(/\\"/g, '"').trim();
 
-  // \"verdict\": \"...\"
   const m2 = s.match(/\\"verdict\\"\s*:\s*\\"([^\\]+)\\"/);
   if (m2 && m2[1]) return m2[1].replace(/\\"/g, '"').trim();
 
@@ -134,8 +118,7 @@ function extractVerdictLoosely(raw) {
 }
 
 /**
- * ✅ Partial Recovery
- * إذا رجع النموذج JSON مقطوع/غير مكتمل، نحاول نلقط أهم الحقول ونبني بطاقة منظمة.
+ * Partial Recovery: إذا JSON مقطوع، نلقط أهم الحقول ونبني بطاقة.
  */
 function recoverPartialCard(raw) {
   const s = String(raw || "");
@@ -192,7 +175,9 @@ function recoverPartialCard(raw) {
   };
 }
 
-// منع ردود "Meta JSON" مثل: إعادة صياغة JSON / تحقق من الفواصل...
+/**
+ * منع ردود "Meta JSON" التقنية (حتى لو كانت JSON صحيح)
+ */
 function isMetaJsonAnswer(d) {
   const text =
     String(d?.title || "") +
@@ -207,7 +192,7 @@ function isMetaJsonAnswer(d) {
     " " +
     (Array.isArray(d?.quick_choices) ? d.quick_choices.join(" ") : "");
 
-  return /json|تنسيق|اقتباس|اقتباسات|فواصل|صيغة|تم تنسيق|format|quotes|commas/i.test(
+  return /json|تنسيق|اقتباس|اقتباسات|فواصل|صيغة|تم تنسيق|تعديل الرد|format|quotes|commas/i.test(
     text
   );
 }
@@ -219,14 +204,15 @@ const sArr = (v, n) =>
     : [];
 
 // ===============================
-// System Prompt (محسن للجودة والاستمرارية)
+// System Prompt
 // ===============================
 function buildSystemPrompt() {
   return `
 أنت "دليل العافية" — مرافق عربي للتثقيف الصحي فقط (ليس تشخيصًا).
 
 مخرجاتك: JSON صالح strict فقط (بدون أي نص خارج JSON، بدون Markdown، بدون \`\`\`، بدون trailing commas).
-ممنوع الردود العامة مثل: "أنا هنا لمساعدتك" أو مقدمات مطاطة. كن محددًا ومباشرًا.
+ممنوع الردود العامة مثل: "أنا هنا لمساعدتك". كن محددًا ومباشرًا.
+ممنوع ذكر JSON أو التنسيق أو الفواصل أو الاقتباسات أو "تم تنسيق الإجابة". ركّز فقط على النصائح الصحية.
 
 التصنيفات المسموحة فقط (طابقها حرفيًا):
 general | nutrition | bp | sugar | sleep | activity | mental | first_aid | report | emergency | water | calories | bmi
@@ -234,23 +220,19 @@ general | nutrition | bp | sugar | sleep | activity | mental | first_aid | repor
 شكل JSON:
 {
   "category": "واحد من القائمة أعلاه",
-  "title": "عنوان محدد (2-5 كلمات) مرتبط بالموضوع الحالي. ممنوع: الاستفسار الأول، متابعة، معلومة صحية (إلا عند فشل واضح)",
-  "verdict": "جملة واحدة محددة تلخص أهم توجيه/تطمين مرتبط مباشرة بسؤال المستخدم/سياقه",
+  "title": "عنوان محدد (2-5 كلمات) مرتبط بالموضوع الحالي",
+  "verdict": "جملة واحدة محددة مرتبطة بالسياق",
   "next_question": "سؤال واحد فقط لاستكمال نفس الموضوع (أو \\"\\")",
   "quick_choices": ["خيار 1","خيار 2"],
   "tips": ["نصيحة قصيرة 1","نصيحة قصيرة 2"],
   "when_to_seek_help": "متى تراجع الطبيب/الطوارئ (أو \\"\\")"
 }
 
-قواعد جودة مهمة:
-- التزم بالموضوع الحالي ولا تغيّر المسار بلا سبب.
-- إذا وصلت إجابة قصيرة مثل "نعم/لا" أو اختيار مثل "صحة القلب"، اعتبرها إجابة لسؤال البطاقة السابقة وكمّل نفس السياق.
-- tips عملية ومحددة (تجنب: اشرب ماء/نم جيدًا كحل لكل شيء إلا إذا كان مناسبًا فعلًا).
-- next_question مرتبط مباشرة بما قاله المستخدم الآن + السياق السابق، وليس سؤالًا عامًا.
+قواعد:
+- التزم بالموضوع ولا تغيّر المسار بلا سبب.
+- إذا كانت الرسالة قصيرة مثل "نعم/لا" أو اختيار، اعتبرها إجابة لسؤال البطاقة السابقة وكمل بنفس المسار.
 - quick_choices: 0 أو 2 فقط وتطابق next_question.
-- when_to_seek_help: إنذارات واضحة فقط، وإلا خله فارغًا.
 - لا أدوية/لا جرعات/لا تشخيص.
-- ممنوع ذكر JSON أو التنسيق أو الفواصل أو الاقتباسات أو "تم تنسيق الإجابة". ركّز فقط على النصائح الصحية.
 `.trim();
 }
 
@@ -269,10 +251,11 @@ async function callGroq(messages) {
       body: JSON.stringify({
         model: MODEL_ID,
         temperature: 0.35,
-        max_tokens: 450,
+        max_tokens: 520,
         messages,
       }),
-    }
+    },
+    20000
   );
 
   if (!res.ok) throw new Error("Groq API error");
@@ -281,14 +264,12 @@ async function callGroq(messages) {
 }
 
 // ===============================
-// Normalize (مع mapping للتوافق مع الواجهة)
+// Normalize (UI compatible categories)
 // ===============================
 function normalize(obj) {
   let cat = sStr(obj?.category) || "general";
 
-  if (cat === "blood_pressure") cat = "bp";
-  if (cat === "bloodpressure") cat = "bp";
-  if (cat === "nutrition") cat = "nutrition";
+  if (cat === "blood_pressure" || cat === "bloodpressure") cat = "bp";
 
   const allowed = new Set([
     "general",
@@ -318,9 +299,6 @@ function normalize(obj) {
   };
 }
 
-/**
- * fallback: لا نسرب raw للمستخدم (منع ظهور الأكواد)
- */
 function fallback(rawText) {
   const looseVerdict = extractVerdictLoosely(rawText);
   return {
@@ -350,7 +328,6 @@ app.post("/chat", async (req, res) => {
       return res.status(400).json({ ok: false, error: "empty_message" });
     }
 
-    // ✅ تمرير سياق آخر بطاقة من الواجهة
     const lastCard = req.body?.context?.last || null;
 
     const messages = [{ role: "system", content: buildSystemPrompt() }];
@@ -366,30 +343,18 @@ app.post("/chat", async (req, res) => {
 
     messages.push({ role: "user", content: msg });
 
+    // 1) call
     const raw = await callGroq(messages);
-
     let parsed = extractJson(raw);
+
+    // 2) retry مرة واحدة فقط — إعادة السؤال (msg) وليس "إصلاح JSON"
     let retryRaw = "";
-
-    // ✅ Retry مرة واحدة فقط إذا فشل parsing
     if (!parsed) {
-      retryRaw = await callGroq([
-        { role: "system", content: buildSystemPrompt() },
-        {
-          role: "user",
-          content:
-            "الرد السابق كان غير صالح كـ JSON. أعد **نفس المحتوى الصحي** المقصود للمستخدم (نصائح/سؤال/تحذير طبي عند الحاجة) لكن بصيغة JSON strict فقط.\n" +
-            "مهم جدًا: **لا تذكر JSON ولا التنسيق ولا الفواصل ولا الاقتباسات** ولا أي شرح تقني.\n" +
-            "اتبع نفس schema في النظام.\n" +
-            "هذا الرد السابق غير الصالح (للإصلاح فقط):\n" +
-            raw,
-        },
-      ]);
-
+      retryRaw = await callGroq(messages); // نفس الرسائل تمامًا
       parsed = extractJson(retryRaw);
     }
 
-    // ✅ Partial Recovery إذا فشل JSON حتى بعد retry
+    // 3) build data
     let data;
     if (parsed) {
       data = normalize(parsed);
@@ -398,7 +363,7 @@ app.post("/chat", async (req, res) => {
       data = recovered ? normalize(recovered) : fallback(raw);
     }
 
-    // ✅ إذا طلع رد تقني عن JSON (حتى لو كان JSON صحيح) نمنعه ونستبدله بـ recovery/fallback
+    // 4) block meta technical cards
     if (isMetaJsonAnswer(data)) {
       const recovered = recoverPartialCard(retryRaw || raw);
       data = recovered ? normalize(recovered) : fallback(raw);

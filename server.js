@@ -41,31 +41,77 @@ async function fetchWithTimeout(url, options = {}, ms = 15000) {
 }
 
 /**
- * لب المشكلة:
- * أحيانًا النموذج يرجّع JSON "شبه صحيح" مثل:
- * - trailing comma:  "title":"...",   }  أو ]  قبل الإغلاق
- * - اقتباسات ذكية “ ” بدل "
- * هذا يجعل JSON.parse يفشل → فتدخلون fallback → ويظهر الرد كنص/كود.
- * الحل: تنظيف النص قبل JSON.parse.
+ * تنظيف JSON "شبه صحيح" + حالات شائعة تسبب فشل JSON.parse:
+ * - ```json ... ```
+ * - اقتباسات ذكية “ ”
+ * - trailing commas
  */
 function cleanJsonish(s) {
-  return String(s || "")
-    // تحويل الاقتباسات الذكية إلى عادية
-    .replace(/[“”]/g, '"')
-    .replace(/[‘’]/g, "'")
-    // إزالة الفواصل الزائدة قبل إغلاق } أو ]
-    .replace(/,\s*([}\]])/g, "$1");
+  let t = String(s || "").trim();
+
+  // 1) إزالة code fences (```json ... ```)
+  if (t.startsWith("```")) {
+    t = t.replace(/^```[a-zA-Z]*\s*/m, "").replace(/```$/m, "").trim();
+  }
+
+  // 2) تحويل الاقتباسات الذكية إلى عادية
+  t = t.replace(/[“”]/g, '"').replace(/[‘’]/g, "'");
+
+  // 3) إزالة الفواصل الزائدة قبل إغلاق } أو ]
+  t = t.replace(/,\s*([}\]])/g, "$1");
+
+  return t;
 }
 
+/**
+ * استخراج JSON من رد النموذج في عدة صيغ محتملة:
+ * 1) JSON مباشر: { ... }
+ * 2) JSON داخل code block: ```json { ... } ```
+ * 3) JSON "stringified": "{\"title\":\"...\"}"
+ * 4) JSON ضمن نص أطول (مقدمة/تعليق) -> اقتناص { ... }
+ * 5) JSON فيه escaping مثل \" و \\n
+ */
 function extractJson(text) {
-  const s = String(text || "");
+  const s0 = String(text || "");
+  let s = cleanJsonish(s0);
+
+  // محاولة 1: Parse مباشر للرد كامل
+  try {
+    const first = JSON.parse(s);
+
+    // لو طلع Object/Array مباشرة
+    if (first && typeof first === "object") return first;
+
+    // لو طلع String (يعني JSON كان stringified) نجرب parse مرة ثانية
+    if (typeof first === "string") {
+      const second = JSON.parse(cleanJsonish(first));
+      if (second && typeof second === "object") return second;
+    }
+  } catch {}
+
+  // محاولة 2: اقتناص أول { وآخر } (لو النص فيه زيادات)
   const a = s.indexOf("{");
   const b = s.lastIndexOf("}");
   if (a === -1 || b === -1 || b <= a) return null;
 
-  const chunk = cleanJsonish(s.slice(a, b + 1));
+  let chunk = cleanJsonish(s.slice(a, b + 1));
+
+  // parse عادي
   try {
     return JSON.parse(chunk);
+  } catch {}
+
+  // محاولة 3: فك escaping الشائع ثم parse
+  const unescaped = cleanJsonish(
+    chunk
+      .replace(/\\"/g, '"')
+      .replace(/\\n/g, "\n")
+      .replace(/\\t/g, "\t")
+      .replace(/\\r/g, "\r")
+  );
+
+  try {
+    return JSON.parse(unescaped);
   } catch {
     return null;
   }

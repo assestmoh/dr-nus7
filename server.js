@@ -1,7 +1,9 @@
 // ===============================
 // server.js — Dalil Alafiyah API
-// دمج تحسينات الجودة + منع الأكواد + Retry واحد + تمرير السياق
-// + Partial Recovery عند فشل JSON (بدون تغيير الواجهة/الفكرة)
+// آخر نسخة: تحسين الجودة + منع الأكواد + Retry واحد + تمرير السياق
+// + Partial Recovery عند فشل JSON
+// + منع ردود "إعادة صياغة JSON" (Meta JSON) في الـ retry
+// (بدون تغيير الواجهة/الفكرة)
 // ===============================
 
 import "dotenv/config";
@@ -134,7 +136,6 @@ function extractVerdictLoosely(raw) {
 /**
  * ✅ Partial Recovery
  * إذا رجع النموذج JSON مقطوع/غير مكتمل، نحاول نلقط أهم الحقول ونبني بطاقة منظمة.
- * (يمنع ظهور رسالة fallback العامة كثيرًا)
  */
 function recoverPartialCard(raw) {
   const s = String(raw || "");
@@ -191,6 +192,26 @@ function recoverPartialCard(raw) {
   };
 }
 
+// منع ردود "Meta JSON" مثل: إعادة صياغة JSON / تحقق من الفواصل...
+function isMetaJsonAnswer(d) {
+  const text =
+    String(d?.title || "") +
+    " " +
+    String(d?.verdict || "") +
+    " " +
+    String(d?.next_question || "") +
+    " " +
+    String(d?.when_to_seek_help || "") +
+    " " +
+    (Array.isArray(d?.tips) ? d.tips.join(" ") : "") +
+    " " +
+    (Array.isArray(d?.quick_choices) ? d.quick_choices.join(" ") : "");
+
+  return /json|تنسيق|اقتباس|اقتباسات|فواصل|صيغة|تم تنسيق|format|quotes|commas/i.test(
+    text
+  );
+}
+
 const sStr = (v) => (typeof v === "string" ? v.trim() : "");
 const sArr = (v, n) =>
   Array.isArray(v)
@@ -229,6 +250,7 @@ general | nutrition | bp | sugar | sleep | activity | mental | first_aid | repor
 - quick_choices: 0 أو 2 فقط وتطابق next_question.
 - when_to_seek_help: إنذارات واضحة فقط، وإلا خله فارغًا.
 - لا أدوية/لا جرعات/لا تشخيص.
+- ممنوع ذكر JSON أو التنسيق أو الفواصل أو الاقتباسات أو "تم تنسيق الإجابة". ركّز فقط على النصائح الصحية.
 `.trim();
 }
 
@@ -290,7 +312,7 @@ function normalize(obj) {
     title: sStr(obj?.title) || "دليل العافية",
     verdict: sStr(obj?.verdict),
     next_question: sStr(obj?.next_question),
-    quick_choices: sArr(obj?.quick_choices, 2), // خيارين فقط
+    quick_choices: sArr(obj?.quick_choices, 2),
     tips: sArr(obj?.tips, 2),
     when_to_seek_help: sStr(obj?.when_to_seek_help),
   };
@@ -304,7 +326,9 @@ function fallback(rawText) {
   return {
     category: "general",
     title: "معلومة صحية",
-    verdict: looseVerdict || "تعذر توليد رد منظم الآن. جرّب إعادة صياغة السؤال بشكل مختصر.",
+    verdict:
+      looseVerdict ||
+      "تعذر توليد رد منظم الآن. جرّب إعادة صياغة السؤال بشكل مختصر.",
     next_question: "",
     quick_choices: [],
     tips: [],
@@ -354,8 +378,10 @@ app.post("/chat", async (req, res) => {
         {
           role: "user",
           content:
-            "أعد نفس الإجابة بصيغة JSON strict فقط (بدون أي نص خارج JSON وبدون ``` وبدون trailing commas).\n" +
-            "هذه كانت الإجابة السابقة غير الصالحة:\n" +
+            "الرد السابق كان غير صالح كـ JSON. أعد **نفس المحتوى الصحي** المقصود للمستخدم (نصائح/سؤال/تحذير طبي عند الحاجة) لكن بصيغة JSON strict فقط.\n" +
+            "مهم جدًا: **لا تذكر JSON ولا التنسيق ولا الفواصل ولا الاقتباسات** ولا أي شرح تقني.\n" +
+            "اتبع نفس schema في النظام.\n" +
+            "هذا الرد السابق غير الصالح (للإصلاح فقط):\n" +
             raw,
         },
       ]);
@@ -368,6 +394,12 @@ app.post("/chat", async (req, res) => {
     if (parsed) {
       data = normalize(parsed);
     } else {
+      const recovered = recoverPartialCard(retryRaw || raw);
+      data = recovered ? normalize(recovered) : fallback(raw);
+    }
+
+    // ✅ إذا طلع رد تقني عن JSON (حتى لو كان JSON صحيح) نمنعه ونستبدله بـ recovery/fallback
+    if (isMetaJsonAnswer(data)) {
       const recovered = recoverPartialCard(retryRaw || raw);
       data = recovered ? normalize(recovered) : fallback(raw);
     }

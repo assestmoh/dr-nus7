@@ -1,8 +1,11 @@
 // ===============================
-// server.js — Dalil Alafiyah API (FINAL)
+// server.js — Dalil Alafiyah API (FINAL+DEBUG)
 // Stable: context pass + strict JSON parsing + partial recovery
 // + retry re-ask (NOT "fix JSON") to avoid meta technical replies
 // + prevent code/JSON leakage to UI
+// + IMPORTANT: print real Groq error (status + body) to logs
+// + add /reset to avoid 404 from UI
+// + add /report placeholder (501) if UI calls it
 // ===============================
 
 import "dotenv/config";
@@ -237,29 +240,55 @@ general | nutrition | bp | sugar | sleep | activity | mental | first_aid | repor
 }
 
 // ===============================
-// Groq
+// Groq (with real error logging)
 // ===============================
 async function callGroq(messages) {
-  const res = await fetchWithTimeout(
-    "https://api.groq.com/openai/v1/chat/completions",
-    {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${GROQ_API_KEY}`,
-        "Content-Type": "application/json",
+  let res;
+  try {
+    res = await fetchWithTimeout(
+      "https://api.groq.com/openai/v1/chat/completions",
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${GROQ_API_KEY}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          model: MODEL_ID,
+          temperature: 0.35,
+          max_tokens: 520,
+          messages,
+        }),
       },
-      body: JSON.stringify({
-        model: MODEL_ID,
-        temperature: 0.35,
-        max_tokens: 520,
-        messages,
-      }),
-    },
-    20000
-  );
+      20000
+    );
+  } catch (e) {
+    // timeout / network / abort
+    console.error("❌ Groq fetch failed:", e?.name || "", e?.message || e);
+    throw new Error("GROQ_FETCH_FAILED");
+  }
 
-  if (!res.ok) throw new Error("Groq API error");
-  const data = await res.json();
+  // read text always to print body on errors
+  const text = await res.text();
+
+  if (!res.ok) {
+    console.error("❌ Groq HTTP:", res.status, res.statusText);
+    console.error("❌ Groq body:", text.slice(0, 2000));
+
+    const err = new Error("GROQ_HTTP_" + res.status);
+    err.status = res.status;
+    err.body = text;
+    throw err;
+  }
+
+  let data;
+  try {
+    data = JSON.parse(text);
+  } catch {
+    console.error("❌ Groq non-JSON:", text.slice(0, 2000));
+    throw new Error("GROQ_BAD_JSON");
+  }
+
   return data.choices?.[0]?.message?.content || "";
 }
 
@@ -321,6 +350,21 @@ app.get("/", (_req, res) => {
   res.json({ ok: true, service: "Dalil Alafiyah API" });
 });
 
+// ✅ avoid UI 404
+app.post("/reset", (_req, res) => {
+  // لا يوجد state في السيرفر حاليًا — مجرد نجاح للواجهة
+  res.json({ ok: true });
+});
+
+// ✅ placeholder (لو واجهتك تستدعيه)
+app.post("/report", (_req, res) => {
+  res.status(501).json({
+    ok: false,
+    error: "not_implemented",
+    message: "Endpoint /report غير مفعل في هذا السيرفر.",
+  });
+});
+
 app.post("/chat", async (req, res) => {
   try {
     const msg = String(req.body.message || "").trim();
@@ -371,7 +415,9 @@ app.post("/chat", async (req, res) => {
 
     res.json({ ok: true, data });
   } catch (e) {
-    console.error(e);
+    // هنا بتشوف السبب الحقيقي في اللوق بعد تعديل callGroq
+    console.error("❌ /chat error:", e?.message || e);
+
     res.status(500).json({
       ok: false,
       error: "server_error",

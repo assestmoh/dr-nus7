@@ -49,15 +49,15 @@ async function fetchWithTimeout(url, options = {}, ms = 15000) {
 function cleanJsonish(s) {
   let t = String(s || "").trim();
 
-  // 1) إزالة code fences (```json ... ```)
+  // إزالة code fences
   if (t.startsWith("```")) {
     t = t.replace(/^```[a-zA-Z]*\s*/m, "").replace(/```$/m, "").trim();
   }
 
-  // 2) تحويل الاقتباسات الذكية إلى عادية
+  // اقتباسات ذكية
   t = t.replace(/[“”]/g, '"').replace(/[‘’]/g, "'");
 
-  // 3) إزالة الفواصل الزائدة قبل إغلاق } أو ]
+  // trailing commas
   t = t.replace(/,\s*([}\]])/g, "$1");
 
   return t;
@@ -66,37 +66,34 @@ function cleanJsonish(s) {
 /**
  * استخراج JSON من رد النموذج في عدة صيغ محتملة:
  * 1) JSON مباشر: { ... }
- * 2) JSON داخل code block: ```json { ... } ```
- * 3) JSON "stringified": "{\"title\":\"...\"}"
- * 4) JSON ضمن نص أطول (مقدمة/تعليق) -> اقتناص { ... }
+ * 2) JSON داخل code block
+ * 3) JSON stringified: "{\"title\":\"...\"}"
+ * 4) JSON ضمن نص أطول -> اقتناص { ... }
  * 5) JSON فيه escaping مثل \" و \\n
  */
 function extractJson(text) {
   const s0 = String(text || "");
   let s = cleanJsonish(s0);
 
-  // محاولة 1: Parse مباشر للرد كامل
+  // محاولة 1: parse كامل الرد
   try {
     const first = JSON.parse(s);
 
-    // لو طلع Object/Array مباشرة
     if (first && typeof first === "object") return first;
 
-    // لو طلع String (يعني JSON كان stringified) نجرب parse مرة ثانية
     if (typeof first === "string") {
       const second = JSON.parse(cleanJsonish(first));
       if (second && typeof second === "object") return second;
     }
   } catch {}
 
-  // محاولة 2: اقتناص أول { وآخر } (لو النص فيه زيادات)
+  // محاولة 2: اقتناص { ... }
   const a = s.indexOf("{");
   const b = s.lastIndexOf("}");
   if (a === -1 || b === -1 || b <= a) return null;
 
   let chunk = cleanJsonish(s.slice(a, b + 1));
 
-  // parse عادي
   try {
     return JSON.parse(chunk);
   } catch {}
@@ -115,6 +112,20 @@ function extractJson(text) {
   } catch {
     return null;
   }
+}
+
+// محاولة استخراج "verdict" بنمط Regex إذا فشل JSON.parse
+function extractVerdictLoosely(raw) {
+  const s = String(raw || "");
+  // يلتقط: "verdict": "...."
+  const m = s.match(/"verdict"\s*:\s*"([^"]+)"/);
+  if (m && m[1]) return m[1].replace(/\\"/g, '"').trim();
+
+  // أحيانًا تكون: \"verdict\": \"...\"
+  const m2 = s.match(/\\"verdict\\"\s*:\s*\\"([^\\]+)\\"/);
+  if (m2 && m2[1]) return m2[1].replace(/\\"/g, '"').trim();
+
+  return "";
 }
 
 const sStr = (v) => (typeof v === "string" ? v.trim() : "");
@@ -193,11 +204,17 @@ function normalize(obj) {
   };
 }
 
-function fallback(text) {
+/**
+ * fallback سابقًا كان يسرب raw داخل verdict -> هذا سبب ظهور "الأكواد" في الواجهة.
+ * الآن: لا نسرب raw للمستخدم. نحاول نلتقط verdict بشكل بسيط، وإلا رسالة عامة.
+ * (لا تغيير في المنطق/الواجهة: فقط منع ظهور الأكواد)
+ */
+function fallback(rawText) {
+  const looseVerdict = extractVerdictLoosely(rawText);
   return {
     category: "general",
     title: "معلومة صحية",
-    verdict: sStr(text) || "لا تتوفر معلومات كافية.",
+    verdict: looseVerdict || "تعذر توليد رد منظم الآن. جرّب إعادة صياغة السؤال بشكل مختصر.",
     next_question: "",
     quick_choices: [],
     tips: [],

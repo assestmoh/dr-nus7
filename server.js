@@ -1,8 +1,12 @@
 // ===============================
 // server.js — Dalil Alafiyah API (FINAL)
-// Stable: context pass + strict JSON parsing + partial recovery
-// + retry re-ask (NOT "fix JSON") to avoid meta technical replies
-// + prevent code/JSON leakage to UI
+// هدف النسخة:
+// 1) منع ظهور الأكواد/JSON الخام للمستخدم (no leakage)
+// 2) استخراج/تنظيف JSON حتى لو رجع النموذج بصيغة غير مثالية
+// 3) تمرير سياق آخر بطاقة من الواجهة لاستمرارية المحادثة
+// 4) Retry واحد فقط عند فشل الـ JSON (بدون طلب "إصلاح JSON" لتجنب ردود تقنية)
+// 5) حجب البطاقات التقنية (Meta about JSON/format)
+// 6) تحسين جودة الإرشاد عبر Prompt أدق + حقائق مستخرجة من رسائل الحاسبات
 // ===============================
 
 import "dotenv/config";
@@ -33,7 +37,7 @@ app.use(bodyParser.json({ limit: "2mb" }));
 // ===============================
 // Helpers
 // ===============================
-async function fetchWithTimeout(url, options = {}, ms = 15000) {
+async function fetchWithTimeout(url, options = {}, ms = 20000) {
   const controller = new AbortController();
   const id = setTimeout(() => controller.abort(), ms);
   try {
@@ -52,33 +56,45 @@ async function fetchWithTimeout(url, options = {}, ms = 15000) {
 function cleanJsonish(s) {
   let t = String(s || "").trim();
 
+  // إزالة code fences
   if (t.startsWith("```")) {
-    t = t.replace(/^```[a-zA-Z]*\s*/m, "").replace(/```$/m, "").trim();
+    t = t.replace(/^```[a-zA-Z]*\s*/m, "").replace(/```\s*$/m, "").trim();
   }
 
+  // اقتباسات ذكية
   t = t.replace(/[“”]/g, '"').replace(/[‘’]/g, "'");
+
+  // trailing commas
   t = t.replace(/,\s*([}\]])/g, "$1");
 
   return t;
 }
 
+/**
+ * استخراج JSON من عدة صيغ محتملة:
+ * 1) JSON مباشر
+ * 2) JSON داخل code block
+ * 3) JSON stringified
+ * 4) JSON ضمن نص أطول (اقتطاع بين أول { وآخر })
+ * 5) JSON مع escaping مثل \" و \n
+ */
 function extractJson(text) {
   const s0 = String(text || "");
   let s = cleanJsonish(s0);
 
-  // 1) parse كامل الرد
+  // محاولة 1: parse كامل الرد
   try {
     const first = JSON.parse(s);
     if (first && typeof first === "object") return first;
 
-    // 2) لو كان stringified JSON
+    // لو كان stringified JSON
     if (typeof first === "string") {
       const second = JSON.parse(cleanJsonish(first));
       if (second && typeof second === "object") return second;
     }
   } catch {}
 
-  // 3) اقتناص { ... }
+  // محاولة 2: اقتناص { ... }
   const a = s.indexOf("{");
   const b = s.lastIndexOf("}");
   if (a === -1 || b === -1 || b <= a) return null;
@@ -89,7 +105,7 @@ function extractJson(text) {
     return JSON.parse(chunk);
   } catch {}
 
-  // 4) فك escaping الشائع
+  // محاولة 3: فك escaping الشائع
   const unescaped = cleanJsonish(
     chunk
       .replace(/\\"/g, '"')
@@ -176,7 +192,7 @@ function recoverPartialCard(raw) {
 }
 
 /**
- * منع ردود "Meta JSON" التقنية (حتى لو كانت JSON صحيح)
+ * منع ردود "Meta" التقنية (حتى لو JSON صحيح)
  */
 function isMetaJsonAnswer(d) {
   const text =
@@ -192,7 +208,7 @@ function isMetaJsonAnswer(d) {
     " " +
     (Array.isArray(d?.quick_choices) ? d.quick_choices.join(" ") : "");
 
-  return /json|تنسيق|اقتباس|اقتباسات|فواصل|صيغة|تم تنسيق|تعديل الرد|format|quotes|commas/i.test(
+  return /json|تنسيق|اقتباس|اقتباسات|فواصل|صيغة|تم تنسيق|تعديل الرد|format|quotes|commas|code fence|```/i.test(
     text
   );
 }
@@ -204,7 +220,7 @@ const sArr = (v, n) =>
     : [];
 
 // ===============================
-// System Prompt
+// System Prompt (محسّن للجودة)
 // ===============================
 function buildSystemPrompt() {
   return `
@@ -212,7 +228,7 @@ function buildSystemPrompt() {
 
 مخرجاتك: JSON صالح strict فقط (بدون أي نص خارج JSON، بدون Markdown، بدون \`\`\`، بدون trailing commas).
 ممنوع الردود العامة مثل: "أنا هنا لمساعدتك". كن محددًا ومباشرًا.
-ممنوع ذكر JSON أو التنسيق أو الفواصل أو الاقتباسات أو "تم تنسيق الإجابة". ركّز فقط على النصائح الصحية.
+ممنوع ذكر JSON أو التنسيق أو الفواصل أو الاقتباسات أو "تم تنسيق" أو أي كلام تقني.
 
 التصنيفات المسموحة فقط (طابقها حرفيًا):
 general | nutrition | bp | sugar | sleep | activity | mental | first_aid | report | emergency | water | calories | bmi
@@ -220,19 +236,27 @@ general | nutrition | bp | sugar | sleep | activity | mental | first_aid | repor
 شكل JSON:
 {
   "category": "واحد من القائمة أعلاه",
-  "title": "عنوان محدد (2-5 كلمات) مرتبط بالموضوع الحالي",
-  "verdict": "جملة واحدة محددة مرتبطة بالسياق",
-  "next_question": "سؤال واحد فقط لاستكمال نفس الموضوع (أو \\"\\")",
+  "title": "عنوان محدد (2-5 كلمات) مرتبط بالسياق الحالي",
+  "verdict": "جملة واحدة محددة مرتبطة مباشرة بسؤال المستخدم/السياق",
+  "next_question": "سؤال واحد فقط لاستكمال نفس الموضوع (أو \\\"\\\\\\\"\\\")",
   "quick_choices": ["خيار 1","خيار 2"],
   "tips": ["نصيحة قصيرة 1","نصيحة قصيرة 2"],
-  "when_to_seek_help": "متى تراجع الطبيب/الطوارئ (أو \\"\\")"
+  "when_to_seek_help": "متى تراجع الطبيب/الطوارئ (أو \\\"\\\\\\\"\\\")"
 }
 
-قواعد:
-- التزم بالموضوع ولا تغيّر المسار بلا سبب.
-- إذا كانت الرسالة قصيرة مثل "نعم/لا" أو اختيار، اعتبرها إجابة لسؤال البطاقة السابقة وكمل بنفس المسار.
-- quick_choices: 0 أو 2 فقط وتطابق next_question.
+قواعد جودة (مهم جدًا):
+- التزم بالموضوع الحالي ولا تغيّر المسار بلا سبب.
+- إذا كانت رسالة المستخدم قصيرة ("نعم/لا" أو اختيار)، اعتبرها إجابة لسؤال البطاقة السابقة وأكمل نفس المسار.
+- quick_choices: إما 0 أو 2 فقط، ويجب أن تطابق next_question حرفيًا.
+- إذا next_question فارغ، اجعل quick_choices فارغة.
+- tips عملية ومحددة (تجنب نصائح عامة جدًا إلا إذا مناسبة فعلًا).
 - لا أدوية/لا جرعات/لا تشخيص.
+
+قواعد موضوعية سريعة:
+- bp: إذا كان الانبساطي منخفض جدًا أو القراءة غير منطقية، اطلب إعادة القياس بالطريقة الصحيحة قبل أي استنتاج.
+- sugar: إذا ظهرت قيمة أقل من 70 mg/dL (صائم أو بعد الأكل)، اعتبرها منخفضة واذكر خطوات عامة آمنة + متى يراجع الطبيب.
+- calories: لا توصي بعجز يومي شديد؛ إذا الهدف سريع جدًا، اقترح هدفًا أهدأ أو متابعة مختص.
+- emergency (سلطنة عمان): رقم الطوارئ 9999، وللإسعاف/الدفاع المدني يمكن 24343666 كبديل. لا تذكر 911.
 `.trim();
 }
 
@@ -269,6 +293,7 @@ async function callGroq(messages) {
 function normalize(obj) {
   let cat = sStr(obj?.category) || "general";
 
+  // mapping شائع
   if (cat === "blood_pressure" || cat === "bloodpressure") cat = "bp";
 
   const allowed = new Set([
@@ -288,17 +313,24 @@ function normalize(obj) {
   ]);
   if (!allowed.has(cat)) cat = "general";
 
+  const nextQ = sStr(obj?.next_question);
+  const qc = sArr(obj?.quick_choices, 2);
+
   return {
     category: cat,
     title: sStr(obj?.title) || "دليل العافية",
     verdict: sStr(obj?.verdict),
-    next_question: sStr(obj?.next_question),
-    quick_choices: sArr(obj?.quick_choices, 2),
+    next_question: nextQ,
+    quick_choices: nextQ ? qc : [],
     tips: sArr(obj?.tips, 2),
     when_to_seek_help: sStr(obj?.when_to_seek_help),
   };
 }
 
+/**
+ * fallback سابقًا كان يسرب raw داخل verdict -> سبب ظهور "الأكواد"
+ * الآن: لا نسرب raw للمستخدم.
+ */
 function fallback(rawText) {
   const looseVerdict = extractVerdictLoosely(rawText);
   return {
@@ -315,6 +347,53 @@ function fallback(rawText) {
 }
 
 // ===============================
+// Facts extraction from calculator prompts (اختياري لتحسين الدقة)
+// ===============================
+function extractFactsFromUserMessage(msg) {
+  const t = String(msg || "");
+
+  // سكر
+  // يدعم صيغ: "القيمة: 60", "60 mg/dL", "60 ملغ/ديسيلتر"
+  const sugarMatch = t.match(/(?:القيمة\s*:\s*|\b)(\d{2,3})(?:\s*(?:mg\/dL|ملغ\/ديسيلتر|ملغ))?/i);
+
+  // نوع السكر
+  const isFasting = /نوع\s*القياس\s*:\s*صائم|\bصائم\b/i.test(t);
+  const isPost = /نوع\s*القياس\s*:\s*بعد\s*الأكل|بعد\s*الأكل/i.test(t);
+
+  // ضغط
+  const bpMatch = t.match(/(\d{2,3})\s*\/\s*(\d{2,3})/);
+
+  const facts = [];
+
+  if (bpMatch) {
+    const s = Number(bpMatch[1]);
+    const d = Number(bpMatch[2]);
+    if (Number.isFinite(s) && Number.isFinite(d)) {
+      if (d <= 40) {
+        facts.push(
+          `حقيقة: قراءة الضغط ${s}/${d} فيها انبساطي منخفض جدًا؛ هذا غالبًا خطأ قياس أو يحتاج إعادة القياس بالطريقة الصحيحة.`
+        );
+      }
+    }
+  }
+
+  if (sugarMatch) {
+    const v = Number(sugarMatch[1]);
+    if (Number.isFinite(v)) {
+      const ctx = isFasting ? "صائم" : isPost ? "بعد الأكل" : "غير محدد";
+      facts.push(`حقيقة: سكر الدم (${ctx}) = ${v} mg/dL.`);
+      if (v < 70) {
+        facts.push(
+          "قاعدة أمان: قيمة أقل من 70 mg/dL تعتبر منخفضة ويجب إعطاء إرشاد للتعامل مع الهبوط بشكل عام + متى يراجع الطبيب."
+        );
+      }
+    }
+  }
+
+  return facts;
+}
+
+// ===============================
 // Routes
 // ===============================
 app.get("/", (_req, res) => {
@@ -324,14 +403,13 @@ app.get("/", (_req, res) => {
 app.post("/chat", async (req, res) => {
   try {
     const msg = String(req.body.message || "").trim();
-    if (!msg) {
-      return res.status(400).json({ ok: false, error: "empty_message" });
-    }
+    if (!msg) return res.status(400).json({ ok: false, error: "empty_message" });
 
     const lastCard = req.body?.context?.last || null;
 
     const messages = [{ role: "system", content: buildSystemPrompt() }];
 
+    // تمرير سياق آخر بطاقة من الواجهة (بدون تغيير الواجهة)
     if (lastCard && typeof lastCard === "object") {
       messages.push({
         role: "assistant",
@@ -341,16 +419,25 @@ app.post("/chat", async (req, res) => {
       });
     }
 
+    // حقائق مستخرجة (تحسين دقة النصائح للحاسبات)
+    const facts = extractFactsFromUserMessage(msg);
+    if (facts.length) {
+      messages.push({
+        role: "assistant",
+        content: "حقائق مؤكدة من سياق المستخدم (التزم بها):\n" + facts.join("\n"),
+      });
+    }
+
     messages.push({ role: "user", content: msg });
 
     // 1) call
     const raw = await callGroq(messages);
     let parsed = extractJson(raw);
 
-    // 2) retry مرة واحدة فقط — إعادة السؤال (msg) وليس "إصلاح JSON"
+    // 2) retry واحد فقط (بدون "إصلاح JSON")
     let retryRaw = "";
     if (!parsed) {
-      retryRaw = await callGroq(messages); // نفس الرسائل تمامًا
+      retryRaw = await callGroq(messages);
       parsed = extractJson(retryRaw);
     }
 
@@ -367,6 +454,20 @@ app.post("/chat", async (req, res) => {
     if (isMetaJsonAnswer(data)) {
       const recovered = recoverPartialCard(retryRaw || raw);
       data = recovered ? normalize(recovered) : fallback(raw);
+    }
+
+    // 5) emergency number sanity (سلطنة عمان)
+    if (data.category === "emergency") {
+      const all = `${data.title} ${data.verdict} ${data.when_to_seek_help} ${data.next_question} ${(data.tips || []).join(" ")}`;
+      // لو ذكر 911 أو أرقام عامة، استبدل برسالة صحيحة
+      if (/\b911\b/.test(all) || /\b112\b/.test(all)) {
+        data.verdict = "في سلطنة عُمان: اتصل بالطوارئ على 9999، ولخدمات الإسعاف/الدفاع المدني يمكن 24343666 كبديل.";
+        data.title = data.title && data.title !== "دليل العافية" ? data.title : "رقم الطوارئ";
+        data.next_question = "هل الحالة الآن طارئة (إغماء/صعوبة تنفس/ألم صدر/تشنجات)؟";
+        data.quick_choices = ["نعم", "لا"];
+        data.tips = ["اذكر موقعك بدقة", "لا تغلق الخط حتى يطلب منك"];
+        data.when_to_seek_help = "";
+      }
     }
 
     res.json({ ok: true, data });

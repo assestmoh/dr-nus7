@@ -19,7 +19,7 @@ const GROQ_API_KEY = process.env.GROQ_API_KEY;
 const PRIMARY_MODEL =
   process.env.GROQ_MODEL_PRIMARY ||
   process.env.GROQ_MODEL ||
-  "llama-3.3-70b-versatile";
+  "openai/gpt-oss-120b";
 
 const FALLBACK_MODEL =
   process.env.GROQ_MODEL_FALLBACK || "qwen/qwen3-32b";

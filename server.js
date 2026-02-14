@@ -1,5 +1,6 @@
 // ===============================
 // server.js — Dalil Alafiyah API
+// (No UI/logic change) فقط منع ظهور الأكواد + Retry واحد عند فشل JSON
 // ===============================
 
 import "dotenv/config";
@@ -78,7 +79,6 @@ function extractJson(text) {
   // محاولة 1: parse كامل الرد
   try {
     const first = JSON.parse(s);
-
     if (first && typeof first === "object") return first;
 
     if (typeof first === "string") {
@@ -94,6 +94,7 @@ function extractJson(text) {
 
   let chunk = cleanJsonish(s.slice(a, b + 1));
 
+  // parse عادي
   try {
     return JSON.parse(chunk);
   } catch {}
@@ -117,11 +118,12 @@ function extractJson(text) {
 // محاولة استخراج "verdict" بنمط Regex إذا فشل JSON.parse
 function extractVerdictLoosely(raw) {
   const s = String(raw || "");
-  // يلتقط: "verdict": "...."
+
+  // "verdict": "...."
   const m = s.match(/"verdict"\s*:\s*"([^"]+)"/);
   if (m && m[1]) return m[1].replace(/\\"/g, '"').trim();
 
-  // أحيانًا تكون: \"verdict\": \"...\"
+  // \"verdict\": \"...\"
   const m2 = s.match(/\\"verdict\\"\s*:\s*\\"([^\\]+)\\"/);
   if (m2 && m2[1]) return m2[1].replace(/\\"/g, '"').trim();
 
@@ -205,9 +207,8 @@ function normalize(obj) {
 }
 
 /**
- * fallback سابقًا كان يسرب raw داخل verdict -> هذا سبب ظهور "الأكواد" في الواجهة.
- * الآن: لا نسرب raw للمستخدم. نحاول نلتقط verdict بشكل بسيط، وإلا رسالة عامة.
- * (لا تغيير في المنطق/الواجهة: فقط منع ظهور الأكواد)
+ * fallback سابقًا كان يسرب raw داخل verdict -> سبب ظهور "الأكواد"
+ * الآن: لا نسرب raw للمستخدم. نحاول نلتقط verdict فقط، وإلا رسالة عامة.
  */
 function fallback(rawText) {
   const looseVerdict = extractVerdictLoosely(rawText);
@@ -241,7 +242,25 @@ app.post("/chat", async (req, res) => {
       { role: "user", content: msg },
     ]);
 
-    const parsed = extractJson(raw);
+    let parsed = extractJson(raw);
+
+    // ✅ Retry مرة واحدة فقط إذا فشل parsing (لمنع ظهور رسالة fallback كثيرًا)
+    // (لا تغيير في الواجهة/الفكرة، فقط تحسين موثوقية الـ JSON)
+    if (!parsed) {
+      const retryRaw = await callGroq([
+        { role: "system", content: buildSystemPrompt() },
+        {
+          role: "user",
+          content:
+            "أعد نفس الإجابة بصيغة JSON strict فقط (بدون أي نص خارج JSON وبدون ``` وبدون trailing commas).\n" +
+            "هذه كانت الإجابة السابقة غير الصالحة:\n" +
+            raw,
+        },
+      ]);
+
+      parsed = extractJson(retryRaw);
+    }
+
     const data = parsed ? normalize(parsed) : fallback(raw);
 
     res.json({ ok: true, data });

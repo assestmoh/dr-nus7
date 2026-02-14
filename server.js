@@ -1,23 +1,29 @@
 // ===============================
 // server.js — Dalil Alafiyah API
-// + Calculators Path (No LLM tokens)
+// - Calculators return PLAIN (no cards)
+// - Other replies use CARD JSON
+// - Compatible with app.js: /chat /report /reset
 // ===============================
 
 import "dotenv/config";
 import express from "express";
 import cors from "cors";
-import bodyParser from "body-parser";
-import fetch from "node-fetch";
 import helmet from "helmet";
 import multer from "multer";
+import rateLimit from "express-rate-limit";
+import fetch from "node-fetch";
 import { createRequire } from "module";
 
 const require = createRequire(import.meta.url);
 let pdfParse = null;
-try { pdfParse = require("pdf-parse"); } catch {}
+try {
+  pdfParse = require("pdf-parse");
+} catch {}
 
 let createWorker = null;
-try { ({ createWorker } = await import("tesseract.js")); } catch {}
+try {
+  ({ createWorker } = await import("tesseract.js"));
+} catch {}
 
 const app = express();
 const upload = multer({ limits: { fileSize: 10 * 1024 * 1024 } });
@@ -25,23 +31,54 @@ const upload = multer({ limits: { fileSize: 10 * 1024 * 1024 } });
 // ===============================
 // ENV
 // ===============================
-const GROQ_API_KEY = process.env.GROQ_API_KEY || "";
-const MODEL_ID = process.env.GROQ_MODEL || "openai/gpt-oss-120b";
 const PORT = process.env.PORT || 3000;
+const GROQ_API_KEY = process.env.GROQ_API_KEY || "";
+const GROQ_MODEL = process.env.GROQ_MODEL || "openai/gpt-oss-120b";
 
-app.use(helmet());
+// Optional: internal key
+const INTERNAL_API_KEY = process.env.INTERNAL_API_KEY || "";
+
+// ===============================
+// Middleware
+// ===============================
+app.use(helmet({ crossOriginResourcePolicy: false }));
+
+app.use(
+  rateLimit({
+    windowMs: 60 * 1000,
+    max: 120,
+    standardHeaders: true,
+    legacyHeaders: false,
+  })
+);
+
+function requireApiKey(req, res, next) {
+  if (!INTERNAL_API_KEY) return next();
+  const key = req.header("x-api-key");
+  if (key !== INTERNAL_API_KEY) return res.status(401).json({ ok: false, error: "unauthorized" });
+  next();
+}
+app.use(requireApiKey);
+
 app.use(
   cors({
     origin: true,
     methods: ["GET", "POST", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization", "x-user-id", "X-User-Id"],
+    allowedHeaders: ["Content-Type", "Authorization", "x-user-id", "x-api-key"],
   })
 );
-app.use(bodyParser.json({ limit: "2mb" }));
+
+app.use(express.json({ limit: "2mb" }));
+app.use(express.urlencoded({ extended: true, limit: "2mb" }));
 
 // ===============================
-// Card helpers
+// Helpers
 // ===============================
+function plain(text) {
+  // ✅ For calculators: app.js will render with addMsg() (no card)
+  return { mode: "plain", text: String(text || "").trim() };
+}
+
 function card({
   category = "general",
   title = "دليل العافية",
@@ -56,27 +93,27 @@ function card({
     title,
     verdict,
     next_question,
-    quick_choices: Array.isArray(quick_choices) ? quick_choices.slice(0, 6) : [],
-    tips: Array.isArray(tips) ? tips.slice(0, 6) : [],
+    quick_choices: Array.isArray(quick_choices) ? quick_choices : [],
+    tips: Array.isArray(tips) ? tips : [],
     when_to_seek_help,
   };
 }
 
-function isCancel(t) {
-  return /^(إلغاء|الغاء|cancel|مسح|ابدأ من جديد|ابدأ جديد|رجوع|عودة|القائمة)$/i.test(
-    String(t || "").trim()
-  );
+function clampText(s, maxChars) {
+  const t = String(s || "").trim();
+  if (t.length <= maxChars) return t;
+  return t.slice(0, maxChars) + "\n...[تم قص النص]";
+}
+
+function parseNumber(text) {
+  const m = String(text || "").match(/(\d+(\.\d+)?)/);
+  return m ? Number(m[1]) : null;
 }
 
 function clampNum(n, min, max) {
   if (!Number.isFinite(n)) return null;
   if (n < min || n > max) return null;
   return n;
-}
-
-function parseNumber(text) {
-  const m = String(text || "").match(/(\d+(\.\d+)?)/);
-  return m ? Number(m[1]) : null;
 }
 
 function parseBP(text) {
@@ -89,43 +126,35 @@ function parseBP(text) {
 }
 
 function detectSugarUnit(text) {
-  // لو المستخدم كتب mmol/L أو mmol
   if (/mmol/i.test(String(text || ""))) return "mmol";
   return "mgdl";
 }
-
 function sugarToMgdl(value, unit) {
   if (unit === "mmol") return Math.round(value * 18);
   return Math.round(value);
 }
 
-// ===============================
-// Sessions (in-memory)
-// ===============================
-const sessions = new Map(); // userId -> { calc:{name,step,data}, ts }
-
-function getUserId(req) {
-  return req.header("x-user-id") || "anon";
+function isCancel(t) {
+  return /^(إلغاء|الغاء|cancel|مسح|ابدأ من جديد|ابدأ جديد|رجوع|عودة|القائمة)$/i.test(
+    String(t || "").trim()
+  );
 }
 
-function getSession(userId) {
-  if (!sessions.has(userId)) sessions.set(userId, { calc: null, ts: Date.now() });
-  const s = sessions.get(userId);
-  s.ts = Date.now();
-  return s;
+function isCalculatorsIntent(t) {
+  return /حاسبات|الحاسبات|🧮/i.test(String(t || ""));
 }
 
-// تنظيف جلسات قديمة
-setInterval(() => {
-  const now = Date.now();
-  for (const [k, v] of sessions) {
-    if (now - (v.ts || 0) > 24 * 60 * 60 * 1000) sessions.delete(k);
-  }
-}, 30 * 60 * 1000);
+function pickCalcFromText(t) {
+  const s = String(t || "");
+  if (/BMI|كتلة الجسم|⚖️/i.test(s)) return "bmi";
+  if (/سعرات|🔥/i.test(s)) return "calories";
+  if (/ماء|💧/i.test(s)) return "water";
+  if (/ضغط|💓/i.test(s)) return "bp";
+  if (/سكر|🩸/i.test(s)) return "sugar";
+  if (/مزاج|🧠/i.test(s)) return "mood";
+  return null;
+}
 
-// ===============================
-// Report entry card (مثل صورتك)
-// ===============================
 function reportEntryCard() {
   return card({
     category: "report",
@@ -144,117 +173,55 @@ function isReportIntent(text) {
 }
 
 // ===============================
-// Calculators Path
+// Sessions (for calculators steps)
 // ===============================
-function calculatorsMenuCard() {
-  return card({
-    category: "calculators",
-    title: "🧮 الحاسبات",
-    verdict: "اختر الحاسبة اللي تبيها (كلها ردود جاهزة لتوفير التوكنز):",
-    next_question: "أي حاسبة نبدأ؟",
-    quick_choices: [
-      "🔥 حاسبة السعرات",
-      "⚖️ حاسبة كتلة الجسم BMI",
-      "💧 حاسبة الماء",
-      "💓 حاسبة الضغط",
-      "🩸 حاسبة السكر",
-      "🧠 حاسبة المزاج",
-      "إلغاء",
-    ],
-    tips: ["النتائج تقديرية للتثقيف العام فقط."],
-    when_to_seek_help: "",
-  });
+const sessions = new Map(); // userId -> { calc:{name,step,data}, ts }
+
+function getUserId(req) {
+  return req.header("x-user-id") || "anon";
+}
+function getSession(userId) {
+  if (!sessions.has(userId)) sessions.set(userId, { calc: null, ts: Date.now() });
+  const s = sessions.get(userId);
+  s.ts = Date.now();
+  return s;
+}
+setInterval(() => {
+  const now = Date.now();
+  for (const [k, v] of sessions) {
+    if (now - (v.ts || 0) > 24 * 60 * 60 * 1000) sessions.delete(k);
+  }
+}, 30 * 60 * 1000);
+
+// ===============================
+// Calculators (PLAIN responses)
+// ===============================
+function calculatorsMenuPlain() {
+  return plain(
+    "🧮 الحاسبات (اكتب واحدة من الصيغ التالية):\n" +
+      "• BMI وزن 70 طول 170\n" +
+      "• ماء وزن 70 نشاط متوسط جو حار\n" +
+      "• ضغط 120/80\n" +
+      "• سكر صائم 95  (أو: سكر صائم 5.5 mmol)\n" +
+      "• سعرات ذكر عمر 28 طول 170 وزن 70 نشاط متوسط هدف تنحيف\n" +
+      "• مزاج جيد نوم 7\n" +
+      "\nاكتب: إلغاء للرجوع."
+  );
 }
 
 function startCalc(session, name) {
   session.calc = { name, step: 1, data: {} };
 
-  if (name === "bmi") {
-    return card({
-      category: "calculators",
-      title: "⚖️ حاسبة BMI",
-      verdict: "أعطني وزنك بالكيلو:",
-      next_question: "كم وزنك؟",
-      quick_choices: ["إلغاء"],
-      tips: ["مثال: 70"],
-      when_to_seek_help: "",
-    });
-  }
-
-  if (name === "calories") {
-    return card({
-      category: "calculators",
-      title: "🔥 حاسبة السعرات",
-      verdict: "اختر الجنس:",
-      next_question: "ذكر أم أنثى؟",
-      quick_choices: ["ذكر", "أنثى", "إلغاء"],
-      tips: ["الحساب تقديري (Mifflin-St Jeor)."],
-      when_to_seek_help: "",
-    });
-  }
-
-  if (name === "water") {
-    return card({
-      category: "calculators",
-      title: "💧 حاسبة الماء",
-      verdict: "اكتب وزنك بالكيلو:",
-      next_question: "كم وزنك؟",
-      quick_choices: ["إلغاء"],
-      tips: ["مثال: 70"],
-      when_to_seek_help: "",
-    });
-  }
-
-  if (name === "bp") {
-    return card({
-      category: "calculators",
-      title: "💓 حاسبة الضغط",
-      verdict: "اكتب قراءة الضغط بالشكل 120/80:",
-      next_question: "ما هي القراءة؟",
-      quick_choices: ["إلغاء"],
-      tips: ["إذا عندك دوخة شديدة/ألم صدر/ضيق نفس: طوارئ فورًا."],
-      when_to_seek_help: "",
-    });
-  }
-
-  if (name === "sugar") {
-    return card({
-      category: "calculators",
-      title: "🩸 حاسبة السكر",
-      verdict: "اختر نوع القياس:",
-      next_question: "القياس كان متى؟",
-      quick_choices: ["صائم", "بعد الأكل بساعتين", "عشوائي", "إلغاء"],
-      tips: ["اكتب القيمة لاحقًا (mg/dL أو mmol/L)."],
-      when_to_seek_help: "",
-    });
-  }
-
-  if (name === "mood") {
-    return card({
-      category: "calculators",
-      title: "🧠 حاسبة المزاج",
-      verdict: "قيّم مزاجك آخر 7 أيام:",
-      next_question: "اختيار واحد:",
-      quick_choices: ["ممتاز", "جيد", "متوسط", "سيئ", "سيئ جدًا", "إلغاء"],
-      tips: ["هذا فحص ذاتي بسيط وليس تشخيصًا."],
-      when_to_seek_help: "",
-    });
-  }
-
+  // short interactive prompts to reduce errors (still plain)
+  if (name === "bmi") return plain("⚖️ BMI: اكتب وزنك بالكيلو (مثال 70)");
+  if (name === "water") return plain("💧 ماء: اكتب وزنك بالكيلو (مثال 70)");
+  if (name === "bp") return plain("💓 ضغط: اكتب القراءة مثل 120/80");
+  if (name === "sugar") return plain("🩸 سكر: اختر النوع (صائم/بعد الأكل بساعتين/عشوائي)");
+  if (name === "calories")
+    return plain("🔥 سعرات: اختر الجنس (ذكر/أنثى) ثم سأكمل معك بخطوات سريعة");
+  if (name === "mood") return plain("🧠 مزاج: قيّم مزاجك (ممتاز/جيد/متوسط/سيئ/سيئ جدًا)");
   session.calc = null;
-  return calculatorsMenuCard();
-}
-
-function finishCalcCard() {
-  return card({
-    category: "calculators",
-    title: "🧮 الحاسبات",
-    verdict: "تحب حاسبة ثانية؟",
-    next_question: "",
-    quick_choices: ["🧮 الحاسبات", "إلغاء"],
-    tips: [],
-    when_to_seek_help: "",
-  });
+  return calculatorsMenuPlain();
 }
 
 function continueCalc(session, message) {
@@ -262,534 +229,270 @@ function continueCalc(session, message) {
   const m = String(message || "").trim();
 
   if (!c) return null;
-
   if (isCancel(m)) {
     session.calc = null;
-    return calculatorsMenuCard();
+    return calculatorsMenuPlain();
   }
 
-  // ---------- BMI ----------
+  // BMI interactive
   if (c.name === "bmi") {
     if (c.step === 1) {
       const w = clampNum(parseNumber(m), 25, 250);
-      if (!w) return card({
-        category: "calculators",
-        title: "⚖️ حاسبة BMI",
-        verdict: "ما فهمت الوزن. اكتب رقم بالكيلو (مثال 70).",
-        next_question: "كم وزنك؟",
-        quick_choices: ["إلغاء"],
-        tips: [],
-      });
+      if (!w) return plain("اكتب وزن صحيح بالكيلو (مثال 70)");
       c.data.w = w;
       c.step = 2;
-      return card({
-        category: "calculators",
-        title: "⚖️ حاسبة BMI",
-        verdict: "الآن اكتب طولك بالسنتيمتر:",
-        next_question: "كم طولك؟",
-        quick_choices: ["إلغاء"],
-        tips: ["مثال: 170"],
-      });
+      return plain("اكتب طولك بالسنتيمتر (مثال 170)");
     }
     if (c.step === 2) {
       const h = clampNum(parseNumber(m), 120, 220);
-      if (!h) return card({
-        category: "calculators",
-        title: "⚖️ حاسبة BMI",
-        verdict: "ما فهمت الطول. اكتب رقم بالسنتيمتر (مثال 170).",
-        next_question: "كم طولك؟",
-        quick_choices: ["إلغاء"],
-        tips: [],
-      });
-
+      if (!h) return plain("اكتب طول صحيح بالسنتيمتر (مثال 170)");
       const bmi = Math.round((c.data.w / Math.pow(h / 100, 2)) * 10) / 10;
 
-      let label = "ضمن الطبيعي";
+      let label = "طبيعي";
       if (bmi < 18.5) label = "نحافة";
       else if (bmi < 25) label = "طبيعي";
       else if (bmi < 30) label = "زيادة وزن";
       else label = "سمنة";
 
       session.calc = null;
-      return card({
-        category: "calculators",
-        title: "⚖️ نتيجة BMI",
-        verdict: `BMI = **${bmi}** (${label})`,
-        next_question: "تبغى نصائح لنمط الحياة حسب النتيجة؟",
-        quick_choices: ["نعم", "لا", "🧮 الحاسبات"],
-        tips: [
-          "النتيجة تقديرية ولا تكفي وحدها لتقييم الصحة.",
-          "حاول توازن الغذاء + نشاط بدني منتظم.",
-        ],
-        when_to_seek_help: "إذا فقدان وزن شديد/تعب مستمر: راجع الطبيب.",
-      });
+      return plain(`BMI = ${bmi}\nالتصنيف: ${label}\nملاحظة: النتيجة تقديرية للتثقيف العام.`);
     }
   }
 
-  // ---------- Calories ----------
-  if (c.name === "calories") {
-    if (c.step === 1) {
-      if (!/^(ذكر|أنثى)$/i.test(m)) return card({
-        category: "calculators",
-        title: "🔥 حاسبة السعرات",
-        verdict: "اختر (ذكر) أو (أنثى).",
-        next_question: "الجنس؟",
-        quick_choices: ["ذكر", "أنثى", "إلغاء"],
-      });
-      c.data.sex = m;
-      c.step = 2;
-      return card({
-        category: "calculators",
-        title: "🔥 حاسبة السعرات",
-        verdict: "اكتب عمرك بالسنوات:",
-        next_question: "كم عمرك؟",
-        quick_choices: ["إلغاء"],
-        tips: ["مثال: 28"],
-      });
-    }
-    if (c.step === 2) {
-      const age = clampNum(parseNumber(m), 10, 90);
-      if (!age) return card({
-        category: "calculators",
-        title: "🔥 حاسبة السعرات",
-        verdict: "اكتب العمر رقم (مثال 28).",
-        next_question: "كم عمرك؟",
-        quick_choices: ["إلغاء"],
-      });
-      c.data.age = age;
-      c.step = 3;
-      return card({
-        category: "calculators",
-        title: "🔥 حاسبة السعرات",
-        verdict: "اكتب طولك بالسنتيمتر:",
-        next_question: "كم طولك؟",
-        quick_choices: ["إلغاء"],
-        tips: ["مثال: 170"],
-      });
-    }
-    if (c.step === 3) {
-      const h = clampNum(parseNumber(m), 120, 220);
-      if (!h) return card({
-        category: "calculators",
-        title: "🔥 حاسبة السعرات",
-        verdict: "اكتب الطول رقم (مثال 170).",
-        next_question: "كم طولك؟",
-        quick_choices: ["إلغاء"],
-      });
-      c.data.h = h;
-      c.step = 4;
-      return card({
-        category: "calculators",
-        title: "🔥 حاسبة السعرات",
-        verdict: "اكتب وزنك بالكيلو:",
-        next_question: "كم وزنك؟",
-        quick_choices: ["إلغاء"],
-        tips: ["مثال: 70"],
-      });
-    }
-    if (c.step === 4) {
-      const w = clampNum(parseNumber(m), 25, 250);
-      if (!w) return card({
-        category: "calculators",
-        title: "🔥 حاسبة السعرات",
-        verdict: "اكتب الوزن رقم (مثال 70).",
-        next_question: "كم وزنك؟",
-        quick_choices: ["إلغاء"],
-      });
-      c.data.w = w;
-      c.step = 5;
-      return card({
-        category: "calculators",
-        title: "🔥 حاسبة السعرات",
-        verdict: "اختر نشاطك اليومي:",
-        next_question: "",
-        quick_choices: ["خفيف", "متوسط", "عالي", "إلغاء"],
-        tips: ["خفيف: عمل مكتبي", "متوسط: مشي/رياضة 3 أيام", "عالي: نشاط يومي قوي"],
-      });
-    }
-    if (c.step === 5) {
-      const actMap = { خفيف: 1.2, متوسط: 1.55, عالي: 1.725 };
-      if (!actMap[m]) return card({
-        category: "calculators",
-        title: "🔥 حاسبة السعرات",
-        verdict: "اختر: خفيف / متوسط / عالي",
-        next_question: "",
-        quick_choices: ["خفيف", "متوسط", "عالي", "إلغاء"],
-      });
-      c.data.act = actMap[m];
-      c.step = 6;
-      return card({
-        category: "calculators",
-        title: "🔥 حاسبة السعرات",
-        verdict: "اختر هدفك:",
-        next_question: "",
-        quick_choices: ["تثبيت", "تنحيف", "زيادة", "إلغاء"],
-        tips: [],
-      });
-    }
-    if (c.step === 6) {
-      const goal = m;
-      if (!/^(تثبيت|تنحيف|زيادة)$/i.test(goal)) return card({
-        category: "calculators",
-        title: "🔥 حاسبة السعرات",
-        verdict: "اختر: تثبيت / تنحيف / زيادة",
-        next_question: "",
-        quick_choices: ["تثبيت", "تنحيف", "زيادة", "إلغاء"],
-      });
-
-      const sex = c.data.sex;
-      const age = c.data.age;
-      const h = c.data.h;
-      const w = c.data.w;
-      const act = c.data.act;
-
-      // Mifflin-St Jeor
-      let bmr = 10 * w + 6.25 * h - 5 * age;
-      bmr += /أنثى/i.test(sex) ? -161 : 5;
-
-      const tdee = Math.round(bmr * act);
-
-      let target = tdee;
-      let note = "تثبيت الوزن";
-      if (/تنحيف/i.test(goal)) { target = tdee - 400; note = "تنحيف (تقريبًا -400)"; }
-      if (/زيادة/i.test(goal)) { target = tdee + 300; note = "زيادة (تقريبًا +300)"; }
-
-      session.calc = null;
-      return card({
-        category: "calculators",
-        title: "🔥 نتيجة السعرات",
-        verdict: `احتياجك اليومي التقريبي = **${tdee}** سعرة/يوم.\nالهدف (${note}) ≈ **${target}** سعرة/يوم.`,
-        next_question: "تبغى نصائح سريعة للأكل؟",
-        quick_choices: ["نعم", "لا", "🧮 الحاسبات"],
-        tips: ["الأرقام تقديرية وقد تختلف حسب الحالة الصحية.", "قسّم البروتين/الخضار/الكربوهيدرات بشكل متوازن."],
-        when_to_seek_help: "إذا لديك مرض مزمن أو فقدان وزن غير مبرر: استشر الطبيب/أخصائي تغذية.",
-      });
-    }
-  }
-
-  // ---------- Water ----------
+  // Water interactive
   if (c.name === "water") {
     if (c.step === 1) {
       const w = clampNum(parseNumber(m), 25, 250);
-      if (!w) return card({
-        category: "calculators",
-        title: "💧 حاسبة الماء",
-        verdict: "اكتب الوزن رقم بالكيلو (مثال 70).",
-        next_question: "كم وزنك؟",
-        quick_choices: ["إلغاء"],
-      });
+      if (!w) return plain("اكتب وزن صحيح بالكيلو (مثال 70)");
       c.data.w = w;
       c.step = 2;
-      return card({
-        category: "calculators",
-        title: "💧 حاسبة الماء",
-        verdict: "نشاطك اليومي؟",
-        next_question: "",
-        quick_choices: ["خفيف", "متوسط", "عالي", "إلغاء"],
-        tips: [],
-      });
+      return plain("اختر النشاط: خفيف / متوسط / عالي");
     }
     if (c.step === 2) {
-      if (!/^(خفيف|متوسط|عالي)$/i.test(m)) return card({
-        category: "calculators",
-        title: "💧 حاسبة الماء",
-        verdict: "اختر: خفيف / متوسط / عالي",
-        next_question: "",
-        quick_choices: ["خفيف", "متوسط", "عالي", "إلغاء"],
-      });
+      if (!/^(خفيف|متوسط|عالي)$/i.test(m)) return plain("اكتب: خفيف أو متوسط أو عالي");
       c.data.act = m;
       c.step = 3;
-      return card({
-        category: "calculators",
-        title: "💧 حاسبة الماء",
-        verdict: "كيف الجو غالبًا؟",
-        next_question: "",
-        quick_choices: ["معتدل", "حار", "مكيف أغلب الوقت", "إلغاء"],
-        tips: [],
-      });
+      return plain("اختر الجو: معتدل / حار / مكيف");
     }
     if (c.step === 3) {
-      if (!/^(معتدل|حار|مكيف أغلب الوقت)$/i.test(m)) return card({
-        category: "calculators",
-        title: "💧 حاسبة الماء",
-        verdict: "اختر: معتدل / حار / مكيف أغلب الوقت",
-        next_question: "",
-        quick_choices: ["معتدل", "حار", "مكيف أغلب الوقت", "إلغاء"],
-      });
-
+      if (!/^(معتدل|حار|مكيف)$/i.test(m)) return plain("اكتب: معتدل أو حار أو مكيف");
       const w = c.data.w;
-      // قاعدة بسيطة: 35ml/kg
       let ml = w * 35;
-
       if (/متوسط/i.test(c.data.act)) ml += 300;
       if (/عالي/i.test(c.data.act)) ml += 600;
-
       if (/حار/i.test(m)) ml += 500;
       if (/مكيف/i.test(m)) ml -= 200;
 
       const liters = Math.max(1.5, Math.round((ml / 1000) * 10) / 10);
-
       session.calc = null;
-      return card({
-        category: "calculators",
-        title: "💧 نتيجة الماء",
-        verdict: `احتياجك التقريبي من الماء ≈ **${liters} لتر/يوم**.`,
-        next_question: "تبغى طريقة توزيعها خلال اليوم؟",
-        quick_choices: ["نعم", "لا", "🧮 الحاسبات"],
-        tips: ["لون البول الفاتح غالبًا علامة ترطيب جيد.", "زد الماء مع الرياضة/الحر."],
-        when_to_seek_help: "إذا لديك فشل كلوي/قصور قلب: استشر طبيبك قبل زيادة السوائل.",
-      });
+      return plain(`احتياج الماء التقريبي: ${liters} لتر/يوم\n(نشاط: ${c.data.act} — جو: ${m})`);
     }
   }
 
-  // ---------- BP ----------
+  // BP interactive
   if (c.name === "bp") {
     if (c.step === 1) {
       const bp = parseBP(m);
-      if (!bp) return card({
-        category: "calculators",
-        title: "💓 حاسبة الضغط",
-        verdict: "اكتبها مثل: 120/80",
-        next_question: "ما هي القراءة؟",
-        quick_choices: ["إلغاء"],
-        tips: [],
-      });
-
+      if (!bp) return plain("اكتب الضغط مثل: 120/80");
       const { s, d } = bp;
 
       let cls = "طبيعي";
-      let seek = "";
-      if (s >= 180 || d >= 120) { cls = "أزمة ضغط (طارئ)"; seek = "إذا مع أعراض (ألم صدر/ضيق نفس/صداع شديد/تشوش): طوارئ فورًا."; }
+      if (s >= 180 || d >= 120) cls = "أزمة ضغط (طارئ)";
       else if (s >= 140 || d >= 90) cls = "مرحلة ثانية";
       else if (s >= 130 || d >= 80) cls = "مرحلة أولى";
       else if (s >= 120 && d < 80) cls = "مرتفع";
-      else cls = "طبيعي";
+
+      const warn =
+        s >= 180 || d >= 120
+          ? "إذا مع أعراض (ألم صدر/ضيق نفس/صداع شديد/تشوش): طوارئ فورًا."
+          : "إذا تكرر ≥140/90 أو مع أعراض مزعجة: راجع الطبيب.";
 
       session.calc = null;
-      return card({
-        category: s >= 180 || d >= 120 ? "emergency" : "calculators",
-        title: "💓 نتيجة الضغط",
-        verdict: `قراءتك **${s}/${d}** وتصنيفها: **${cls}**.`,
-        next_question: "هل تريد نصائح لقياس الضغط بشكل صحيح؟",
-        quick_choices: ["نعم", "لا", "🧮 الحاسبات"],
-        tips: ["قِس بعد راحة 5 دقائق.", "تجنب القهوة/التدخين 30 دقيقة قبل القياس."],
-        when_to_seek_help: seek || "إذا تكرر ≥140/90 أو مع أعراض مزعجة: راجع الطبيب.",
-      });
+      return plain(`قراءتك: ${s}/${d}\nالتصنيف: ${cls}\n${warn}`);
     }
   }
 
-  // ---------- Sugar ----------
+  // Sugar interactive
   if (c.name === "sugar") {
     if (c.step === 1) {
-      if (!/^(صائم|بعد الأكل بساعتين|عشوائي)$/i.test(m)) {
-        return card({
-          category: "calculators",
-          title: "🩸 حاسبة السكر",
-          verdict: "اختر نوع القياس:",
-          next_question: "",
-          quick_choices: ["صائم", "بعد الأكل بساعتين", "عشوائي", "إلغاء"],
-        });
-      }
+      if (!/^(صائم|بعد الأكل بساعتين|عشوائي)$/i.test(m))
+        return plain("اكتب واحد: صائم / بعد الأكل بساعتين / عشوائي");
       c.data.type = m;
       c.step = 2;
-      return card({
-        category: "calculators",
-        title: "🩸 حاسبة السكر",
-        verdict: "اكتب قيمة السكر:",
-        next_question: "مثال: 95 أو 7.2 mmol",
-        quick_choices: ["إلغاء"],
-        tips: ["إذا تكتب mmol اكتب معها mmol لتتحول تلقائيًا."],
-      });
+      return plain("اكتب قراءة السكر (مثال: 95 أو 5.5 mmol)");
     }
     if (c.step === 2) {
       const v = parseNumber(m);
-      if (!v) return card({
-        category: "calculators",
-        title: "🩸 حاسبة السكر",
-        verdict: "اكتب رقم واضح.",
-        next_question: "كم القراءة؟",
-        quick_choices: ["إلغاء"],
-      });
-
+      if (!v) return plain("اكتب رقم واضح للسكر (مثال 95 أو 5.5 mmol)");
       const unit = detectSugarUnit(m);
       const mg = sugarToMgdl(v, unit);
 
       const type = c.data.type;
-      let cls = "ضمن الطبيعي";
-      let note = "";
+      let cls = "طبيعي";
 
       if (/صائم/i.test(type)) {
-        if (mg < 70) { cls = "منخفض"; note = "إذا أعراض هبوط: اتبع إرشادات طبيبك/اطلب مساعدة."; }
+        if (mg < 70) cls = "منخفض";
         else if (mg <= 99) cls = "طبيعي";
-        else if (mg <= 125) cls = "مرتفع (ما قبل السكري)";
-        else cls = "مرتفع جدًا (يحتاج تأكيد طبي)";
+        else if (mg <= 125) cls = "ما قبل السكري";
+        else cls = "مرتفع جدًا (يحتاج تقييم)";
       } else if (/بعد الأكل/i.test(type)) {
-        if (mg < 70) { cls = "منخفض"; note = "إذا أعراض هبوط: اطلب مساعدة."; }
+        if (mg < 70) cls = "منخفض";
         else if (mg < 140) cls = "طبيعي";
-        else if (mg <= 199) cls = "مرتفع (ما قبل السكري)";
-        else cls = "مرتفع جدًا (يحتاج تقييم طبي)";
+        else if (mg <= 199) cls = "مرتفع";
+        else cls = "مرتفع جدًا";
       } else {
-        // عشوائي
-        if (mg < 70) { cls = "منخفض"; note = "إذا أعراض هبوط: اطلب مساعدة."; }
+        if (mg < 70) cls = "منخفض";
         else if (mg < 200) cls = "قد يكون طبيعي/مرتفع حسب الأكل";
-        else cls = "مرتفع جدًا (خصوصًا مع أعراض)";
+        else cls = "مرتفع جدًا";
       }
 
       session.calc = null;
-      return card({
-        category: cls.includes("مرتفع جدًا") ? "calculators" : "calculators",
-        title: "🩸 نتيجة السكر",
-        verdict: `قراءة السكر ≈ **${mg} mg/dL** (${cls}).`,
-        next_question: "تبغى نصائح غذائية قصيرة؟",
-        quick_choices: ["نعم", "لا", "🧮 الحاسبات"],
-        tips: [
-          "القراءة الواحدة لا تكفي للتشخيص.",
-          "كرّر القياس في أوقات مختلفة وسجّل النتائج.",
-          note || "قلّل السكريات السريعة وزد الألياف والمشي.",
-        ].filter(Boolean),
-        when_to_seek_help:
-          "إذا القراءة عالية جدًا مع عطش شديد/تبوّل كثير/تقيؤ/دوخة: راجع الطوارئ. وللتقييم الدقيق: راجع الطبيب.",
-      });
+      return plain(
+        `قراءة السكر ≈ ${mg} mg/dL\nالنوع: ${type}\nالتصنيف: ${cls}\nملاحظة: القراءة الواحدة لا تكفي للتشخيص.\nإذا مرتفع جدًا مع أعراض شديدة: طوارئ.`
+      );
     }
   }
 
-  // ---------- Mood ----------
+  // Calories interactive (simple steps)
+  if (c.name === "calories") {
+    if (c.step === 1) {
+      if (!/^(ذكر|أنثى|انثى)$/i.test(m)) return plain("اكتب: ذكر أو أنثى");
+      c.data.sex = /انثى/i.test(m) ? "أنثى" : m;
+      c.step = 2;
+      return plain("اكتب عمرك (مثال 28)");
+    }
+    if (c.step === 2) {
+      const age = clampNum(parseNumber(m), 10, 90);
+      if (!age) return plain("اكتب عمر صحيح (مثال 28)");
+      c.data.age = age;
+      c.step = 3;
+      return plain("اكتب طولك بالسنتيمتر (مثال 170)");
+    }
+    if (c.step === 3) {
+      const h = clampNum(parseNumber(m), 120, 220);
+      if (!h) return plain("اكتب طول صحيح (مثال 170)");
+      c.data.h = h;
+      c.step = 4;
+      return plain("اكتب وزنك بالكيلو (مثال 70)");
+    }
+    if (c.step === 4) {
+      const w = clampNum(parseNumber(m), 25, 250);
+      if (!w) return plain("اكتب وزن صحيح (مثال 70)");
+      c.data.w = w;
+      c.step = 5;
+      return plain("اختر النشاط: خفيف / متوسط / عالي");
+    }
+    if (c.step === 5) {
+      const act = /عالي/i.test(m) ? 1.725 : /متوسط/i.test(m) ? 1.55 : /خفيف/i.test(m) ? 1.2 : null;
+      if (!act) return plain("اكتب: خفيف أو متوسط أو عالي");
+      c.data.act = act;
+      c.step = 6;
+      return plain("اختر الهدف: تثبيت / تنحيف / زيادة");
+    }
+    if (c.step === 6) {
+      const goal = /تنحيف/i.test(m) ? "تنحيف" : /زيادة/i.test(m) ? "زيادة" : /تثبيت/i.test(m) ? "تثبيت" : null;
+      if (!goal) return plain("اكتب: تثبيت أو تنحيف أو زيادة");
+
+      const { sex, age, h, w, act } = c.data;
+      let bmr = 10 * w + 6.25 * h - 5 * age + (sex === "أنثى" ? -161 : 5);
+      const tdee = Math.round(bmr * act);
+
+      let target = tdee;
+      if (goal === "تنحيف") target = tdee - 400;
+      if (goal === "زيادة") target = tdee + 300;
+
+      session.calc = null;
+      return plain(
+        `احتياجك التقريبي: ${tdee} سعرة/يوم\nهدف (${goal}): ${target} سعرة/يوم\nملاحظة: تقديري للتثقيف العام.`
+      );
+    }
+  }
+
+  // Mood interactive
   if (c.name === "mood") {
     if (c.step === 1) {
-      if (!/^(ممتاز|جيد|متوسط|سيئ|سيئ جدًا)$/i.test(m)) return card({
-        category: "calculators",
-        title: "🧠 حاسبة المزاج",
-        verdict: "اختر خيار واحد:",
-        next_question: "",
-        quick_choices: ["ممتاز", "جيد", "متوسط", "سيئ", "سيئ جدًا", "إلغاء"],
-      });
-      c.data.mood = m;
+      if (!/^(ممتاز|جيد|متوسط|سيئ|سيئ جدًا|سيء|سيء جدا)$/i.test(m))
+        return plain("اختر: ممتاز / جيد / متوسط / سيئ / سيئ جدًا");
+      c.data.mood = m.replace("سيء", "سيئ");
       c.step = 2;
-      return card({
-        category: "calculators",
-        title: "🧠 حاسبة المزاج",
-        verdict: "كم ساعة تنام غالبًا؟",
-        next_question: "اكتب رقم (مثال 7)",
-        quick_choices: ["إلغاء"],
-        tips: [],
-      });
+      return plain("كم ساعة تنام غالبًا؟ (مثال 7)");
     }
     if (c.step === 2) {
       const hrs = clampNum(parseNumber(m), 0, 14);
-      if (hrs === null) return card({
-        category: "calculators",
-        title: "🧠 حاسبة المزاج",
-        verdict: "اكتب رقم للساعات (مثال 7).",
-        next_question: "",
-        quick_choices: ["إلغاء"],
-      });
-
+      if (hrs === null) return plain("اكتب رقم ساعات النوم (مثال 7)");
       const mood = c.data.mood;
+
+      let note = "اقتراح: ماء + وجبة خفيفة متوازنة + مشي 10 دقائق.";
+      if (hrs < 6) note = "اقتراح: ثبّت موعد النوم وقلّل الشاشة قبل النوم بساعة.";
+      if (/سيئ/i.test(mood)) note += "\nإذا عندك أفكار لإيذاء النفس: اطلب مساعدة فورًا (طوارئ/خط دعم).";
+
       session.calc = null;
-
-      const tips = [];
-      if (hrs < 6) tips.push("حاول تثبيت موعد النوم وتقليل الشاشة قبل النوم بساعة.");
-      if (/سيئ|سيئ جدًا/i.test(mood)) tips.push("جرّب نشاط بسيط يوميًا + تواصل مع شخص تثق به.");
-      if (/متوسط/i.test(mood)) tips.push("قسّم يومك لمهام صغيرة واهتم بالأكل والنوم.");
-
-      const seek =
-        "إذا عندك أفكار لإيذاء النفس/انتحار أو انهيار شديد: اطلب مساعدة فورًا (طوارئ/خط دعم).";
-
-      return card({
-        category: "calculators",
-        title: "🧠 نتيجة المزاج",
-        verdict: `مزاجك: **${mood}** — نومك: **${hrs} ساعة**.`,
-        next_question: "تبغى خطة بسيطة لليوم؟",
-        quick_choices: ["نعم", "لا", "🧮 الحاسبات"],
-        tips: tips.length ? tips : ["حافظ على ماء/أكل منتظم + مشي 10 دقائق."],
-        when_to_seek_help: seek,
-      });
+      return plain(`مزاجك: ${mood}\nنومك: ${hrs} ساعة\n${note}`);
     }
   }
 
-  // fallback
   session.calc = null;
-  return calculatorsMenuCard();
-}
-
-// اختيار الحاسبة من نص الزر
-function pickCalcFromChoice(text) {
-  const t = String(text || "");
-  if (/BMI|كتلة الجسم|⚖️/i.test(t)) return "bmi";
-  if (/سعرات|🔥/i.test(t)) return "calories";
-  if (/ماء|💧/i.test(t)) return "water";
-  if (/ضغط|💓/i.test(t)) return "bp";
-  if (/سكر|🩸/i.test(t)) return "sugar";
-  if (/مزاج|🧠/i.test(t)) return "mood";
-  return null;
-}
-
-function isCalculatorsIntent(text) {
-  return /حاسبات|الحاسبات|🧮/i.test(String(text || ""));
+  return calculatorsMenuPlain();
 }
 
 // ===============================
-// LLM (fallback فقط لغير الحاسبات/التقرير)
+// Groq (fallback لغير الحاسبات)
 // ===============================
 function buildSystemPrompt() {
   return `
 أنت "دليل العافية" — مرافق صحي عربي للتثقيف الصحي فقط.
-أخرج JSON فقط:
+أخرج الرد بصيغة JSON فقط وبدون نص خارجها:
 {
- "category":"general|sugar|bp|nutrition|sleep|activity|mental|first_aid|report|emergency",
- "title":"عنوان قصير",
- "verdict":"جملة واحدة",
- "next_question":"سؤال واحد أو \"\"",
- "quick_choices":["..."],
- "tips":["..."],
- "when_to_seek_help":"..."
+  "category": "general|sugar|bp|nutrition|sleep|activity|mental|first_aid|report|emergency",
+  "title": "عنوان قصير",
+  "verdict": "جملة واحدة",
+  "next_question": "سؤال واحد أو \"\"",
+  "quick_choices": ["..."],
+  "tips": ["..."],
+  "when_to_seek_help": "..."
 }
-قواعد: لا تشخيص، لا أدوية، لا جرعات. لغة بسيطة.
+قواعد:
+- لا تشخيص
+- لا أدوية
+- لا جرعات
+- لغة بسيطة
 `.trim();
 }
 
 async function callGroq(messages) {
-  if (!GROQ_API_KEY) throw new Error("Missing GROQ_API_KEY");
-
-  const payload = {
-    model: MODEL_ID,
-    temperature: 0.35,
-    max_tokens: 450,
-    messages,
-    response_format: { type: "json_object" },
-  };
-
-  // محاولة مع response_format ثم بدونها
-  let res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+  const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
     method: "POST",
-    headers: { Authorization: `Bearer ${GROQ_API_KEY}`, "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
+    headers: {
+      Authorization: `Bearer ${GROQ_API_KEY}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      model: GROQ_MODEL,
+      temperature: 0.35,
+      max_tokens: 450,
+      messages,
+      response_format: { type: "json_object" },
+    }),
   });
-
-  if (!res.ok) {
-    const payload2 = { ...payload };
-    delete payload2.response_format;
-    res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
-      method: "POST",
-      headers: { Authorization: `Bearer ${GROQ_API_KEY}`, "Content-Type": "application/json" },
-      body: JSON.stringify(payload2),
-    });
-    if (!res.ok) throw new Error("Groq API error");
-  }
-
+  if (!res.ok) throw new Error("Groq API error");
   const data = await res.json().catch(() => ({}));
-  const txt = data.choices?.[0]?.message?.content || "";
-  return txt;
+  return data.choices?.[0]?.message?.content || "";
 }
 
 function extractJson(text) {
   let s = String(text || "").trim();
   s = s.replace(/^```(?:json)?/i, "").replace(/```$/i, "").trim();
-  try { return JSON.parse(s); } catch {}
+  try {
+    return JSON.parse(s);
+  } catch {}
   const a = s.indexOf("{");
   const b = s.lastIndexOf("}");
   if (a === -1 || b === -1 || b <= a) return null;
-  try { return JSON.parse(s.slice(a, b + 1)); } catch { return null; }
+  try {
+    return JSON.parse(s.slice(a, b + 1));
+  } catch {
+    return null;
+  }
 }
 
 function sanitizeText(v) {
@@ -810,33 +513,38 @@ function normalize(obj) {
   });
 }
 
-function fallbackCard() {
+function fallbackCard(text) {
   return card({
     category: "general",
-    title: "دليل العافية",
-    verdict: "لم أفهم سؤالك بالكامل. اكتب عرضك ومدة الأعراض.",
-    next_question: "ما هو العرض الأساسي؟ وكم له؟",
-    quick_choices: ["🧮 الحاسبات", "📄 افهم تقريرك", "إلغاء"],
+    title: "معلومة صحية",
+    verdict: sanitizeText(text) || "لا تتوفر معلومات كافية.",
+    next_question: "",
+    quick_choices: [],
     tips: [],
-    when_to_seek_help: "إذا ألم صدر/ضيق نفس/إغماء/نزيف شديد: طوارئ فورًا.",
+    when_to_seek_help: "",
   });
 }
 
 // ===============================
-// OCR + Report
+// OCR / Report
 // ===============================
 let ocrWorkerPromise = null;
+
 async function getOcrWorker() {
   if (!createWorker) return null;
   if (!ocrWorkerPromise) {
-    ocrWorkerPromise = (async () => await createWorker("eng+ara"))();
+    ocrWorkerPromise = (async () => {
+      const w = await createWorker("eng+ara");
+      return w;
+    })();
   }
   return ocrWorkerPromise;
 }
-async function ocrImage(buffer) {
-  const w = await getOcrWorker();
-  if (!w) return "";
-  const { data } = await w.recognize(buffer);
+
+async function ocrImageBuffer(buffer) {
+  const worker = await getOcrWorker();
+  if (!worker) return "";
+  const { data } = await worker.recognize(buffer);
   return data?.text ? String(data.text) : "";
 }
 
@@ -844,7 +552,13 @@ async function ocrImage(buffer) {
 // Routes
 // ===============================
 app.get("/", (_req, res) => {
-  res.json({ ok: true, service: "Dalil Alafiyah API", routes: ["/chat", "/report"] });
+  res.json({ ok: true, service: "Dalil Alafiyah API", routes: ["/chat", "/report", "/reset"] });
+});
+
+app.post("/reset", (req, res) => {
+  const userId = getUserId(req);
+  sessions.delete(userId);
+  res.json({ ok: true });
 });
 
 app.post("/chat", async (req, res) => {
@@ -854,60 +568,85 @@ app.post("/chat", async (req, res) => {
   const msg = String(req.body?.message || "").trim();
   if (!msg) return res.status(400).json({ ok: false, error: "empty_message" });
 
-  // ====== تقرير (ثابت) ======
+  // ✅ "افهم تقريرك" (بطاقة مثل قبل)
   if (isReportIntent(msg) && msg.length <= 40) {
     session.calc = null;
     return res.json({ ok: true, data: reportEntryCard() });
   }
 
-  // ====== الحاسبات ======
-  // إذا داخل حاسبة -> تابع الخطوات
+  // ✅ الحاسبات: إذا داخل جلسة حاسبة
   if (session.calc) {
     const out = continueCalc(session, msg);
-    return res.json({ ok: true, data: out || calculatorsMenuCard() });
+    return res.json({ ok: true, data: out || calculatorsMenuPlain() });
   }
 
-  // بدء مسار الحاسبات (قائمة)
+  // ✅ فتح قائمة الحاسبات
   if (isCalculatorsIntent(msg)) {
-    return res.json({ ok: true, data: calculatorsMenuCard() });
+    return res.json({ ok: true, data: calculatorsMenuPlain() });
   }
 
-  // اختيار حاسبة من قائمة
-  const picked = pickCalcFromChoice(msg);
+  // ✅ اختيار مباشر من كلمات المستخدم
+  const picked = pickCalcFromText(msg);
   if (picked) {
     return res.json({ ok: true, data: startCalc(session, picked) });
   }
 
-  // لو المستخدم كتب "حاسبة الضغط" مباشرة
-  if (/حاسبة\s*الضغط/i.test(msg)) return res.json({ ok: true, data: startCalc(session, "bp") });
-  if (/حاسبة\s*السكر/i.test(msg)) return res.json({ ok: true, data: startCalc(session, "sugar") });
-  if (/حاسبة\s*الماء/i.test(msg)) return res.json({ ok: true, data: startCalc(session, "water") });
-  if (/حاسبة\s*السعرات/i.test(msg)) return res.json({ ok: true, data: startCalc(session, "calories") });
-  if (/حاسبة\s*كتلة|حاسبة\s*bmi/i.test(msg)) return res.json({ ok: true, data: startCalc(session, "bmi") });
-  if (/حاسبة\s*المزاج/i.test(msg)) return res.json({ ok: true, data: startCalc(session, "mood") });
+  // ✅ صيغ مباشرة (بدون جلسة)
+  if (/^bmi\b/i.test(msg)) {
+    const w = Number((msg.match(/وزن\s*(\d{2,3})/i) || [])[1]);
+    const h = Number((msg.match(/طول\s*(\d{2,3})/i) || [])[1]);
+    if (!w || !h) return res.json({ ok: true, data: plain("اكتبها مثل: BMI وزن 70 طول 170") });
+    const bmi = Math.round((w / Math.pow(h / 100, 2)) * 10) / 10;
+    let label = "طبيعي";
+    if (bmi < 18.5) label = "نحافة";
+    else if (bmi < 25) label = "طبيعي";
+    else if (bmi < 30) label = "زيادة وزن";
+    else label = "سمنة";
+    return res.json({ ok: true, data: plain(`BMI = ${bmi}\nالتصنيف: ${label}`) });
+  }
 
-  // ====== fallback إلى LLM (فقط لغير الحاسبات) ======
+  // ✅ fallback LLM (لو تبي)
+  if (!GROQ_API_KEY) {
+    // بدون Groq: رجّع بطاقة عامة مختصرة
+    return res.json({
+      ok: true,
+      data: card({
+        category: "general",
+        title: "دليل العافية",
+        verdict: "اكتب سؤالك بشكل أوضح أو استخدم 🧮 الحاسبات.",
+        next_question: "",
+        quick_choices: ["🧮 الحاسبات", "📄 افهم تقريرك"],
+        tips: [],
+        when_to_seek_help: "إذا ألم صدر/ضيق نفس/إغماء/نزيف شديد: طوارئ فورًا.",
+      }),
+    });
+  }
+
   try {
     const raw = await callGroq([
       { role: "system", content: buildSystemPrompt() },
-      { role: "user", content: msg },
+      { role: "user", content: clampText(msg, 1200) },
     ]);
     const parsed = extractJson(raw);
-    const data = parsed ? normalize(parsed) : fallbackCard();
+    const data = parsed ? normalize(parsed) : fallbackCard(raw);
     return res.json({ ok: true, data });
   } catch (e) {
     console.error(e);
-    return res.status(500).json({ ok: false, error: "server_error", data: fallbackCard() });
+    return res.status(500).json({
+      ok: false,
+      error: "server_error",
+      data: fallbackCard("حدث خطأ غير متوقع. راجع الطبيب إذا الأعراض مقلقة."),
+    });
   }
 });
 
 app.post("/report", upload.single("file"), async (req, res) => {
-  try {
-    const file = req.file;
-    if (!file) return res.status(400).json({ ok: false, error: "missing_file" });
+  const file = req.file;
+  if (!file) return res.status(400).json({ ok: false, error: "missing_file" });
 
+  try {
+    let extracted = "";
     const mime = String(file.mimetype || "");
-    let extractedText = "";
 
     if (mime === "application/pdf") {
       if (!pdfParse) {
@@ -916,73 +655,75 @@ app.post("/report", upload.single("file"), async (req, res) => {
           data: card({
             category: "report",
             title: "افهم تقريرك",
-            verdict: "استلمت PDF لكن الخادم لا يدعم قراءة PDF حالياً.",
-            next_question: "هل تقدر تلصق نص التقرير هنا؟",
-            quick_choices: ["ألصق النص", "إلغاء"],
-            tips: ["إذا PDF صورة (scan) الأفضل ترفع صورة واضحة."],
-            when_to_seek_help: "إذا أعراض شديدة: راجع الطبيب/الطوارئ.",
+            verdict: "الخادم لا يدعم قراءة PDF حاليًا. جرّب صورة واضحة للتقرير.",
+            next_question: "",
+            quick_choices: ["📎 إضافة مرفق", "إلغاء"],
+            tips: [],
+            when_to_seek_help: "",
           }),
         });
       }
       const parsed = await pdfParse(file.buffer).catch(() => null);
-      extractedText = (parsed?.text || "").replace(/\s+/g, " ").trim();
+      extracted = parsed?.text ? String(parsed.text) : "";
+      extracted = extracted.replace(/\s+/g, " ").trim();
     } else if (mime.startsWith("image/")) {
-      extractedText = (await ocrImage(file.buffer)).replace(/\s+/g, " ").trim();
+      extracted = await ocrImageBuffer(file.buffer);
+      extracted = extracted.replace(/\s+/g, " ").trim();
     } else {
       return res.status(400).json({ ok: false, error: "unsupported_type" });
     }
 
-    if (!extractedText || extractedText.length < 40) {
+    if (!extracted || extracted.length < 30) {
       return res.json({
         ok: true,
         data: card({
           category: "report",
           title: "افهم تقريرك",
-          verdict: "استلمت الملف لكن ما قدرت أقرأ نص كافي (قد يكون غير واضح).",
-          next_question: "تقدر ترفع صورة أوضح أو تلصق أهم النتائج هنا؟",
-          quick_choices: ["📎 إضافة مرفق", "ألصق النتائج"],
-          tips: ["صوّر النتائج بإضاءة جيدة وبدون قصّ.", "اخفِ البيانات الشخصية إن أمكن."],
-          when_to_seek_help: "إذا أعراض شديدة: راجع الطبيب/الطوارئ.",
+          verdict: "ما قدرت أقرأ نص كافي من الملف. جرّب صورة أوضح.",
+          next_question: "",
+          quick_choices: ["📎 إضافة مرفق", "إلغاء"],
+          tips: ["صور بإضاءة جيدة وبدون انعكاس."],
+          when_to_seek_help: "إذا أعراض شديدة: طوارئ.",
         }),
       });
     }
 
-    // لتقليل التوكنز: قص النص
-    const clipped = extractedText.slice(0, 5000);
-
-    // شرح عام بالـ LLM (اختياري)
+    // لو ما في Groq: رجّع ملخص ثابت
     if (!GROQ_API_KEY) {
       return res.json({
         ok: true,
         data: card({
           category: "report",
           title: "افهم تقريرك",
-          verdict: "تم استخراج نص من التقرير، لكن مفتاح GROQ غير مضبوط لتحليل النص.",
-          next_question: "الصق أهم سطرين من النتائج وسأشرحها بشكل عام.",
-          quick_choices: ["ألصق النتائج", "إلغاء"],
+          verdict:
+            "تم استخراج نص من التقرير، لكن التحليل الذكي غير مفعّل (GROQ_API_KEY غير موجود).",
+          next_question: "الصق أهم سطرين من النتائج هنا وسأشرحها بشكل عام.",
+          quick_choices: [],
           tips: ["لا ترفع بيانات حساسة."],
-          when_to_seek_help: "إذا أعراض شديدة: راجع الطبيب/الطوارئ.",
+          when_to_seek_help: "إذا أعراض شديدة: طوارئ.",
         }),
       });
     }
 
+    const clipped = clampText(extracted, 5000);
+
     const raw = await callGroq([
-      { role: "system", content: `أنت مساعد تثقيف صحي عربي لشرح تقارير التحاليل بشكل عام. ممنوع: تشخيص/أدوية/جرعات. أخرج JSON بنفس مفاتيح البطاقة.` },
-      { role: "user", content: "نص التقرير:\n" + clipped + "\n\nاشرح بشكل عام وباختصار." },
+      {
+        role: "system",
+        content:
+          "أنت مساعد تثقيف صحي عربي لشرح نتائج التحاليل بشكل عام. ممنوع: تشخيص/أدوية/جرعات. أخرج JSON بمفاتيح البطاقة.",
+      },
+      {
+        role: "user",
+        content:
+          "نص التقرير:\n" +
+          clipped +
+          "\n\nاشرح بشكل عام وباختصار + نصائح عامة + متى يراجع الطبيب.",
+      },
     ]);
 
     const parsed = extractJson(raw);
-    const out = parsed
-      ? normalize({ ...parsed, category: "report" })
-      : card({
-          category: "report",
-          title: "افهم تقريرك",
-          verdict: "تعذر تحليل التقرير الآن.",
-          next_question: "جرّب صورة أوضح أو الصق النص.",
-          quick_choices: ["📎 إضافة مرفق", "إلغاء"],
-          tips: ["لا ترفع بيانات حساسة."],
-          when_to_seek_help: "إذا أعراض شديدة: راجع الطبيب/الطوارئ.",
-        });
+    const out = parsed ? normalize({ ...parsed, category: "report" }) : fallbackCard(raw);
 
     return res.json({ ok: true, data: out });
   } catch (e) {
@@ -993,11 +734,11 @@ app.post("/report", upload.single("file"), async (req, res) => {
       data: card({
         category: "report",
         title: "افهم تقريرك",
-        verdict: "تعذر تحليل التقرير الآن.",
-        next_question: "جرّب صورة أوضح أو الصق النص.",
+        verdict: "تعذر تحليل التقرير الآن. جرّب صورة أوضح أو الصق النص.",
+        next_question: "",
         quick_choices: ["📎 إضافة مرفق", "إلغاء"],
         tips: [],
-        when_to_seek_help: "إذا أعراض شديدة: راجع الطبيب/الطوارئ.",
+        when_to_seek_help: "",
       }),
     });
   }

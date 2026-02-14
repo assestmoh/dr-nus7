@@ -24,6 +24,9 @@ const app = express();
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
 const MODEL_ID = process.env.GROQ_MODEL || "openai/gpt-oss-120b";
 const PORT = process.env.PORT || 3000;
+const BUDGET_MODE = process.env.BUDGET_MODE === "true";
+const MAX_TOKENS = Number(process.env.MAX_TOKENS || 520);
+const LOW_TEMP_MODE = process.env.LOW_TEMP_MODE === "true";
 
 if (!GROQ_API_KEY) {
   console.error("❌ GROQ_API_KEY غير مضبوط");
@@ -274,8 +277,9 @@ async function callGroq(messages) {
       },
       body: JSON.stringify({
         model: MODEL_ID,
-        temperature: 0.35,
-        max_tokens: 520,
+temperature: LOW_TEMP_MODE ? 0.2 : 0.35,
+max_tokens: MAX_TOKENS,
+
         messages,
       }),
     },

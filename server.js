@@ -1,7 +1,7 @@
 // ===============================
 // server.js — Dalil Alafiyah API
 // دمج تحسينات الجودة + منع الأكواد + Retry واحد + تمرير السياق
-// (بدون تغيير الواجهة/الفكرة)
+// + Partial Recovery عند فشل JSON (بدون تغيير الواجهة/الفكرة)
 // ===============================
 
 import "dotenv/config";
@@ -131,6 +131,66 @@ function extractVerdictLoosely(raw) {
   return "";
 }
 
+/**
+ * ✅ Partial Recovery
+ * إذا رجع النموذج JSON مقطوع/غير مكتمل، نحاول نلقط أهم الحقول ونبني بطاقة منظمة.
+ * (يمنع ظهور رسالة fallback العامة كثيرًا)
+ */
+function recoverPartialCard(raw) {
+  const s = String(raw || "");
+
+  const pick = (re) => {
+    const m = s.match(re);
+    return m && m[1] ? m[1].replace(/\\"/g, '"').trim() : "";
+  };
+
+  const category =
+    pick(/"category"\s*:\s*"([^"]+)"/) ||
+    pick(/\\"category\\"\s*:\s*\\"([^\\]+)\\"/);
+
+  const title =
+    pick(/"title"\s*:\s*"([^"]+)"/) ||
+    pick(/\\"title\\"\s*:\s*\\"([^\\]+)\\"/);
+
+  const verdict =
+    pick(/"verdict"\s*:\s*"([^"]+)"/) ||
+    pick(/\\"verdict\\"\s*:\s*\\"([^\\]+)\\"/);
+
+  const next_question =
+    pick(/"next_question"\s*:\s*"([^"]*)"/) ||
+    pick(/\\"next_question\\"\s*:\s*\\"([^\\]*)\\"/);
+
+  const when_to_seek_help =
+    pick(/"when_to_seek_help"\s*:\s*"([^"]*)"/) ||
+    pick(/\\"when_to_seek_help\\"\s*:\s*\\"([^\\]*)\\"/);
+
+  const arrPick = (key) => {
+    const m = s.match(new RegExp(`"${key}"\\s*:\\s*\\[([\\s\\S]*?)\\]`));
+    const inner = m && m[1] ? m[1] : "";
+    if (!inner) return [];
+    return inner
+      .split(",")
+      .map((x) => x.trim())
+      .map((x) => x.replace(/^"+|"+$/g, "").replace(/\\"/g, '"'))
+      .filter((x) => x);
+  };
+
+  const quick_choices = arrPick("quick_choices").slice(0, 2);
+  const tips = arrPick("tips").slice(0, 2);
+
+  if (!title && !verdict && tips.length === 0 && !next_question) return null;
+
+  return {
+    category: category || "general",
+    title: title || "دليل العافية",
+    verdict: verdict || "",
+    next_question: next_question || "",
+    quick_choices,
+    tips,
+    when_to_seek_help: when_to_seek_help || "",
+  };
+}
+
 const sStr = (v) => (typeof v === "string" ? v.trim() : "");
 const sArr = (v, n) =>
   Array.isArray(v)
@@ -204,7 +264,6 @@ async function callGroq(messages) {
 function normalize(obj) {
   let cat = sStr(obj?.category) || "general";
 
-  // mapping شائع من النماذج/التاريخ القديم
   if (cat === "blood_pressure") cat = "bp";
   if (cat === "bloodpressure") cat = "bp";
   if (cat === "nutrition") cat = "nutrition";
@@ -238,8 +297,7 @@ function normalize(obj) {
 }
 
 /**
- * fallback سابقًا كان يسرب raw داخل verdict -> سبب ظهور الأكواد
- * الآن: لا نسرب raw للمستخدم. نحاول نلتقط verdict فقط، وإلا رسالة عامة.
+ * fallback: لا نسرب raw للمستخدم (منع ظهور الأكواد)
  */
 function fallback(rawText) {
   const looseVerdict = extractVerdictLoosely(rawText);
@@ -268,7 +326,7 @@ app.post("/chat", async (req, res) => {
       return res.status(400).json({ ok: false, error: "empty_message" });
     }
 
-    // ✅ تمرير سياق آخر بطاقة من الواجهة (بدون تغيير الواجهة)
+    // ✅ تمرير سياق آخر بطاقة من الواجهة
     const lastCard = req.body?.context?.last || null;
 
     const messages = [{ role: "system", content: buildSystemPrompt() }];
@@ -287,10 +345,11 @@ app.post("/chat", async (req, res) => {
     const raw = await callGroq(messages);
 
     let parsed = extractJson(raw);
+    let retryRaw = "";
 
     // ✅ Retry مرة واحدة فقط إذا فشل parsing
     if (!parsed) {
-      const retryRaw = await callGroq([
+      retryRaw = await callGroq([
         { role: "system", content: buildSystemPrompt() },
         {
           role: "user",
@@ -304,7 +363,14 @@ app.post("/chat", async (req, res) => {
       parsed = extractJson(retryRaw);
     }
 
-    const data = parsed ? normalize(parsed) : fallback(raw);
+    // ✅ Partial Recovery إذا فشل JSON حتى بعد retry
+    let data;
+    if (parsed) {
+      data = normalize(parsed);
+    } else {
+      const recovered = recoverPartialCard(retryRaw || raw);
+      data = recovered ? normalize(recovered) : fallback(raw);
+    }
 
     res.json({ ok: true, data });
   } catch (e) {

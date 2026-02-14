@@ -40,13 +40,32 @@ async function fetchWithTimeout(url, options = {}, ms = 15000) {
   }
 }
 
+/**
+ * لب المشكلة:
+ * أحيانًا النموذج يرجّع JSON "شبه صحيح" مثل:
+ * - trailing comma:  "title":"...",   }  أو ]  قبل الإغلاق
+ * - اقتباسات ذكية “ ” بدل "
+ * هذا يجعل JSON.parse يفشل → فتدخلون fallback → ويظهر الرد كنص/كود.
+ * الحل: تنظيف النص قبل JSON.parse.
+ */
+function cleanJsonish(s) {
+  return String(s || "")
+    // تحويل الاقتباسات الذكية إلى عادية
+    .replace(/[“”]/g, '"')
+    .replace(/[‘’]/g, "'")
+    // إزالة الفواصل الزائدة قبل إغلاق } أو ]
+    .replace(/,\s*([}\]])/g, "$1");
+}
+
 function extractJson(text) {
   const s = String(text || "");
   const a = s.indexOf("{");
   const b = s.lastIndexOf("}");
   if (a === -1 || b === -1 || b <= a) return null;
+
+  const chunk = cleanJsonish(s.slice(a, b + 1));
   try {
-    return JSON.parse(s.slice(a, b + 1));
+    return JSON.parse(chunk);
   } catch {
     return null;
   }
@@ -54,7 +73,9 @@ function extractJson(text) {
 
 const sStr = (v) => (typeof v === "string" ? v.trim() : "");
 const sArr = (v, n) =>
-  Array.isArray(v) ? v.filter(x => typeof x === "string" && x.trim()).slice(0, n) : [];
+  Array.isArray(v)
+    ? v.filter((x) => typeof x === "string" && x.trim()).slice(0, n)
+    : [];
 
 // ===============================
 // System Prompt
@@ -63,16 +84,17 @@ function buildSystemPrompt() {
   return `
 أنت "دليل العافية" — مرافق صحي عربي للتثقيف الصحي فقط.
 
-أخرج الرد بصيغة JSON فقط وبدون أي نص خارجها:
+أخرج الرد بصيغة JSON فقط وبدون أي نص خارجها.
+مهم: يجب أن يكون JSON صالحًا strict (بدون trailing commas وبدون Markdown وبدون \`\`\`).
 
 {
   "category": "general | sugar | blood_pressure | nutrition | sleep | activity | mental | first_aid | report | emergency",
   "title": "عنوان قصير (2-5 كلمات)",
   "verdict": "جملة واحدة: تطمين أو تنبيه",
-  "next_question": "سؤال واحد فقط (أو \"\")",
+  "next_question": "سؤال واحد فقط (أو \\"\\")",
   "quick_choices": ["خيار 1","خيار 2"],
   "tips": ["نصيحة قصيرة 1","نصيحة قصيرة 2"],
-  "when_to_seek_help": "متى تراجع الطبيب أو الطوارئ (أو \"\")"
+  "when_to_seek_help": "متى تراجع الطبيب أو الطوارئ (أو \\"\\")"
 }
 
 قواعد:
@@ -104,6 +126,7 @@ async function callGroq(messages) {
       }),
     }
   );
+
   if (!res.ok) throw new Error("Groq API error");
   const data = await res.json();
   return data.choices?.[0]?.message?.content || "";

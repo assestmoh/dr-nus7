@@ -7,6 +7,12 @@
 // 4) Retry واحد فقط عند فشل الـ JSON (بدون طلب "إصلاح JSON" لتجنب ردود تقنية)
 // 5) حجب البطاقات التقنية (Meta about JSON/format)
 // 6) تحسين جودة الإرشاد عبر Prompt أدق + حقائق مستخرجة من رسائل الحاسبات
+//
+// + (تعديلات توفير التوكن - 4 نقاط):
+// A) رد محلي للـ small-talk
+// B) خفض max_tokens
+// C) Slim lastCard context
+// D) Retry فقط إذا يستاهل
 // ===============================
 
 import "dotenv/config";
@@ -220,6 +226,58 @@ const sArr = (v, n) =>
     : [];
 
 // ===============================
+// (تعديل 1) Small-talk local response (بدون Groq)
+// ===============================
+function isSmallTalk(msg) {
+  const t = String(msg || "").trim().toLowerCase();
+  const small = [
+    "هلا",
+    "مرحبا",
+    "السلام عليكم",
+    "وعليكم السلام",
+    "تمام",
+    "طيب",
+    "اوك",
+    "ok",
+    "شكرا",
+    "شكرًا",
+    "يعطيك العافيه",
+    "يعطيك العافية",
+    "اهلا",
+    "أهلا",
+    "hello",
+    "hi",
+  ];
+  if (t.length <= 2) return true;
+  if (t.length <= 4 && /^[a-z]+$/i.test(t)) return true;
+  return small.some((w) => t === w || t.includes(w));
+}
+
+function smallTalkCard() {
+  return {
+    category: "general",
+    title: "دليل العافية",
+    verdict: "هلا 👋 اكتب سؤالك مباشرة أو اختر موضوع من الأزرار.",
+    next_question: "وش تبي تفحص؟",
+    quick_choices: ["سكر", "ضغط"],
+    tips: ["إذا عندك رقم ارسله مباشرة (مثال: سكر صائم 90).", "إذا عندك تقرير، الصق نصّه هنا."],
+    when_to_seek_help: "",
+  };
+}
+
+// ===============================
+// (تعديل 4) Retry gate: هل يستاهل نعيد الطلب؟
+// ===============================
+function shouldRetry(raw) {
+  const s = String(raw || "");
+  if (!s.includes("{") || !s.includes("}")) return false; // ما فيه محاولة JSON أصلاً
+  // إذا فيه مؤشرات أنه حاول JSON لكنه انكسر
+  if (s.includes("```")) return true;
+  if (s.length > 40) return true;
+  return true;
+}
+
+// ===============================
 // System Prompt (محسّن للجودة)
 // ===============================
 function buildSystemPrompt() {
@@ -275,7 +333,10 @@ async function callGroq(messages) {
       body: JSON.stringify({
         model: MODEL_ID,
         temperature: 0.35,
-        max_tokens: 520,
+        // ===============================
+        // (تعديل 2) خفض max_tokens لتوفير التوكن
+        // ===============================
+        max_tokens: 280,
         messages,
       }),
     },
@@ -353,8 +414,9 @@ function extractFactsFromUserMessage(msg) {
   const t = String(msg || "");
 
   // سكر
-  // يدعم صيغ: "القيمة: 60", "60 mg/dL", "60 ملغ/ديسيلتر"
-  const sugarMatch = t.match(/(?:القيمة\s*:\s*|\b)(\d{2,3})(?:\s*(?:mg\/dL|ملغ\/ديسيلتر|ملغ))?/i);
+  const sugarMatch = t.match(
+    /(?:القيمة\s*:\s*|\b)(\d{2,3})(?:\s*(?:mg\/dL|ملغ\/ديسيلتر|ملغ))?/i
+  );
 
   // نوع السكر
   const isFasting = /نوع\s*القياس\s*:\s*صائم|\bصائم\b/i.test(t);
@@ -405,17 +467,37 @@ app.post("/chat", async (req, res) => {
     const msg = String(req.body.message || "").trim();
     if (!msg) return res.status(400).json({ ok: false, error: "empty_message" });
 
+    // ===============================
+    // (تعديل 1) رد محلي للـ small-talk لتوفير التوكن
+    // ===============================
+    if (isSmallTalk(msg)) {
+      return res.json({ ok: true, data: smallTalkCard() });
+    }
+
     const lastCard = req.body?.context?.last || null;
 
     const messages = [{ role: "system", content: buildSystemPrompt() }];
 
-    // تمرير سياق آخر بطاقة من الواجهة (بدون تغيير الواجهة)
-    if (lastCard && typeof lastCard === "object") {
+    // ===============================
+    // (تعديل 3) Slim lastCard context لتقليل التوكن
+    // ===============================
+    const slimLast =
+      lastCard && typeof lastCard === "object"
+        ? {
+            category: lastCard.category,
+            title: lastCard.title,
+            verdict: lastCard.verdict,
+            next_question: lastCard.next_question,
+            quick_choices: lastCard.quick_choices,
+          }
+        : null;
+
+    if (slimLast) {
       messages.push({
         role: "assistant",
         content:
-          "سياق سابق (آخر بطاقة JSON للاستمرار عليها بدون تكرار):\n" +
-          JSON.stringify(lastCard),
+          "سياق سابق (آخر بطاقة مختصرة للاستمرار عليها بدون تكرار):\n" +
+          JSON.stringify(slimLast),
       });
     }
 
@@ -434,9 +516,9 @@ app.post("/chat", async (req, res) => {
     const raw = await callGroq(messages);
     let parsed = extractJson(raw);
 
-    // 2) retry واحد فقط (بدون "إصلاح JSON")
+    // 2) retry واحد فقط إذا "يستاهل"
     let retryRaw = "";
-    if (!parsed) {
+    if (!parsed && shouldRetry(raw)) {
       retryRaw = await callGroq(messages);
       parsed = extractJson(retryRaw);
     }
@@ -459,9 +541,9 @@ app.post("/chat", async (req, res) => {
     // 5) emergency number sanity (سلطنة عمان)
     if (data.category === "emergency") {
       const all = `${data.title} ${data.verdict} ${data.when_to_seek_help} ${data.next_question} ${(data.tips || []).join(" ")}`;
-      // لو ذكر 911 أو أرقام عامة، استبدل برسالة صحيحة
       if (/\b911\b/.test(all) || /\b112\b/.test(all)) {
-        data.verdict = "في سلطنة عُمان: اتصل بالطوارئ على 9999، ولخدمات الإسعاف/الدفاع المدني يمكن 24343666 كبديل.";
+        data.verdict =
+          "في سلطنة عُمان: اتصل بالطوارئ على 9999، ولخدمات الإسعاف/الدفاع المدني يمكن 24343666 كبديل.";
         data.title = data.title && data.title !== "دليل العافية" ? data.title : "رقم الطوارئ";
         data.next_question = "هل الحالة الآن طارئة (إغماء/صعوبة تنفس/ألم صدر/تشنجات)؟";
         data.quick_choices = ["نعم", "لا"];

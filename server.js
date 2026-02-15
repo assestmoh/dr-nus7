@@ -11,8 +11,21 @@ import cors from "cors";
 import bodyParser from "body-parser";
 import fetch from "node-fetch";
 import helmet from "helmet";
+import multer from "multer";
+import { createRequire } from "module";
+import { createWorker } from "tesseract.js";
+import path from "path";
+import { fileURLToPath } from "url";
 
 const app = express();
+
+// ===== Report deps (pdf-parse) =====
+const require = createRequire(import.meta.url);
+const pdfParse = require("pdf-parse");
+const upload = multer({ limits: { fileSize: 8 * 1024 * 1024 } });
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 // ===============================
 // ENV
@@ -29,6 +42,41 @@ if (!GROQ_API_KEY) {
 app.use(helmet());
 app.use(cors());
 app.use(bodyParser.json({ limit: "2mb" }));
+// ===============================
+// Sessions (ذاكرة بسيطة)
+// ===============================
+const sessions = new Map(); // userId -> { lastCard }
+function getUserId(req){
+  return String(req.header("x-user-id") || "anon");
+}
+function getSession(req){
+  const id = getUserId(req);
+  if (!sessions.has(id)) sessions.set(id, { lastCard: null });
+  return sessions.get(id);
+}
+
+// ===============================
+// OCR Worker (eng+ara)
+// ===============================
+let ocrWorkerPromise = null;
+async function getOcrWorker(){
+  if (!ocrWorkerPromise){
+    ocrWorkerPromise = (async () => {
+      const worker = await createWorker();
+      await worker.load();
+      await worker.loadLanguage("eng+ara");
+      await worker.initialize("eng+ara");
+      return worker;
+    })();
+  }
+  return ocrWorkerPromise;
+}
+async function ocrImageBuffer(buffer){
+  const worker = await getOcrWorker();
+  const { data } = await worker.recognize(buffer);
+  return (data && data.text) ? String(data.text) : "";
+}
+
 
 // ===============================
 // Helpers
@@ -228,6 +276,29 @@ general | nutrition | bp | sugar | sleep | activity | mental | first_aid | repor
   "when_to_seek_help": "متى تراجع الطبيب/الطوارئ (أو \\"\\")"
 }
 
+function buildReportSystemPrompt() {
+          return `
+أنت "دليل العافية" — مساعد عربي لشرح نتائج التقارير/التحاليل بشكل تثقيفي فقط (ليس تشخيصًا).
+مخرجاتك: JSON صالح strict فقط (بدون أي نص خارج JSON، بدون Markdown، بدون \`\`\`).
+
+نفس شكل JSON تمامًا:
+{
+  "category": "report",
+  "title": "عنوان محدد (2-5 كلمات)",
+  "verdict": "خلاصة مبسطة ومطمّنة لما يعنيه التقرير",
+  "next_question": "سؤال واحد لاستكمال الفهم (أو \"\")",
+  "quick_choices": ["خيار 1","خيار 2"] أو [],
+  "tips": ["نصيحة قصيرة 1","نصيحة قصيرة 2"] أو [],
+  "when_to_seek_help": "متى تراجع الطبيب/الطوارئ (أو \"\")"
+}
+
+قواعد:
+- لا تشخيص، لا أدوية، لا جرعات.
+- إذا النص غير واضح/ناقص: قل ذلك بوضوح واطلب صورة أوضح أو نصًا أدق.
+- إذا ظهرت مؤشرات طوارئ (ألم صدر شديد/ضيق نفس شديد/إغماء/نزيف شديد): وجّه للطوارئ فورًا.
+`.trim();
+        }
+
 قواعد:
 - التزم بالموضوع ولا تغيّر المسار بلا سبب.
 - إذا كانت الرسالة قصيرة مثل "نعم/لا" أو اختيار، اعتبرها إجابة لسؤال البطاقة السابقة وكمل بنفس المسار.
@@ -320,6 +391,79 @@ function fallback(rawText) {
 app.get("/", (_req, res) => {
   res.json({ ok: true, service: "Dalil Alafiyah API" });
 });
+app.post("/reset", (req, res) => {
+  const userId = getUserId(req);
+  sessions.delete(userId);
+  res.json({ ok: true });
+});
+
+// تنزيل/معلومات الدليل (اختياري)
+app.get("/guide", (_req, res) => {
+  res.json({ ok: true, install: "pwa" });
+});
+
+// Report: upload image/pdf
+app.post("/report", upload.single("file"), async (req, res) => {
+  const session = getSession(req);
+  const file = req.file;
+
+  if (!file) return res.status(400).json({ ok: false, error: "missing_file" });
+
+  try{
+    let extracted = "";
+
+    if (file.mimetype === "application/pdf") {
+      const parsed = await pdfParse(file.buffer).catch(() => null);
+      extracted = parsed?.text ? String(parsed.text) : "";
+      extracted = extracted.replace(/\s+/g, " ").trim();
+      if (extracted.length < 40){
+        return res.json({
+          ok: false,
+          error: "pdf_no_text",
+          message: "هذا PDF يبدو ممسوح (Scan) ولا يحتوي نصًا قابلًا للنسخ. ارفع صورة واضحة للتقرير أو الصق النص."
+        });
+      }
+    } else if (file.mimetype && file.mimetype.startsWith("image/")) {
+      extracted = await ocrImageBuffer(file.buffer);
+      extracted = extracted.replace(/\s+/g, " ").trim();
+      if (extracted.length < 25){
+        return res.json({
+          ok: false,
+          error: "ocr_failed",
+          message: "الصورة لم تُقرأ بوضوح. حاول صورة أوضح (بدون قص شديد/مع إضاءة أفضل)."
+        });
+      }
+    } else {
+      return res.status(400).json({ ok: false, error: "unsupported_type" });
+    }
+
+    const messages = [
+      { role: "system", content: buildReportSystemPrompt() },
+      { role: "user", content: "هذا نص مستخرج من تقرير/تحاليل (قد يكون بالإنجليزية):\n" + extracted + "\n\nاشرحه بالعربية بشكل مطمّن وبسيط، مع نصائح عامة ومتى يراجع الطبيب." }
+    ];
+
+    const raw = await callGroq(messages);
+    let parsed = extractJson(raw);
+    if (!parsed){
+      const retryRaw = await callGroq(messages);
+      parsed = extractJson(retryRaw);
+    }
+
+    let data = parsed ? normalize(parsed) : fallback(raw);
+    data.category = "report";
+
+    session.lastCard = data;
+    return res.json({ ok: true, data });
+  } catch(e){
+    console.error(e);
+    return res.status(200).json({
+      ok: false,
+      error: "report_error",
+      message: "تعذر تحليل التقرير الآن. جرّب صورة أوضح أو الصق النص."
+    });
+  }
+});
+
 
 app.post("/chat", async (req, res) => {
   try {
@@ -328,7 +472,8 @@ app.post("/chat", async (req, res) => {
       return res.status(400).json({ ok: false, error: "empty_message" });
     }
 
-    const lastCard = req.body?.context?.last || null;
+    const session = getSession(req);
+    const lastCard = req.body?.context?.last || session.lastCard || null;
 
     const messages = [{ role: "system", content: buildSystemPrompt() }];
 
@@ -369,6 +514,7 @@ app.post("/chat", async (req, res) => {
       data = recovered ? normalize(recovered) : fallback(raw);
     }
 
+    session.lastCard = data;
     res.json({ ok: true, data });
   } catch (e) {
     console.error(e);

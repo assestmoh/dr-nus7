@@ -3,6 +3,9 @@
 // Stable: context pass + strict JSON parsing + partial recovery
 // + retry re-ask (NOT "fix JSON") to avoid meta technical replies
 // + prevent code/JSON leakage to UI
+// + block "action claims" (booking/app-like confirmations)
+// + block off-scope drift (non-health topics)
+// + lastCard moved to SYSTEM to reduce role-play drift
 // ===============================
 
 import "dotenv/config";
@@ -197,6 +200,47 @@ function isMetaJsonAnswer(d) {
   );
 }
 
+/**
+ * منع أسلوب "تطبيق" / ادّعاء تنفيذ (حجز/تأكيد/إرسال/إنشاء..)
+ */
+function isActionClaim(d) {
+  const text =
+    String(d?.title || "") +
+    " " +
+    String(d?.verdict || "") +
+    " " +
+    String(d?.next_question || "") +
+    " " +
+    String(d?.when_to_seek_help || "") +
+    " " +
+    (Array.isArray(d?.tips) ? d.tips.join(" ") : "") +
+    " " +
+    (Array.isArray(d?.quick_choices) ? d.quick_choices.join(" ") : "");
+
+  return /(تم\s*(الحجز|التأكيد|التاكيد|الإرسال|الارسال|الإنشاء|انشاء|فتح|تسجيل)|حجزت\s*لك|أكدت\s*لك|اكدت\s*لك|سأقوم\s*ب|ساقوم\s*ب|تم\s*جدولة|موعدك\s*تم|تذكير\s*تم|تم\s*إضافة|تم\s*اضافة)/i.test(
+    text
+  );
+}
+
+/**
+ * منع الانحراف لمواضيع غير التثقيف الصحي
+ * (فلتر خفيف: إذا ظهر كلام واضح خارج الصحة داخل البطاقة)
+ */
+function looksOffScope(d) {
+  const text =
+    String(d?.title || "") +
+    " " +
+    String(d?.verdict || "") +
+    " " +
+    String(d?.next_question || "") +
+    " " +
+    (Array.isArray(d?.tips) ? d.tips.join(" ") : "");
+
+  return /(برمجة|سيرفر|node|express|api|endpoint|قاعدة بيانات|داتا|شبكات|سياسة|انتخابات|دين|فتوى|استثمار|سوق|شراء|تسوق|متجر|سعر|مباراة|فيلم|مسلسل)/i.test(
+    text
+  );
+}
+
 const sStr = (v) => (typeof v === "string" ? v.trim() : "");
 const sArr = (v, n) =>
   Array.isArray(v)
@@ -214,6 +258,11 @@ function buildSystemPrompt() {
 ممنوع الردود العامة مثل: "أنا هنا لمساعدتك". كن محددًا ومباشرًا.
 ممنوع ذكر JSON أو التنسيق أو الفواصل أو الاقتباسات أو "تم تنسيق الإجابة". ركّز فقط على النصائح الصحية.
 
+مهم جدًا:
+- ممنوع تمامًا ادّعاء تنفيذ أي إجراء في العالم الحقيقي: (حجز/موعد/تأكيد/إرسال/فتح تذكرة/تم/سأقوم الآن/حجزت لك).
+- أنت محادثة تثقيف صحي فقط. أي طلب خارج التثقيف الصحي (حجز موعد، دعم فني، سياسة، دين، برمجة، تسوق...) → أعد بطاقة category="general" تشرح أنه خارج النطاق وتطلب سؤالًا صحيًا محددًا.
+- لا تستخدم كلمات توحي بتنفيذ: "تم الحجز" "تم التأكيد" "تم إنشاء" "تم الإرسال" "سجّلت" "حجزت".
+
 التصنيفات المسموحة فقط (طابقها حرفيًا):
 general | nutrition | bp | sugar | sleep | activity | mental | first_aid | report | emergency | water | calories | bmi
 
@@ -229,7 +278,8 @@ general | nutrition | bp | sugar | sleep | activity | mental | first_aid | repor
 }
 
 قواعد:
-- التزم بالموضوع ولا تغيّر المسار بلا سبب.
+- التزم بالتثقيف الصحي فقط ولا تغيّر المسار بلا سبب.
+- إذا لم يكن السؤال صحيًا/عافية/نمط حياة/إسعاف أولي → لا تجاوب محتواه، فقط أعد توجيهه لسؤال صحي.
 - إذا كانت الرسالة قصيرة مثل "نعم/لا" أو اختيار، اعتبرها إجابة لسؤال البطاقة السابقة وكمل بنفس المسار.
 - quick_choices: 0 أو 2 فقط وتطابق next_question.
 - لا أدوية/لا جرعات/لا تشخيص.
@@ -250,7 +300,7 @@ async function callGroq(messages) {
       },
       body: JSON.stringify({
         model: MODEL_ID,
-        temperature: 0.35,
+        temperature: 0.2, // كان 0.35 — خفضناها لتقليل الانحراف
         max_tokens: 520,
         messages,
       }),
@@ -314,6 +364,30 @@ function fallback(rawText) {
   };
 }
 
+function makeOffScopeCard() {
+  return {
+    category: "general",
+    title: "خارج النطاق",
+    verdict: "أقدر أساعدك بالتثقيف الصحي فقط. اكتب سؤالك الصحي مباشرة وباختصار.",
+    next_question: "هل سؤالك عن أعراض، نوم، تغذية، نشاط، أو إسعافات أولية؟",
+    quick_choices: ["أعراض", "نمط حياة"],
+    tips: ["اذكر العمر/الجنس/مدة الأعراض إن وجدت.", "اكتب هدفك أو عرضك بجملة واحدة."],
+    when_to_seek_help: "",
+  };
+}
+
+function makeNoActionCard() {
+  return {
+    category: "general",
+    title: "توضيح سريع",
+    verdict: "أنا محادثة تثقيف صحي فقط ولا أنفّذ حجوزات أو إجراءات. اسألني سؤالًا صحيًا مباشرًا.",
+    next_question: "وش الموضوع الصحي اللي تبغى نركز عليه الآن؟",
+    quick_choices: ["نوم", "تغذية"],
+    tips: ["مثال: أرق منذ أسبوع.", "أو: كيف أوازن وجباتي؟"],
+    when_to_seek_help: "",
+  };
+}
+
 // ===============================
 // Routes
 // ===============================
@@ -332,9 +406,10 @@ app.post("/chat", async (req, res) => {
 
     const messages = [{ role: "system", content: buildSystemPrompt() }];
 
+    // مهم: نقل سياق آخر بطاقة إلى system لتقليل "role-play" والانحراف
     if (lastCard && typeof lastCard === "object") {
       messages.push({
-        role: "assistant",
+        role: "system",
         content:
           "سياق سابق (آخر بطاقة JSON للاستمرار عليها بدون تكرار):\n" +
           JSON.stringify(lastCard),
@@ -367,6 +442,16 @@ app.post("/chat", async (req, res) => {
     if (isMetaJsonAnswer(data)) {
       const recovered = recoverPartialCard(retryRaw || raw);
       data = recovered ? normalize(recovered) : fallback(raw);
+    }
+
+    // 4.5) block "action claims" (appointment/app-like confirmations)
+    if (isActionClaim(data)) {
+      data = makeNoActionCard();
+    }
+
+    // 4.7) block off-scope drift (non-health topics)
+    if (looksOffScope(data) && data.category !== "report") {
+      data = makeOffScopeCard();
     }
 
     res.json({ ok: true, data });

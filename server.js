@@ -4,7 +4,7 @@
 // + retry re-ask (NOT "fix JSON") to avoid meta technical replies
 // + prevent code/JSON leakage to UI
 // + block "action claims" (booking/app-like confirmations)
-// + block off-scope drift (non-health topics)
+// + early off-scope block based on USER message (fixes false "خارج النطاق")
 // + lastCard moved to SYSTEM to reduce role-play drift
 // ===============================
 
@@ -222,30 +222,52 @@ function isActionClaim(d) {
   );
 }
 
-/**
- * منع الانحراف لمواضيع غير التثقيف الصحي
- * (فلتر خفيف: إذا ظهر كلام واضح خارج الصحة داخل البطاقة)
- */
-function looksOffScope(d) {
-  const text =
-    String(d?.title || "") +
-    " " +
-    String(d?.verdict || "") +
-    " " +
-    String(d?.next_question || "") +
-    " " +
-    (Array.isArray(d?.tips) ? d.tips.join(" ") : "");
-
-  return /(برمجة|سيرفر|node|express|api|endpoint|قاعدة بيانات|داتا|شبكات|سياسة|انتخابات|دين|فتوى|استثمار|سوق|شراء|تسوق|متجر|سعر|مباراة|فيلم|مسلسل)/i.test(
-    text
-  );
-}
-
 const sStr = (v) => (typeof v === "string" ? v.trim() : "");
 const sArr = (v, n) =>
   Array.isArray(v)
     ? v.filter((x) => typeof x === "string" && x.trim()).slice(0, n)
     : [];
+
+// ===============================
+// Cards
+// ===============================
+function makeOffScopeCard() {
+  return {
+    category: "general",
+    title: "خارج النطاق",
+    verdict: "أقدر أساعدك بالتثقيف الصحي فقط. اكتب سؤالك الصحي مباشرة وباختصار.",
+    next_question: "هل سؤالك عن أعراض، نوم، تغذية، نشاط، أو إسعافات أولية؟",
+    quick_choices: ["أعراض", "نمط حياة"],
+    tips: ["اذكر العمر/الجنس/مدة الأعراض إن وجدت.", "اكتب هدفك أو عرضك بجملة واحدة."],
+    when_to_seek_help: "",
+  };
+}
+
+function makeNoActionCard() {
+  return {
+    category: "general",
+    title: "توضيح سريع",
+    verdict: "أنا محادثة تثقيف صحي فقط ولا أنفّذ حجوزات أو إجراءات. اسألني سؤالًا صحيًا مباشرًا.",
+    next_question: "وش الموضوع الصحي اللي تبغى نركز عليه الآن؟",
+    quick_choices: ["نوم", "تغذية"],
+    tips: ["مثال: أرق منذ أسبوع.", "أو: كيف أوازن وجباتي؟"],
+    when_to_seek_help: "",
+  };
+}
+
+/**
+ * فلترة خارج النطاق بناءً على رسالة المستخدم (قبل استدعاء النموذج)
+ * مع استثناء الردود القصيرة المتوقعة داخل المسار (نعم/لا/1/2/3/خفيف/متوسط/عالي)
+ */
+function userLooksOffScope(msg) {
+  const s = String(msg || "").trim();
+
+  if (/^(نعم|لا|1|2|3|خفيف|متوسط|عالي)$/i.test(s)) return false;
+
+  return /(برمجة|سيرفر|node|express|api|endpoint|قاعدة بيانات|داتا|شبكات|سياسة|انتخابات|دين|فتوى|استثمار|سوق|شراء|تسوق|متجر|سعر|مباراة|فيلم|مسلسل)/i.test(
+    s
+  );
+}
 
 // ===============================
 // System Prompt
@@ -364,30 +386,6 @@ function fallback(rawText) {
   };
 }
 
-function makeOffScopeCard() {
-  return {
-    category: "general",
-    title: "خارج النطاق",
-    verdict: "أقدر أساعدك بالتثقيف الصحي فقط. اكتب سؤالك الصحي مباشرة وباختصار.",
-    next_question: "هل سؤالك عن أعراض، نوم، تغذية، نشاط، أو إسعافات أولية؟",
-    quick_choices: ["أعراض", "نمط حياة"],
-    tips: ["اذكر العمر/الجنس/مدة الأعراض إن وجدت.", "اكتب هدفك أو عرضك بجملة واحدة."],
-    when_to_seek_help: "",
-  };
-}
-
-function makeNoActionCard() {
-  return {
-    category: "general",
-    title: "توضيح سريع",
-    verdict: "أنا محادثة تثقيف صحي فقط ولا أنفّذ حجوزات أو إجراءات. اسألني سؤالًا صحيًا مباشرًا.",
-    next_question: "وش الموضوع الصحي اللي تبغى نركز عليه الآن؟",
-    quick_choices: ["نوم", "تغذية"],
-    tips: ["مثال: أرق منذ أسبوع.", "أو: كيف أوازن وجباتي؟"],
-    when_to_seek_help: "",
-  };
-}
-
 // ===============================
 // Routes
 // ===============================
@@ -400,6 +398,11 @@ app.post("/chat", async (req, res) => {
     const msg = String(req.body.message || "").trim();
     if (!msg) {
       return res.status(400).json({ ok: false, error: "empty_message" });
+    }
+
+    // ✅ block off-scope user messages early (fixes false "خارج النطاق")
+    if (userLooksOffScope(msg)) {
+      return res.json({ ok: true, data: makeOffScopeCard() });
     }
 
     const lastCard = req.body?.context?.last || null;
@@ -447,11 +450,6 @@ app.post("/chat", async (req, res) => {
     // 4.5) block "action claims" (appointment/app-like confirmations)
     if (isActionClaim(data)) {
       data = makeNoActionCard();
-    }
-
-    // 4.7) block off-scope drift (non-health topics)
-    if (looksOffScope(data) && data.category !== "report") {
-      data = makeOffScopeCard();
     }
 
     res.json({ ok: true, data });

@@ -3,10 +3,6 @@
 // Stable: context pass + strict JSON parsing + partial recovery
 // + retry re-ask (NOT "fix JSON") to avoid meta technical replies
 // + prevent code/JSON leakage to UI
-// + block "action claims" (booking/app-like confirmations)
-// + early off-scope block based on USER message (robust; ignores short replies)
-// + deterministic local handling for Calories flow (fixes "نعم" => خارج النطاق 100%)
-// + lastCard moved to SYSTEM to reduce role-play drift
 // ===============================
 
 import "dotenv/config";
@@ -201,108 +197,11 @@ function isMetaJsonAnswer(d) {
   );
 }
 
-/**
- * منع أسلوب "تطبيق" / ادّعاء تنفيذ (حجز/تأكيد/إرسال/إنشاء..)
- */
-function isActionClaim(d) {
-  const text =
-    String(d?.title || "") +
-    " " +
-    String(d?.verdict || "") +
-    " " +
-    String(d?.next_question || "") +
-    " " +
-    String(d?.when_to_seek_help || "") +
-    " " +
-    (Array.isArray(d?.tips) ? d.tips.join(" ") : "") +
-    " " +
-    (Array.isArray(d?.quick_choices) ? d.quick_choices.join(" ") : "");
-
-  return /(تم\s*(الحجز|التأكيد|التاكيد|الإرسال|الارسال|الإنشاء|انشاء|فتح|تسجيل)|حجزت\s*لك|أكدت\s*لك|اكدت\s*لك|سأقوم\s*ب|ساقوم\s*ب|تم\s*جدولة|موعدك\s*تم|تذكير\s*تم|تم\s*إضافة|تم\s*اضافة)/i.test(
-    text
-  );
-}
-
 const sStr = (v) => (typeof v === "string" ? v.trim() : "");
 const sArr = (v, n) =>
   Array.isArray(v)
     ? v.filter((x) => typeof x === "string" && x.trim()).slice(0, n)
     : [];
-
-// ===============================
-// Cards
-// ===============================
-function makeOffScopeCard() {
-  return {
-    category: "general",
-    title: "خارج النطاق",
-    verdict: "أقدر أساعدك بالتثقيف الصحي فقط. اكتب سؤالك الصحي مباشرة وباختصار.",
-    next_question: "هل سؤالك عن أعراض، نوم، تغذية، نشاط، أو إسعافات أولية؟",
-    quick_choices: ["أعراض", "نمط حياة"],
-    tips: ["اذكر العمر/الجنس/مدة الأعراض إن وجدت.", "اكتب هدفك أو عرضك بجملة واحدة."],
-    when_to_seek_help: "",
-  };
-}
-
-function makeNoActionCard() {
-  return {
-    category: "general",
-    title: "توضيح سريع",
-    verdict: "أنا محادثة تثقيف صحي فقط ولا أنفّذ حجوزات أو إجراءات. اسألني سؤالًا صحيًا مباشرًا.",
-    next_question: "وش الموضوع الصحي اللي تبغى نركز عليه الآن؟",
-    quick_choices: ["نوم", "تغذية"],
-    tips: ["مثال: أرق منذ أسبوع.", "أو: كيف أوازن وجباتي؟"],
-    when_to_seek_help: "",
-  };
-}
-
-// ✅ مسار محلي للسعرات عند سؤال "هل تريد نصائح حول حاسبة السعرات؟"
-function makeCaloriesTipsCard() {
-  return {
-    category: "calories",
-    title: "نصائح للسعرات",
-    verdict: "تمام—هذه قواعد بسيطة تجعل تقدير السعرات أدق وأسهل للالتزام.",
-    next_question: "هل هدفك تنحيف ولا تثبيت ولا زيادة وزن؟",
-    quick_choices: ["تنحيف", "تثبيت"],
-    tips: [
-      "عدّل الرقم ±200 سعرة لمدة أسبوع ثم راقب الوزن/المحيط.",
-      "قسّم البروتين خلال اليوم واهتم بالألياف والماء لتقليل الجوع.",
-    ],
-    when_to_seek_help: "",
-  };
-}
-
-function makeCaloriesNoTipsCard() {
-  return {
-    category: "calories",
-    title: "تمام",
-    verdict: "ممتاز—نقدر نكمل بتحديد هدفك وتقسيم السعرات على وجبات إذا تحب.",
-    next_question: "هل هدفك تنحيف ولا تثبيت ولا زيادة وزن؟",
-    quick_choices: ["تنحيف", "تثبيت"],
-    tips: [
-      "الالتزام أهم من الدقة المطلقة—اختر رقم تقدر تعيش عليه.",
-      "راقب المتوسط الأسبوعي بدل يوم واحد.",
-    ],
-    when_to_seek_help: "",
-  };
-}
-
-/**
- * فلترة خارج النطاق بناءً على رسالة المستخدم (قبل استدعاء النموذج)
- * ✅ ملاحظة: أي رسالة قصيرة جدًا (مثل نعم/لا/2) نعتبرها داخل المسار دائمًا.
- */
-function userLooksOffScope(msg) {
-  const s = String(msg || "").trim();
-
-  // ✅ أي رد قصير اعتبره داخل السياق (يمنع false-positive)
-  if (s.length <= 6) return false;
-
-  if (/^(نعم|لا|1|2|3|خفيف|متوسط|عالي)$/i.test(s)) return false;
-
-  return /(برمجة|سيرفر|node|express|api|endpoint|قاعدة بيانات|داتا|شبكات|سياسة|انتخابات|دين|فتوى|استثمار|سوق|شراء|تسوق|متجر|سعر|مباراة|فيلم|مسلسل)/i.test(
-    s
-  );
-}
 
 // ===============================
 // System Prompt
@@ -314,12 +213,6 @@ function buildSystemPrompt() {
 مخرجاتك: JSON صالح strict فقط (بدون أي نص خارج JSON، بدون Markdown، بدون \`\`\`، بدون trailing commas).
 ممنوع الردود العامة مثل: "أنا هنا لمساعدتك". كن محددًا ومباشرًا.
 ممنوع ذكر JSON أو التنسيق أو الفواصل أو الاقتباسات أو "تم تنسيق الإجابة". ركّز فقط على النصائح الصحية.
-
-مهم جدًا:
-- ممنوع تمامًا ادّعاء تنفيذ أي إجراء في العالم الحقيقي: (حجز/موعد/تأكيد/إرسال/فتح تذكرة/تم/سأقوم الآن/حجزت لك).
-- أنت محادثة تثقيف صحي فقط. أي طلب خارج التثقيف الصحي (حجز موعد، دعم فني، سياسة، دين، برمجة، تسوق...) → أعد بطاقة category="general" تشرح أنه خارج النطاق وتطلب سؤالًا صحيًا محددًا.
-- لا تستخدم كلمات توحي بتنفيذ: "تم الحجز" "تم التأكيد" "تم إنشاء" "تم الإرسال" "سجّلت" "حجزت".
-- حاسبة السعرات/الوزن/BMI/الماء/النشاط/النوم كلها ضمن التثقيف الصحي.
 
 التصنيفات المسموحة فقط (طابقها حرفيًا):
 general | nutrition | bp | sugar | sleep | activity | mental | first_aid | report | emergency | water | calories | bmi
@@ -336,8 +229,7 @@ general | nutrition | bp | sugar | sleep | activity | mental | first_aid | repor
 }
 
 قواعد:
-- التزم بالتثقيف الصحي فقط ولا تغيّر المسار بلا سبب.
-- إذا لم يكن السؤال صحيًا/عافية/نمط حياة/إسعاف أولي → لا تجاوب محتواه، فقط أعد توجيهه لسؤال صحي.
+- التزم بالموضوع ولا تغيّر المسار بلا سبب.
 - إذا كانت الرسالة قصيرة مثل "نعم/لا" أو اختيار، اعتبرها إجابة لسؤال البطاقة السابقة وكمل بنفس المسار.
 - quick_choices: 0 أو 2 فقط وتطابق next_question.
 - لا أدوية/لا جرعات/لا تشخيص.
@@ -358,7 +250,7 @@ async function callGroq(messages) {
       },
       body: JSON.stringify({
         model: MODEL_ID,
-        temperature: 0.2, // كان 0.35 — خفضناها لتقليل الانحراف
+        temperature: 0.35,
         max_tokens: 520,
         messages,
       }),
@@ -436,37 +328,13 @@ app.post("/chat", async (req, res) => {
       return res.status(400).json({ ok: false, error: "empty_message" });
     }
 
-    // ✅ block off-scope user messages early (robust)
-    if (userLooksOffScope(msg)) {
-      return res.json({ ok: true, data: makeOffScopeCard() });
-    }
-
     const lastCard = req.body?.context?.last || null;
-
-    // ✅ deterministic local continuation for Calories "tips" question
-    if (lastCard && typeof lastCard === "object") {
-      const lastCat = String(lastCard.category || "").trim();
-      const lastQ = String(lastCard.next_question || "");
-
-      const isCaloriesTrack = lastCat === "calories" || lastCat === "nutrition";
-      const isTipsQuestion =
-        /نصائح\s*حول\s*حاسبة\s*السعرات/i.test(lastQ) ||
-        /حاسبة\s*السعرات/i.test(lastQ);
-
-      if (isCaloriesTrack && isTipsQuestion && /^(نعم|لا)$/i.test(msg)) {
-        return res.json({
-          ok: true,
-          data: /^نعم$/i.test(msg) ? makeCaloriesTipsCard() : makeCaloriesNoTipsCard(),
-        });
-      }
-    }
 
     const messages = [{ role: "system", content: buildSystemPrompt() }];
 
-    // مهم: نقل سياق آخر بطاقة إلى system لتقليل "role-play" والانحراف
     if (lastCard && typeof lastCard === "object") {
       messages.push({
-        role: "system",
+        role: "assistant",
         content:
           "سياق سابق (آخر بطاقة JSON للاستمرار عليها بدون تكرار):\n" +
           JSON.stringify(lastCard),
@@ -499,11 +367,6 @@ app.post("/chat", async (req, res) => {
     if (isMetaJsonAnswer(data)) {
       const recovered = recoverPartialCard(retryRaw || raw);
       data = recovered ? normalize(recovered) : fallback(raw);
-    }
-
-    // 4.5) block "action claims" (appointment/app-like confirmations)
-    if (isActionClaim(data)) {
-      data = makeNoActionCard();
     }
 
     res.json({ ok: true, data });

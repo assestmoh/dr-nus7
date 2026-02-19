@@ -4,7 +4,8 @@
 // + retry re-ask (NOT "fix JSON") to avoid meta technical replies
 // + prevent code/JSON leakage to UI
 // + block "action claims" (booking/app-like confirmations)
-// + early off-scope block based on USER message (fixes false "خارج النطاق")
+// + early off-scope block based on USER message (robust; ignores short replies)
+// + deterministic local handling for Calories flow (fixes "نعم" => خارج النطاق 100%)
 // + lastCard moved to SYSTEM to reduce role-play drift
 // ===============================
 
@@ -255,12 +256,46 @@ function makeNoActionCard() {
   };
 }
 
+// ✅ مسار محلي للسعرات عند سؤال "هل تريد نصائح حول حاسبة السعرات؟"
+function makeCaloriesTipsCard() {
+  return {
+    category: "calories",
+    title: "نصائح للسعرات",
+    verdict: "تمام—هذه قواعد بسيطة تجعل تقدير السعرات أدق وأسهل للالتزام.",
+    next_question: "هل هدفك تنحيف ولا تثبيت ولا زيادة وزن؟",
+    quick_choices: ["تنحيف", "تثبيت"],
+    tips: [
+      "عدّل الرقم ±200 سعرة لمدة أسبوع ثم راقب الوزن/المحيط.",
+      "قسّم البروتين خلال اليوم واهتم بالألياف والماء لتقليل الجوع.",
+    ],
+    when_to_seek_help: "",
+  };
+}
+
+function makeCaloriesNoTipsCard() {
+  return {
+    category: "calories",
+    title: "تمام",
+    verdict: "ممتاز—نقدر نكمل بتحديد هدفك وتقسيم السعرات على وجبات إذا تحب.",
+    next_question: "هل هدفك تنحيف ولا تثبيت ولا زيادة وزن؟",
+    quick_choices: ["تنحيف", "تثبيت"],
+    tips: [
+      "الالتزام أهم من الدقة المطلقة—اختر رقم تقدر تعيش عليه.",
+      "راقب المتوسط الأسبوعي بدل يوم واحد.",
+    ],
+    when_to_seek_help: "",
+  };
+}
+
 /**
  * فلترة خارج النطاق بناءً على رسالة المستخدم (قبل استدعاء النموذج)
- * مع استثناء الردود القصيرة المتوقعة داخل المسار (نعم/لا/1/2/3/خفيف/متوسط/عالي)
+ * ✅ ملاحظة: أي رسالة قصيرة جدًا (مثل نعم/لا/2) نعتبرها داخل المسار دائمًا.
  */
 function userLooksOffScope(msg) {
   const s = String(msg || "").trim();
+
+  // ✅ أي رد قصير اعتبره داخل السياق (يمنع false-positive)
+  if (s.length <= 6) return false;
 
   if (/^(نعم|لا|1|2|3|خفيف|متوسط|عالي)$/i.test(s)) return false;
 
@@ -284,6 +319,7 @@ function buildSystemPrompt() {
 - ممنوع تمامًا ادّعاء تنفيذ أي إجراء في العالم الحقيقي: (حجز/موعد/تأكيد/إرسال/فتح تذكرة/تم/سأقوم الآن/حجزت لك).
 - أنت محادثة تثقيف صحي فقط. أي طلب خارج التثقيف الصحي (حجز موعد، دعم فني، سياسة، دين، برمجة، تسوق...) → أعد بطاقة category="general" تشرح أنه خارج النطاق وتطلب سؤالًا صحيًا محددًا.
 - لا تستخدم كلمات توحي بتنفيذ: "تم الحجز" "تم التأكيد" "تم إنشاء" "تم الإرسال" "سجّلت" "حجزت".
+- حاسبة السعرات/الوزن/BMI/الماء/النشاط/النوم كلها ضمن التثقيف الصحي.
 
 التصنيفات المسموحة فقط (طابقها حرفيًا):
 general | nutrition | bp | sugar | sleep | activity | mental | first_aid | report | emergency | water | calories | bmi
@@ -400,12 +436,30 @@ app.post("/chat", async (req, res) => {
       return res.status(400).json({ ok: false, error: "empty_message" });
     }
 
-    // ✅ block off-scope user messages early (fixes false "خارج النطاق")
+    // ✅ block off-scope user messages early (robust)
     if (userLooksOffScope(msg)) {
       return res.json({ ok: true, data: makeOffScopeCard() });
     }
 
     const lastCard = req.body?.context?.last || null;
+
+    // ✅ deterministic local continuation for Calories "tips" question
+    if (lastCard && typeof lastCard === "object") {
+      const lastCat = String(lastCard.category || "").trim();
+      const lastQ = String(lastCard.next_question || "");
+
+      const isCaloriesTrack = lastCat === "calories" || lastCat === "nutrition";
+      const isTipsQuestion =
+        /نصائح\s*حول\s*حاسبة\s*السعرات/i.test(lastQ) ||
+        /حاسبة\s*السعرات/i.test(lastQ);
+
+      if (isCaloriesTrack && isTipsQuestion && /^(نعم|لا)$/i.test(msg)) {
+        return res.json({
+          ok: true,
+          data: /^نعم$/i.test(msg) ? makeCaloriesTipsCard() : makeCaloriesNoTipsCard(),
+        });
+      }
+    }
 
     const messages = [{ role: "system", content: buildSystemPrompt() }];
 

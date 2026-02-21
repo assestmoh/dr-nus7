@@ -801,18 +801,92 @@ app.post("/chat", chatLimiter, async (req, res) => {
 
     const lastCard = req.body?.context?.last || null;
 
-    // 1) quick_choices → تفريعات محلية فقط
+    // 1) quick_choices → تفريعات محلية أولًا، وإن لم نجد تفريعًا: نستخدم الذكاء (إن كان مفعّلًا) لإكمال نفس الموضوع
     if (isChoice && lastCard && typeof lastCard === "object") {
       const follow = handleChoiceFollowup(msg, lastCard);
       if (follow) return res.json({ ok: true, data: follow });
 
+      // ✅ إذا لم يوجد تفريع محلي للزر: نكمّل بنفس الموضوع عبر AI (بدون أسئلة "تفاصيل أكثر")
+      if (AI_FALLBACK_ENABLED && GROQ_API_KEY) {
+        const system = buildSystemPrompt();
+
+        const lastTitle = String(lastCard?.title || "دليل العافية");
+        const lastVerdict = String(lastCard?.verdict || "");
+        const lastCat = String(lastCard?.category || "general");
+
+        const messages = [
+          { role: "system", content: system },
+          {
+            role: "assistant",
+            content:
+              "آخر بطاقة (للاستمرار عليها):
+" + JSON.stringify(lastCard),
+          },
+          {
+            role: "user",
+            content:
+              `المستخدم اختار زر: "${msg}".
+` +
+              `تابع نفس الموضوع فقط ولا تغيّر السياق.
+` +
+              `اكتب بطاقة واحدة مرتبطة مباشرة بعنوان: ${lastTitle}.
+` +
+              `اجعل الرد عمليًا ومحددًا وخفيفًا (بدون طلب تفاصيل إضافية إلا إذا لزم).
+` +
+              `استخدم نفس التصنيف إن أمكن: ${lastCat}.
+` +
+              `السياق السابق (مختصر): ${lastVerdict}`,
+          },
+        ];
+
+        try {
+          const raw = await callGroq(messages);
+          let parsed = extractJson(raw);
+
+          let retryRaw = "";
+          if (!parsed) {
+            retryRaw = await callGroq(messages);
+            parsed = extractJson(retryRaw);
+          }
+
+          let data;
+          if (parsed) data = normalize(parsed);
+          else data = normalize(recoverPartialCard(retryRaw || raw) || fallback(raw));
+
+          if (isMetaJsonAnswer(data)) data = normalize(recoverPartialCard(retryRaw || raw) || fallback(raw));
+          if (!data.verdict && (!data.tips || data.tips.length === 0)) data = fallback("");
+
+          // تثبيت العنوان إذا خرج بعيد
+          if (!String(data.title || "").trim()) data.title = lastTitle;
+
+          return res.json({ ok: true, data });
+        } catch {
+          // إذا فشل AI: نرجع بطاقة محلية مرتبطة بالسياق (بدون "تم استلام اختيارك")
+          return res.json({
+            ok: true,
+            data: card({
+              category: lastCat || "general",
+              title: lastTitle,
+              verdict: `اخترت: "${msg}". اكتب سطر واحد يوضح وضعك/هدفك لأعطيك إرشادًا أدق ضمن نفس الموضوع.`,
+              tips: ["مثال: كم مرة في الأسبوع؟ ما البديل المتاح لديك؟"],
+              next_question: "",
+              quick_choices: [],
+              when_to_seek_help: "",
+            }),
+          });
+        }
+      }
+
+      // إذا الذكاء غير مفعّل: رد محلي مرتبط بالموضوع (بدون "تم استلام اختيارك")
+      const lastTitle = String(lastCard?.title || "متابعة");
+      const lastCat = String(lastCard?.category || "general");
       return res.json({
         ok: true,
         data: card({
-          category: "general",
-          title: "متابعة",
-          verdict: "تم استلام اختيارك. اكتب تفاصيل أكثر لأعطيك إرشادًا أدق.",
-          tips: ["مثال: (العمر/المدة/الأعراض/هل يوجد مرض مزمن؟)."],
+          category: lastCat,
+          title: lastTitle,
+          verdict: `اخترت: "${msg}". اكتب سطر واحد يوضح وضعك/هدفك لأعطيك إرشادًا أدق ضمن نفس الموضوع.`,
+          tips: ["مثال: كم مرة في الأسبوع؟ ما البديل المتاح لديك؟"],
           next_question: "",
           quick_choices: [],
           when_to_seek_help: "",

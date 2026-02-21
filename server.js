@@ -861,17 +861,23 @@ app.post("/chat", chatLimiter, async (req, res) => {
 
           return res.json({ ok: true, data });
         } catch {
-          // إذا فشل AI: نرجع بطاقة محلية مرتبطة بالسياق (بدون "تم استلام اختيارك")
+          // إذا فشل AI: نرجع بطاقة متابعة مرتبطة بنفس الموضوع (بدون أي رسالة عامة مزعجة)
+          const lastTitle = String(lastCard?.title || "متابعة");
+          const lastCat = String(lastCard?.category || "general");
           return res.json({
             ok: true,
             data: card({
-              category: lastCat || "general",
-              title: lastTitle,
-              verdict: `اخترت: "${msg}". اكتب سطر واحد يوضح وضعك/هدفك لأعطيك إرشادًا أدق ضمن نفس الموضوع.`,
-              tips: ["مثال: كم مرة في الأسبوع؟ ما البديل المتاح لديك؟"],
-              next_question: "",
-              quick_choices: [],
-              when_to_seek_help: "",
+              category: lastCat,
+              title: lastTitle + " — متابعة",
+              verdict: `بالنسبة لاختيارك "${msg}": استمر في الإرشادات السابقة وراقب التحسّن خلال الساعات القادمة.`,
+              tips: [
+                "قدّم سوائل بكميات صغيرة ومتكررة حسب الحالة.",
+                "راقب أي تدهور مفاجئ أو أعراض جديدة."
+              ],
+              next_question: "هل توجد علامات تعب شديد أو جفاف الآن؟",
+              quick_choices: ["نعم", "لا"],
+              when_to_seek_help:
+                "إذا ظهرت علامات خطر (خمول شديد/جفاف/صعوبة تنفس/تشنجات): توجّه للطوارئ فورًا."
             }),
           });
         }

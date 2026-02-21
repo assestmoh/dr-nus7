@@ -1,13 +1,18 @@
-// server.js — Dalil Alafiyah API (Local Quick Paths + AI only when needed)
-// ✅ لا تغيير على واجهة front-end: نفس /chat و/ reset و/ health ونفس JSON structure المتوقعة من app.js
-// ✅ "المسارات السريعة" (المحفوظة في app.js) تُجاب محليًا 100% بدون ذكاء
-// ✅ داخل كل مسار: بطاقات + أسئلة سريعة + quick_choices (تفريعات محلية)
-// ✅ الاتصال بالذكاء فقط عندما السؤال خارج المعرفة المحلية
+// server.js — Dalil Alafiyah API (Local-first + AI continuation)
+// ✅ نفس /chat و /reset و /health ونفس JSON structure المتوقعة من app.js
+// ✅ Local-first: المسارات السريعة + أغلب البطاقات محليًا (بدون AI)
+// ✅ إذا انتهى التفريع المحلي (زر/اختيار بدون تفريع) → AI يكمل نفس الموضوع مباشرة (إن كان مفعّلًا)
+// ✅ لا نُرجع أبدًا رسالة عامة مثل: "لا توجد معلومة محلية مطابقة الآن"
 //
-// ملاحظات سلامة:
-// - محتوى تثقيفي عام فقط (ليس تشخيصًا).
-// - بدون أدوية/جرعات/وصفات.
-// - نذكر "متى تراجع الطبيب/الطوارئ" بشكل واضح.
+// تشغيل:
+// - npm start
+// إعدادات بيئة مهمة:
+// - GROQ_API_KEY=...
+// - AI_FALLBACK_ENABLED=1   (أو 0 لتعطيل الذكاء نهائيًا)
+// - MAX_TOKENS=220
+// - TEMPERATURE=0.25
+// - RATE_LIMIT_PER_MIN=30
+// - ALLOWED_ORIGINS=https://alafya.netlify.app,http://localhost:8000
 
 import "dotenv/config";
 import express from "express";
@@ -23,14 +28,12 @@ const GROQ_API_KEY = process.env.GROQ_API_KEY || "";
 const MODEL_ID = process.env.GROQ_MODEL || "openai/gpt-oss-120b";
 const PORT = process.env.PORT || 3000;
 
-// السماح بالذكاء كـ fallback فقط (افتراضي: ON إذا يوجد مفتاح)
 const AI_FALLBACK_ENABLED =
   (process.env.AI_FALLBACK_ENABLED || (GROQ_API_KEY ? "1" : "0")) === "1";
 
 const MAX_TOKENS = Number(process.env.MAX_TOKENS || 220);
 const TEMP = Number(process.env.TEMPERATURE || 0.25);
 
-// CORS allowlist (comma-separated). إذا فارغ: dev/any origin
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || "")
   .split(",")
   .map((s) => s.trim())
@@ -61,7 +64,7 @@ const chatLimiter = rateLimit({
   keyGenerator: (req) => String(req.headers["x-user-id"] || req.ip),
 });
 
-// ---------- helpers ----------
+// ---------------- helpers ----------------
 async function fetchWithTimeout(url, options = {}, ms = 15000) {
   const controller = new AbortController();
   const id = setTimeout(() => controller.abort(), ms);
@@ -110,14 +113,14 @@ function extractJson(text) {
 function extractVerdictLoosely(raw) {
   const s = String(raw || "");
   const m = s.match(/"verdict"\s*:\s*"([^"]+)"/);
-  return m?.[1]?.replace(/\\\"/g, '"').trim() || "";
+  return m?.[1]?.replace(/\\"/g, '"').trim() || "";
 }
 
 function recoverPartialCard(raw) {
   const s = String(raw || "");
   const pick = (re) => {
     const m = s.match(re);
-    return m?.[1] ? m[1].replace(/\\\"/g, '"').trim() : "";
+    return m?.[1] ? m[1].replace(/\\"/g, '"').trim() : "";
   };
 
   const category = pick(/"category"\s*:\s*"([^"]+)"/) || "general";
@@ -133,7 +136,7 @@ function recoverPartialCard(raw) {
     return inner
       .split(",")
       .map((x) => x.trim())
-      .map((x) => x.replace(/^"+|"+$/g, "").replace(/\\\"/g, '"'))
+      .map((x) => x.replace(/^"+|"+$/g, "").replace(/\\"/g, '"'))
       .filter(Boolean)
       .slice(0, limit);
   };
@@ -157,7 +160,6 @@ function isMetaJsonAnswer(d) {
     (Array.isArray(d?.tips) ? d.tips.join(" ") : "") +
     " " +
     (Array.isArray(d?.quick_choices) ? d.quick_choices.join(" ") : "");
-
   return /json|format|schema|اقتباس|فواصل|تنسيق/i.test(text);
 }
 
@@ -211,7 +213,7 @@ function normalizeText(s) {
     .trim();
 }
 
-// ---------- Local Knowledge Base ----------
+// -------- Local KB (polished) --------
 const KB = {
   general_home: card({
     category: "general",
@@ -226,8 +228,12 @@ const KB = {
   path_lifestyle: card({
     category: "general",
     title: "نمط الحياة الصحي",
-    verdict: "نمط حياة صحي = ثلاث ركائز: **طبق متوازن** + **حركة يومية** + **نوم منتظم**. نبدأ بخطوة صغيرة قابلة للاستمرار.",
-    tips: ["اختر تغييرًا واحدًا اليوم وطبّقه 7 أيام.", "خفّض السكر والملح تدريجيًا لتثبيت العادة (نهج موصى به في الإرشادات الغذائية)."],
+    verdict:
+      "نمط حياة صحي = ثلاث ركائز: **طبق متوازن** + **حركة يومية** + **نوم منتظم**. نبدأ بخطوة صغيرة قابلة للاستمرار.",
+    tips: [
+      "اختر تغييرًا واحدًا اليوم وطبّقه 7 أيام.",
+      "خفّض السكر والملح تدريجيًا لتثبيت العادة (نهج موصى به في الإرشادات الغذائية).",
+    ],
     next_question: "تريد تبدأ من أي محور؟",
     quick_choices: ["التغذية", "النشاط"],
     when_to_seek_help: "إذا لديك مرض مزمن أو أعراض مستمرة، راجع مركزًا صحيًا لوضع خطة تناسب حالتك.",
@@ -280,8 +286,7 @@ const KB = {
     tips: ["راقب التبول/جفاف الفم/الخمول.", "خفف الملابس واجعل المكان معتدل."],
     next_question: "منذ متى بدأت الحرارة؟",
     quick_choices: ["أقل من 24 ساعة", "أكثر من 24 ساعة"],
-    when_to_seek_help:
-      "طوارئ/طبيب فورًا عند: خمول شديد، صعوبة تنفس، تشنجات، جفاف واضح، أو تدهور سريع.",
+    when_to_seek_help: "طوارئ/طبيب فورًا عند: خمول شديد، صعوبة تنفس، تشنجات، جفاف واضح، أو تدهور سريع.",
   }),
 
   child_diarrhea_u5: card({
@@ -426,13 +431,18 @@ function handleChoiceFollowup(choiceRaw, lastCard) {
   const choice = String(choiceRaw || "").trim();
   const lastTitle = String(lastCard?.title || "").trim();
 
+  // lifestyle
   if (lastTitle.includes("نمط الحياة")) {
     if (choice.includes("التغذية"))
       return card({
         category: "nutrition",
         title: "الغذاء المتوازن",
         verdict: "هدفنا اليوم: **طبق متوازن** مع خفض تدريجي للسكر/الملح. ركّز على الجودة لا الحرمان.",
-        tips: ["نصف الطبق خضار/فواكه (تنويع الألوان أفضل).", "أضف بروتينًا مناسبًا + حبوبًا كاملة.", "اختر الماء بدل المشروبات المُحلّاة قدر الإمكان."],
+        tips: [
+          "نصف الطبق خضار/فواكه (تنويع الألوان أفضل).",
+          "أضف بروتينًا مناسبًا + حبوبًا كاملة.",
+          "اختر الماء بدل المشروبات المُحلّاة قدر الإمكان.",
+        ],
         next_question: "ما الأولوية هذا الأسبوع؟",
         quick_choices: ["تقليل السكر", "تقليل الملح"],
         when_to_seek_help: "إذا لديك مرض مزمن، راجع مختصًا لتوصيات مناسبة. (مرجع: الإرشادات الغذائية العُمانية – وزارة الصحة)",
@@ -449,7 +459,7 @@ function handleChoiceFollowup(choiceRaw, lastCard) {
       });
   }
 
-  // nutrition followups: (حتى لا تظهر بطاقة "متابعة" بعد اختيار تقليل السكر/الملح)
+  // nutrition followups
   if (lastTitle.includes("الغذاء المتوازن")) {
     if (choice.includes("تقليل السكر")) {
       return card({
@@ -483,7 +493,7 @@ function handleChoiceFollowup(choiceRaw, lastCard) {
     }
   }
 
-
+  // women
   if (lastTitle.includes("صحة النساء")) {
     if (choice.includes("تغذية")) return KB.path_lifestyle;
     if (choice.includes("فحوصات"))
@@ -498,6 +508,7 @@ function handleChoiceFollowup(choiceRaw, lastCard) {
       });
   }
 
+  // children
   if (lastTitle.includes("صحة الأطفال")) {
     if (choice.includes("أقل")) return KB.child_u5;
     if (choice.includes("5+")) return KB.child_5p;
@@ -506,12 +517,41 @@ function handleChoiceFollowup(choiceRaw, lastCard) {
     if (choice.includes("حرارة")) return KB.child_fever_u5;
     if (choice.includes("إسهال")) return KB.child_diarrhea_u5;
   }
+  if (lastTitle.includes("إسهال عند طفل")) {
+    if (choice.includes("قيء")) {
+      return card({
+        category: "general",
+        title: "إسهال مع قيء متكرر عند طفل (<5)",
+        verdict:
+          "استمر في إعطاء سوائل صغيرة ومتكررة (ماء/محلول رطوبة فموي) وراقب علامات الجفاف. قدّم كميات قليلة كل 5–10 دقائق بدل كمية كبيرة دفعة واحدة.",
+        tips: [
+          "إذا كان يرضع: استمر على الرضاعة.",
+          "راقب الجفاف: قلة البول/جفاف الفم/خمول/انعدام الدموع.",
+        ],
+        next_question: "هل ظهر حمى أعلى من 38°C أو تغيّر في الوعي؟",
+        quick_choices: ["حمى مرتفعة", "تغير الوعي"],
+        when_to_seek_help:
+          "راجع الطبيب/الطوارئ عند: جفاف واضح، قيء يمنع الشرب، دم بالبراز، خمول شديد، أو صعوبة تنفس.",
+      });
+    }
+    if (choice.includes("دم")) {
+      return card({
+        category: "general",
+        title: "إسهال مع دم/لون أسود (<5)",
+        verdict: "وجود دم أو لون أسود في البراز يحتاج تقييمًا طبيًا عاجلًا.",
+        tips: ["حافظ على السوائل قدر الإمكان.", "لا تُعطِ أدوية بدون استشارة."],
+        next_question: "هل الطفل خامل جدًا أو لديه جفاف؟",
+        quick_choices: ["نعم", "لا"],
+        when_to_seek_help: "توجّه للطوارئ/الطبيب فورًا.",
+      });
+    }
+  }
 
+  // elderly
   if (lastTitle.includes("صحة المسنين")) {
     if (choice.includes("السقوط")) return KB.elderly_falls;
     if (choice.includes("التغذية")) return KB.path_lifestyle;
   }
-
   if (lastTitle.includes("الوقاية من السقوط")) {
     if (choice === "نعم") {
       return card({
@@ -524,8 +564,7 @@ function handleChoiceFollowup(choiceRaw, lastCard) {
         ],
         next_question: "هل كان السقوط بسبب دوخة أم تعثر؟",
         quick_choices: ["دوخة", "تعثر"],
-        when_to_seek_help:
-          "إذا تكرر السقوط أو وُجد إغماء/دوخة شديدة: يلزم تقييم طبي. (مرجع: إجراءات منع السقوط – وزارة الصحة)",
+        when_to_seek_help: "إذا تكرر السقوط أو وُجد إغماء/دوخة شديدة: يلزم تقييم طبي.",
       });
     }
     if (choice === "لا") {
@@ -533,19 +572,15 @@ function handleChoiceFollowup(choiceRaw, lastCard) {
         category: "general",
         title: "وقاية استباقية",
         verdict: "ممتاز. الوقاية قبل حدوث السقوط أفضل: ثبّت البيئة الآمنة وادعم التوازن.",
-        tips: [
-          "تمارين توازن خفيفة (حسب القدرة) + مشي منتظم.",
-          "حافظ على الإضاءة وإزالة العوائق بشكل دائم.",
-        ],
+        tips: ["تمارين توازن خفيفة (حسب القدرة) + مشي منتظم.", "حافظ على الإضاءة وإزالة العوائق بشكل دائم."],
         next_question: "هل يوجد دوخة متكررة؟",
         quick_choices: ["نعم", "لا"],
-        when_to_seek_help:
-          "دوخة شديدة/إغماء/ضعف مفاجئ: طوارئ أو تقييم عاجل.",
+        when_to_seek_help: "دوخة شديدة/إغماء/ضعف مفاجئ: طوارئ أو تقييم عاجل.",
       });
     }
   }
 
-
+  // adolescents
   if (lastTitle.includes("صحة اليافعين")) {
     if (choice.includes("النوم"))
       return card({
@@ -560,6 +595,7 @@ function handleChoiceFollowup(choiceRaw, lastCard) {
     if (choice.includes("التغذية")) return KB.path_lifestyle;
   }
 
+  // mental
   if (lastTitle.includes("الصحة النفسية")) {
     if (choice.includes("القلق")) return KB.mental_anxiety;
     if (choice.includes("النوم"))
@@ -574,6 +610,7 @@ function handleChoiceFollowup(choiceRaw, lastCard) {
       });
   }
 
+  // ncd
   if (lastTitle.includes("الأمراض غير المعدية")) {
     if (choice.includes("الضغط"))
       return card({
@@ -597,6 +634,7 @@ function handleChoiceFollowup(choiceRaw, lastCard) {
       });
   }
 
+  // infection
   if (lastTitle.includes("مكافحة العدوى")) {
     if (choice === "نعم")
       return card({
@@ -620,6 +658,7 @@ function handleChoiceFollowup(choiceRaw, lastCard) {
       });
   }
 
+  // med safety
   if (lastTitle.includes("السلامة الدوائية")) {
     if (choice.includes("خافض")) return KB.med_antipyretic;
     if (choice.includes("حساسية")) return KB.med_antihistamine;
@@ -647,40 +686,30 @@ function handleChoiceFollowup(choiceRaw, lastCard) {
         when_to_seek_help: "حرارة عالية مستمرة/أعراض شديدة: راجع الطبيب.",
       });
   }
-  
-
   if (lastTitle.includes("خافض حرارة لبالغ")) {
-    if (choice === "نعم") {
+    if (choice === "نعم")
       return card({
         category: "general",
         title: "خافض حرارة مع مرض مزمن",
         verdict: "مع الأمراض المزمنة، الأفضل اختيار الدواء **بعد استشارة** لتجنب التداخلات والمضاعفات.",
-        tips: [
-          "أخبر الصيدلي/الطبيب بكل أدويتك الحالية (خصوصًا مميعات الدم/أدوية الكبد/الكلى).",
-          "تجنب تكرار نفس المادة الفعالة في أكثر من منتج (نزلات برد/مسكنات).",
-        ],
+        tips: ["أخبر الصيدلي/الطبيب بكل أدويتك الحالية.", "تجنب تكرار نفس المادة الفعالة في أكثر من منتج."],
         next_question: "هل المرض المزمن مرتبط بالكبد/الكلى؟",
         quick_choices: ["الكبد/الكلى", "غير ذلك"],
-        when_to_seek_help:
-          "إذا ظهرت أعراض حساسية شديدة (تورم/صعوبة تنفس) أو تدهور مفاجئ: طوارئ.",
+        when_to_seek_help: "إذا ظهرت أعراض حساسية شديدة (تورم/صعوبة تنفس): طوارئ.",
       });
-    }
-    if (choice === "لا") {
+    if (choice === "لا")
       return card({
         category: "general",
         title: "خافض حرارة بدون مرض مزمن",
         verdict: "اختر منتجًا واحدًا واضح المادة الفعالة وتجنب الجمع غير الضروري.",
-        tips: [
-          "اقرأ الملصق وتأكد من المادة الفعالة لتجنب التكرار.",
-          "إذا استمرت الحرارة أو ظهر عرض شديد: لا تؤخر الاستشارة.",
-        ],
+        tips: ["اقرأ الملصق لتجنب التكرار.", "إذا استمرت الحرارة أو ظهر عرض شديد: لا تؤخر الاستشارة."],
         next_question: "هل الحرارة مستمرة أكثر من يومين؟",
         quick_choices: ["نعم", "لا"],
         when_to_seek_help: "حرارة عالية مستمرة/أعراض شديدة: راجع الطبيب.",
       });
-    }
   }
-if (lastTitle.includes("مضاد حساسية")) {
+
+  if (lastTitle.includes("مضاد حساسية")) {
     if (choice.includes("عطاس"))
       return card({
         category: "general",
@@ -735,16 +764,16 @@ function detectQuickPathIntent(text) {
   return "";
 }
 
-// ---------- AI fallback ----------
+// ---------------- AI ----------------
 function buildSystemPrompt() {
   return `
 أنت "دليل العافية" للتثقيف الصحي العام فقط (ليس تشخيصًا).
-أجب بالعربية وباختصار شديد. ممنوع: أدوية/جرعات/تشخيص.
+أجب بالعربية وباختصار أنيق وواضح. ممنوع: أدوية/جرعات/تشخيص.
 أعد JSON صالح فقط (بدون أي نص خارجه).
 التصنيفات: general | nutrition | bp | sugar | sleep | activity | mental | first_aid | report | emergency | water | calories | bmi
 الشكل:
 {"category":"general","title":"...","verdict":"...","next_question":"...","quick_choices":["..",".."],"tips":["..",".."],"when_to_seek_help":"..."}
-`.trim();
+  `.trim();
 }
 
 async function callGroq(messages) {
@@ -771,22 +800,22 @@ async function callGroq(messages) {
   return data.choices?.[0]?.message?.content || "";
 }
 
-function fallback(rawText) {
-  const looseVerdict = extractVerdictLoosely(rawText);
+function contextualFallback(lastCard, msg) {
+  const lastTitle = String(lastCard?.title || "متابعة");
+  const lastCat = String(lastCard?.category || "general");
+  const chosen = msg ? `("${msg}")` : "";
   return card({
-    category: "general",
-    title: "إرشاد عام",
-    verdict:
-      looseVerdict ||
-      "لا توجد معلومة محلية مطابقة الآن. اكتب سؤالك بتفاصيل أكثر (الأعراض + المدة + العمر) وسأحاول المساعدة.",
-    tips: ["لا تشارك بيانات حساسة.", "إذا كانت الحالة طارئة توجّه للطوارئ."],
+    category: lastCat,
+    title: `${lastTitle} — متابعة`,
+    verdict: `نكمل على نفس الموضوع ${chosen}: اتبع الإرشادات السابقة وراقب التحسّن خلال الساعات القادمة.`,
+    tips: ["ركّز على خطوة واحدة عملية الآن.", "إذا ظهرت أعراض جديدة أو تدهور واضح، لا تؤخر الاستشارة."],
     next_question: "",
     quick_choices: [],
-    when_to_seek_help: "",
+    when_to_seek_help: "إذا ظهرت علامات خطر/تدهور سريع: توجّه للطوارئ.",
   });
 }
 
-// ---------- routes ----------
+// ---------------- routes ----------------
 app.get("/health", (_req, res) => res.json({ ok: true }));
 app.post("/reset", (_req, res) => res.json({ ok: true }));
 
@@ -801,103 +830,46 @@ app.post("/chat", chatLimiter, async (req, res) => {
 
     const lastCard = req.body?.context?.last || null;
 
-    // 1) quick_choices → تفريعات محلية أولًا، وإن لم نجد تفريعًا: نستخدم الذكاء (إن كان مفعّلًا) لإكمال نفس الموضوع
+    // 1) quick_choices: محلي أولًا، إن لم يوجد تفريع → AI يكمل نفس الموضوع (إن كان مفعّلًا)
     if (isChoice && lastCard && typeof lastCard === "object") {
       const follow = handleChoiceFollowup(msg, lastCard);
       if (follow) return res.json({ ok: true, data: follow });
 
-      // ✅ إذا لم يوجد تفريع محلي للزر: نكمّل بنفس الموضوع عبر AI (بدون أسئلة "تفاصيل أكثر")
+      // إذا يوجد AI: اكمل بنفس الموضوع (هذا يمنع سقوط "إرشاد عام" نهائيًا)
       if (AI_FALLBACK_ENABLED && GROQ_API_KEY) {
-        const system = buildSystemPrompt();
-
-        const lastTitle = String(lastCard?.title || "دليل العافية");
-        const lastVerdict = String(lastCard?.verdict || "");
-        const lastCat = String(lastCard?.category || "general");
-
         const messages = [
-          { role: "system", content: system },
-          {
-            role: "assistant",
-            content:
-              "آخر بطاقة (للاستمرار عليها):\n" + JSON.stringify(lastCard),
-          },
+          { role: "system", content: buildSystemPrompt() },
+          { role: "assistant", content: "آخر بطاقة للاستمرار عليها:\n" + JSON.stringify(lastCard) },
           {
             role: "user",
             content:
-              `المستخدم اختار زر: "${msg}".
-` +
-              `تابع نفس الموضوع فقط ولا تغيّر السياق.
-` +
-              `اكتب بطاقة واحدة مرتبطة مباشرة بعنوان: ${lastTitle}.
-` +
-              `اجعل الرد عمليًا ومحددًا وخفيفًا (بدون طلب تفاصيل إضافية إلا إذا لزم).
-` +
-              `استخدم نفس التصنيف إن أمكن: ${lastCat}.
-` +
-              `السياق السابق (مختصر): ${lastVerdict}`,
+              `المستخدم اختار زر: "${msg}".\n` +
+              `تابع نفس الموضوع فقط ولا تغيّر السياق.\n` +
+              `اكتب بطاقة واحدة عملية مع سؤال متابعة واحد وخيارين إن أمكن.`,
           },
         ];
 
+        const raw = await callGroq(messages);
+        let parsed = extractJson(raw);
 
-        try {
-          const raw = await callGroq(messages);
-          let parsed = extractJson(raw);
-
-          let retryRaw = "";
-          if (!parsed) {
-            retryRaw = await callGroq(messages);
-            parsed = extractJson(retryRaw);
-          }
-
-          let data;
-          if (parsed) data = normalize(parsed);
-          else data = normalize(recoverPartialCard(retryRaw || raw) || fallback(raw));
-
-          if (isMetaJsonAnswer(data)) data = normalize(recoverPartialCard(retryRaw || raw) || fallback(raw));
-          if (!data.verdict && (!data.tips || data.tips.length === 0)) data = fallback("");
-
-          // تثبيت العنوان إذا خرج بعيد
-          if (!String(data.title || "").trim()) data.title = lastTitle;
-
-          return res.json({ ok: true, data });
-        } catch {
-          // إذا فشل AI: نرجع بطاقة متابعة مرتبطة بنفس الموضوع (بدون أي رسالة عامة مزعجة)
-          const lastTitle = String(lastCard?.title || "متابعة");
-          const lastCat = String(lastCard?.category || "general");
-          return res.json({
-            ok: true,
-            data: card({
-              category: lastCat,
-              title: lastTitle + " — متابعة",
-              verdict: `بالنسبة لاختيارك "${msg}": استمر في الإرشادات السابقة وراقب التحسّن خلال الساعات القادمة.`,
-              tips: [
-                "قدّم سوائل بكميات صغيرة ومتكررة حسب الحالة.",
-                "راقب أي تدهور مفاجئ أو أعراض جديدة."
-              ],
-              next_question: "هل توجد علامات تعب شديد أو جفاف الآن؟",
-              quick_choices: ["نعم", "لا"],
-              when_to_seek_help:
-                "إذا ظهرت علامات خطر (خمول شديد/جفاف/صعوبة تنفس/تشنجات): توجّه للطوارئ فورًا."
-            }),
-          });
+        let retryRaw = "";
+        if (!parsed) {
+          retryRaw = await callGroq(messages);
+          parsed = extractJson(retryRaw);
         }
+
+        let data;
+        if (parsed) data = normalize(parsed);
+        else data = normalize(recoverPartialCard(retryRaw || raw) || contextualFallback(lastCard, msg));
+
+        if (isMetaJsonAnswer(data)) data = normalize(recoverPartialCard(retryRaw || raw) || contextualFallback(lastCard, msg));
+        if (!data.verdict && (!data.tips || data.tips.length === 0)) data = contextualFallback(lastCard, msg);
+
+        return res.json({ ok: true, data });
       }
 
-      // إذا الذكاء غير مفعّل: رد محلي مرتبط بالموضوع (بدون "تم استلام اختيارك")
-      const lastTitle = String(lastCard?.title || "متابعة");
-      const lastCat = String(lastCard?.category || "general");
-      return res.json({
-        ok: true,
-        data: card({
-          category: lastCat,
-          title: lastTitle,
-          verdict: `اخترت: "${msg}". اكتب سطر واحد يوضح وضعك/هدفك لأعطيك إرشادًا أدق ضمن نفس الموضوع.`,
-          tips: ["مثال: كم مرة في الأسبوع؟ ما البديل المتاح لديك؟"],
-          next_question: "",
-          quick_choices: [],
-          when_to_seek_help: "",
-        }),
-      });
+      // إذا AI غير مفعّل: متابعة مرتبطة بالسياق (بدون أي رسالة عامة)
+      return res.json({ ok: true, data: contextualFallback(lastCard, msg) });
     }
 
     // 2) presetPrompts الطويلة من app.js → محلي 100%
@@ -910,26 +882,26 @@ app.post("/chat", chatLimiter, async (req, res) => {
     if (msg === "مكافحة الأمراض") return res.json({ ok: true, data: KB.path_infection });
     if (msg === "الحالات الطارئة") return res.json({ ok: true, data: KB.path_emergency });
 
-    // 4) كلمات مفتاحية محلية
+    // 4) كلمات مفتاحية محلية سريعة
     const t = normalizeText(msg);
     if (/(مضاد حيوي)/.test(t)) return res.json({ ok: true, data: KB.med_antibiotic });
     if (/(مضاد حساسية|حساسيه)/.test(t)) return res.json({ ok: true, data: KB.med_antihistamine });
     if (/(خافض حرارة|حرارة|حمى|حمي)/.test(t) && t.length <= 40) return res.json({ ok: true, data: KB.med_antipyretic });
 
-    // 5) بدون AI
-    if (!AI_FALLBACK_ENABLED || !GROQ_API_KEY) return res.json({ ok: true, data: fallback("") });
+    // 5) سؤال حر: AI إذا مفعّل، وإلا رد محلي محترم
+    if (!AI_FALLBACK_ENABLED || !GROQ_API_KEY) {
+      return res.json({ ok: true, data: KB.general_home });
+    }
 
-    // 6) AI fallback فقط هنا
     const messages = [{ role: "system", content: buildSystemPrompt() }];
     if (lastCard && typeof lastCard === "object") {
-      messages.push({
-        role: "assistant",
-        content: "سياق سابق (آخر بطاقة JSON للاستمرار عليها):\n" + JSON.stringify(lastCard),
-      });
+      messages.push({ role: "assistant", content: "سياق سابق:\n" + JSON.stringify(lastCard) });
     }
     messages.push({
       role: "user",
-      content: msg + "\n\nملاحظة: إن لم تكن متأكدًا، أعطِ إرشادًا عامًا قصيرًا + سؤال متابعة واحد فقط.",
+      content:
+        msg +
+        "\n\nملاحظة: إن لم تكن متأكدًا، أعطِ إرشادًا عامًا قصيرًا + سؤال متابعة واحد فقط.",
     });
 
     const raw = await callGroq(messages);
@@ -943,15 +915,15 @@ app.post("/chat", chatLimiter, async (req, res) => {
 
     let data;
     if (parsed) data = normalize(parsed);
-    else data = normalize(recoverPartialCard(retryRaw || raw) || fallback(raw));
+    else data = normalize(recoverPartialCard(retryRaw || raw) || contextualFallback(lastCard, msg));
 
-    if (isMetaJsonAnswer(data)) data = normalize(recoverPartialCard(retryRaw || raw) || fallback(raw));
-    if (!data.verdict && (!data.tips || data.tips.length === 0)) data = fallback("");
+    if (isMetaJsonAnswer(data)) data = normalize(recoverPartialCard(retryRaw || raw) || contextualFallback(lastCard, msg));
+    if (!data.verdict && (!data.tips || data.tips.length === 0)) data = contextualFallback(lastCard, msg);
 
     return res.json({ ok: true, data });
   } catch (e) {
     console.error(e);
-    return res.status(500).json({ ok: false, error: "server_error", data: fallback("") });
+    return res.status(500).json({ ok: false, error: "server_error", data: KB.general_home });
   }
 });
 

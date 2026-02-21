@@ -1,25 +1,23 @@
-// ===============================
-// server.js — Dalil Alafiyah API (FINAL)
-// Stable: context pass + strict JSON parsing + partial recovery
-// + retry re-ask (NOT "fix JSON") to avoid meta technical replies
-// + prevent code/JSON leakage to UI
-// ===============================
-
+// server.js — Dalil Alafiyah API (Hardened)
 import "dotenv/config";
 import express from "express";
 import cors from "cors";
 import bodyParser from "body-parser";
 import fetch from "node-fetch";
 import helmet from "helmet";
+import rateLimit from "express-rate-limit";
 
 const app = express();
 
-// ===============================
-// ENV
-// ===============================
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
 const MODEL_ID = process.env.GROQ_MODEL || "openai/gpt-oss-120b";
 const PORT = process.env.PORT || 3000;
+
+// ✅ CORS allowlist
+const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || "")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
 
 if (!GROQ_API_KEY) {
   console.error("❌ GROQ_API_KEY غير مضبوط");
@@ -27,8 +25,31 @@ if (!GROQ_API_KEY) {
 }
 
 app.use(helmet());
-app.use(cors());
+app.set("trust proxy", 1);
+
+// ✅ CORS: اسمح فقط للدومينات المحددة
+app.use(
+  cors({
+    origin: (origin, cb) => {
+      if (!origin) return cb(null, true); // health checks / curl
+      if (ALLOWED_ORIGINS.length === 0) return cb(null, true); // وضع تطوير
+      return ALLOWED_ORIGINS.includes(origin)
+        ? cb(null, true)
+        : cb(new Error("CORS blocked"), false);
+    },
+    methods: ["POST", "GET"],
+  })
+);
+
 app.use(bodyParser.json({ limit: "2mb" }));
+
+// ✅ Rate limit على chat
+const chatLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 25, // 25 طلب/دقيقة لكل IP
+  standardHeaders: true,
+  legacyHeaders: false,
+});
 
 // ===============================
 // Helpers
@@ -43,22 +64,13 @@ async function fetchWithTimeout(url, options = {}, ms = 15000) {
   }
 }
 
-/**
- * تنظيف JSON "شبه صحيح":
- * - ```json ... ```
- * - اقتباسات ذكية “ ”
- * - trailing commas
- */
 function cleanJsonish(s) {
   let t = String(s || "").trim();
-
   if (t.startsWith("```")) {
     t = t.replace(/^```[a-zA-Z]*\s*/m, "").replace(/```$/m, "").trim();
   }
-
   t = t.replace(/[“”]/g, '"').replace(/[‘’]/g, "'");
   t = t.replace(/,\s*([}\]])/g, "$1");
-
   return t;
 }
 
@@ -66,63 +78,49 @@ function extractJson(text) {
   const s0 = String(text || "");
   let s = cleanJsonish(s0);
 
-  // 1) parse كامل الرد
   try {
     const first = JSON.parse(s);
     if (first && typeof first === "object") return first;
-
-    // 2) لو كان stringified JSON
     if (typeof first === "string") {
       const second = JSON.parse(cleanJsonish(first));
       if (second && typeof second === "object") return second;
     }
   } catch {}
 
-  // 3) اقتناص { ... }
   const a = s.indexOf("{");
   const b = s.lastIndexOf("}");
   if (a === -1 || b === -1 || b <= a) return null;
 
   let chunk = cleanJsonish(s.slice(a, b + 1));
-
   try {
     return JSON.parse(chunk);
-  } catch {}
-
-  // 4) فك escaping الشائع
-  const unescaped = cleanJsonish(
-    chunk
-      .replace(/\\"/g, '"')
-      .replace(/\\n/g, "\n")
-      .replace(/\\t/g, "\t")
-      .replace(/\\r/g, "\r")
-  );
-
-  try {
-    return JSON.parse(unescaped);
   } catch {
-    return null;
+    const unescaped = cleanJsonish(
+      chunk
+        .replace(/\\"/g, '"')
+        .replace(/\\n/g, "\n")
+        .replace(/\\t/g, "\t")
+        .replace(/\\r/g, "\r")
+    );
+    try {
+      return JSON.parse(unescaped);
+    } catch {
+      return null;
+    }
   }
 }
 
 function extractVerdictLoosely(raw) {
   const s = String(raw || "");
-
   const m = s.match(/"verdict"\s*:\s*"([^"]+)"/);
   if (m && m[1]) return m[1].replace(/\\"/g, '"').trim();
-
   const m2 = s.match(/\\"verdict\\"\s*:\s*\\"([^\\]+)\\"/);
   if (m2 && m2[1]) return m2[1].replace(/\\"/g, '"').trim();
-
   return "";
 }
 
-/**
- * Partial Recovery: إذا JSON مقطوع، نلقط أهم الحقول ونبني بطاقة.
- */
 function recoverPartialCard(raw) {
   const s = String(raw || "");
-
   const pick = (re) => {
     const m = s.match(re);
     return m && m[1] ? m[1].replace(/\\"/g, '"').trim() : "";
@@ -175,9 +173,6 @@ function recoverPartialCard(raw) {
   };
 }
 
-/**
- * منع ردود "Meta JSON" التقنية (حتى لو كانت JSON صحيح)
- */
 function isMetaJsonAnswer(d) {
   const text =
     String(d?.title || "") +
@@ -203,9 +198,6 @@ const sArr = (v, n) =>
     ? v.filter((x) => typeof x === "string" && x.trim()).slice(0, n)
     : [];
 
-// ===============================
-// System Prompt
-// ===============================
 function buildSystemPrompt() {
   return `
 أنت "دليل العافية" — مرافق عربي للتثقيف الصحي فقط (ليس تشخيصًا).
@@ -236,9 +228,6 @@ general | nutrition | bp | sugar | sleep | activity | mental | first_aid | repor
 `.trim();
 }
 
-// ===============================
-// Groq
-// ===============================
 async function callGroq(messages) {
   const res = await fetchWithTimeout(
     "https://api.groq.com/openai/v1/chat/completions",
@@ -263,12 +252,8 @@ async function callGroq(messages) {
   return data.choices?.[0]?.message?.content || "";
 }
 
-// ===============================
-// Normalize (UI compatible categories)
-// ===============================
 function normalize(obj) {
   let cat = sStr(obj?.category) || "general";
-
   if (cat === "blood_pressure" || cat === "bloodpressure") cat = "bp";
 
   const allowed = new Set([
@@ -317,15 +302,16 @@ function fallback(rawText) {
 // ===============================
 // Routes
 // ===============================
-app.get("/", (_req, res) => {
-  res.json({ ok: true, service: "Dalil Alafiyah API" });
-});
+app.get("/health", (_req, res) => res.json({ ok: true }));
 
-app.post("/chat", async (req, res) => {
+app.post("/chat", chatLimiter, async (req, res) => {
   try {
     const msg = String(req.body.message || "").trim();
-    if (!msg) {
-      return res.status(400).json({ ok: false, error: "empty_message" });
+    if (!msg) return res.status(400).json({ ok: false, error: "empty_message" });
+
+    // ✅ حد طول الرسالة لتقليل التكلفة/الإساءة
+    if (msg.length > 1200) {
+      return res.status(400).json({ ok: false, error: "message_too_long" });
     }
 
     const lastCard = req.body?.context?.last || null;
@@ -343,36 +329,31 @@ app.post("/chat", async (req, res) => {
 
     messages.push({ role: "user", content: msg });
 
-    // 1) call
     const raw = await callGroq(messages);
     let parsed = extractJson(raw);
 
-    // 2) retry مرة واحدة فقط — إعادة السؤال (msg) وليس "إصلاح JSON"
     let retryRaw = "";
     if (!parsed) {
-      retryRaw = await callGroq(messages); // نفس الرسائل تمامًا
+      retryRaw = await callGroq(messages);
       parsed = extractJson(retryRaw);
     }
 
-    // 3) build data
     let data;
-    if (parsed) {
-      data = normalize(parsed);
-    } else {
+    if (parsed) data = normalize(parsed);
+    else {
       const recovered = recoverPartialCard(retryRaw || raw);
       data = recovered ? normalize(recovered) : fallback(raw);
     }
 
-    // 4) block meta technical cards
     if (isMetaJsonAnswer(data)) {
       const recovered = recoverPartialCard(retryRaw || raw);
       data = recovered ? normalize(recovered) : fallback(raw);
     }
 
-    res.json({ ok: true, data });
+    return res.json({ ok: true, data });
   } catch (e) {
     console.error(e);
-    res.status(500).json({
+    return res.status(500).json({
       ok: false,
       error: "server_error",
       data: fallback("حدث خطأ غير متوقع. راجع الطبيب إذا الأعراض مقلقة."),
@@ -381,5 +362,5 @@ app.post("/chat", async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`🚀 Dalil Alafiyah API يعمل على ${PORT}`);
+  console.log(`🚀 Dalil Alafiyah API يعمل على ${PORT} | model=${MODEL_ID}`);
 });

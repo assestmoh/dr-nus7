@@ -1,10 +1,8 @@
 // server.js — Dalil Alafiyah API (LOW token usage + stable conversations)
-// تغييرات أساسية (بدون تغيير واجهة /chat أو شكل الرد):
-// 1) Knowledge Base محلي لمسارات شائعة (تغذية/نشاط/نوم/ضغط/سكري/صحة نفسية/ضربة شمس/طوارئ)
-// 2) متابعة الاختيارات Quick Choices محليًا (حتى لا تتكرر نفس البطاقة)
-// 3) استدعاء Groq فقط عند الحاجة + max_tokens منخفض
-// 4) Cache + Cooldown + Daily limit (مع استثناء الاختيارات حتى ما تظهر "لحظة" عند الضغط)
-// 5) (اختياري) تشغيل الذكاء فقط بعد 3 رسائل "حقيقية" للمستخدم لتقليل الاستهلاك
+// ✅ هذه النسخة تصلّح تكرار البطاقات عند الضغط على الأزرار (Quick Choices + مسارات إرشادية)
+// ✅ تقلّل استهلاك التوكنز: Knowledge Base محلي + Cache + AI محدود + max_tokens منخفض
+//
+// لا تغيّر واجهة /chat ولا شكل الرد (يرجع نفس JSON الذي يتوقعه app.js)
 
 import "dotenv/config";
 import express from "express";
@@ -29,8 +27,8 @@ const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || "")
 // ---- cost controls (env optional) ----
 const AI_FALLBACK_ENABLED = (process.env.AI_FALLBACK_ENABLED || "1") === "1"; // 1=يسمح باستدعاء Groq عند عدم وجود جواب محلي
 const AI_AFTER_MESSAGES = Number(process.env.AI_AFTER_MESSAGES || 3); // تشغيل Groq فقط بعد N رسائل (للأسئلة غير المغطاة محليًا)
-const COOLDOWN_MS = Number(process.env.COOLDOWN_MS || 2000); // تبريد لكل مستخدم
-const DAILY_LIMIT = Number(process.env.DAILY_LIMIT || 120); // حد يومي لكل مستخدم
+const COOLDOWN_MS = Number(process.env.COOLDOWN_MS || 1500); // تبريد لكل مستخدم (مخفف حتى ما يضايق المستخدم)
+const DAILY_LIMIT = Number(process.env.DAILY_LIMIT || 180); // حد يومي لكل مستخدم
 const CACHE_TTL_MS = Number(process.env.CACHE_TTL_MS || 6 * 60 * 60 * 1000); // 6 ساعات
 const MAX_TOKENS = Number(process.env.MAX_TOKENS || 220);
 const TEMP = Number(process.env.TEMPERATURE || 0.25);
@@ -213,6 +211,7 @@ function card({ category, title, verdict, tips = [], next_question = "", quick_c
 
 // روابط مرجعية رسمية (وزارة الصحة العُمانية)
 const MOH = {
+  awareness_root: "https://www.moh.gov.om/ar/%D8%AA%D8%B9%D8%B2%D9%8A%D8%B2-%D8%A7%D9%84%D8%B5%D8%AD%D8%A9/%D9%88%D8%B9%D9%8A%D9%83-%D8%B5%D8%AD%D8%A9/",
   nutrition: "https://moh.gov.om/ar/%D8%AA%D8%B9%D8%B2%D9%8A%D8%B2-%D8%A7%D9%84%D8%B5%D8%AD%D8%A9/%D9%88%D8%B9%D9%8A%D9%83-%D8%B5%D8%AD%D8%A9/%D8%A7%D9%84%D8%AF%D9%84%D9%8A%D9%84-%D8%A7%D9%84%D8%B9%D9%85%D8%A7%D9%86%D9%8A-%D9%84%D9%84%D8%BA%D8%B0%D8%A7%D8%A1-%D8%A7%D9%84%D8%B5%D8%AD%D9%8A-%D8%B9%D8%B1%D8%A8%D9%8A/",
   bp: "https://www.moh.gov.om/ar/%D8%AA%D8%B9%D8%B2%D9%8A%D8%B2-%D8%A7%D9%84%D8%B5%D8%AD%D8%A9/%D9%88%D8%B9%D9%8A%D9%83-%D8%B5%D8%AD%D8%A9/%D8%B6%D8%BA%D8%B7-%D8%A7%D9%84%D8%AF%D9%85/",
   diabetes: "https://www.moh.gov.om/ar/%D8%AA%D8%B9%D8%B2%D9%8A%D8%B2-%D8%A7%D9%84%D8%B5%D8%AD%D8%A9/%D9%88%D8%B9%D9%8A%D9%83-%D8%B5%D8%AD%D8%A9/%D9%85%D8%B1%D8%B6-%D8%A7%D9%84%D8%B3%D9%83%D8%B1%D9%8A/",
@@ -220,6 +219,7 @@ const MOH = {
 };
 
 const KB = {
+  // ===== أساسيات =====
   nutrition: card({
     category: "nutrition",
     title: "غذاء صحي",
@@ -243,7 +243,7 @@ const KB = {
     ],
     next_question: "تفضّل نشاط خفيف أم متوسط؟",
     quick_choices: ["خفيف", "متوسط"],
-    when_to_seek_help: "إذا ظهرت أعراض مقلقة أثناء النشاط (ألم صدر/دوخة شديدة) أوقف النشاط واطلب تقييمًا طبيًا.",
+    when_to_seek_help: `معلومات عامة للتثقيف الصحي. للمزيد: ${MOH.awareness_root}`,
   }),
 
   bp: card({
@@ -282,7 +282,7 @@ const KB = {
     ],
     next_question: "مشكلتك: سهر متكرر أم أرق؟",
     quick_choices: ["سهر متكرر", "أرق"],
-    when_to_seek_help: "إذا استمر اضطراب النوم وأثر على حياتك اليومية، راجع مختص/عيادة.",
+    when_to_seek_help: `معلومات عامة للتثقيف الصحي. للمزيد: ${MOH.awareness_root}`,
   }),
 
   first_aid_heatstroke: card({
@@ -308,7 +308,7 @@ const KB = {
     ],
     next_question: "هل المشكلة: قلق أم حزن مستمر؟",
     quick_choices: ["قلق", "حزن مستمر"],
-    when_to_seek_help: "إذا وُجدت أفكار بإيذاء النفس أو خطر عاجل: اطلب مساعدة فورية.",
+    when_to_seek_help: `إذا وُجدت أفكار بإيذاء النفس أو خطر عاجل: اطلب مساعدة فورية. للمزيد: ${MOH.awareness_root}`,
   }),
 
   emergency: card({
@@ -333,14 +333,116 @@ const KB = {
     quick_choices: ["تغذية", "نشاط"],
     when_to_seek_help: "",
   }),
+
+  // ===== مسارات إرشادية (أزرار الشاشة عندك) — كلها محلية بدون AI =====
+  path_lifestyle: card({
+    category: "general",
+    title: "نمط الحياة الصحي",
+    verdict: "خطة بسيطة اليوم: تغذية + نشاط + نوم (خطوات صغيرة قابلة للاستمرار).",
+    tips: ["اختر تغيير واحد فقط اليوم.", "تابع 7 أيام ثم عدّل خطوة جديدة."],
+    next_question: "ما الذي تريد تحسينه أولاً؟",
+    quick_choices: ["التغذية", "النشاط", "النوم"],
+    when_to_seek_help: `معلومات عامة للتثقيف الصحي. للمزيد: ${MOH.awareness_root}`,
+  }),
+
+  path_women: card({
+    category: "general",
+    title: "صحة النساء",
+    verdict: "إرشادات عامة آمنة: وقاية + فحوصات + نمط حياة (بدون أدوية/جرعات).",
+    tips: ["نمط حياة صحي (غذاء/نشاط/نوم).", "راجع الطبيب عند أعراض غير معتادة أو مستمرة."],
+    next_question: "أي محور تريده الآن؟",
+    quick_choices: ["تغذية", "فحوصات"],
+    when_to_seek_help: `معلومات عامة للتثقيف الصحي. للمزيد: ${MOH.awareness_root}`,
+  }),
+
+  path_children: card({
+    category: "general",
+    title: "صحة الأطفال",
+    verdict: "وقاية عامة: تغذية مناسبة + نشاط + تطعيمات + مراقبة علامات الخطر.",
+    tips: ["قلّل السكريات والمشروبات المحلّاة.", "راقب السوائل عند الإسهال/الحرارة."],
+    next_question: "العمر التقريبي؟",
+    quick_choices: ["أقل من 5", "5+ سنوات"],
+    when_to_seek_help: "إذا حرارة عالية مستمرة/خمول شديد/صعوبة تنفس/جفاف واضح: راجع الطبيب أو الطوارئ.",
+  }),
+
+  path_elderly: card({
+    category: "general",
+    title: "صحة المسنين",
+    verdict: "الأولوية: الوقاية من السقوط + تغذية/سوائل + متابعة الأمراض المزمنة.",
+    tips: ["حركة خفيفة يوميًا حسب القدرة.", "مراجعة الأدوية دوريًا مع الطبيب."],
+    next_question: "ما الذي تريده الآن؟",
+    quick_choices: ["الوقاية من السقوط", "التغذية"],
+    when_to_seek_help: "دوخة شديدة/سقوط متكرر/تدهور مفاجئ: يحتاج تقييم طبي.",
+  }),
+
+  path_adolescents: card({
+    category: "general",
+    title: "صحة اليافعين",
+    verdict: "نوم كافٍ + نشاط + تغذية + دعم نفسي… هذه أهم الأساسيات.",
+    tips: ["توازن بين الدراسة والنوم.", "تقليل المشروبات المحلّاة والوجبات السريعة قدر الإمكان."],
+    next_question: "أكبر تحدي الآن؟",
+    quick_choices: ["النوم", "التغذية"],
+    when_to_seek_help: "إذا توتر/حزن شديد مستمر أو تأثير واضح على الدراسة/الحياة: اطلب مساعدة مختص.",
+  }),
+
+  path_mental_health: card({
+    category: "mental",
+    title: "مسار الصحة النفسية",
+    verdict: "أدوات يومية بسيطة + متى أطلب مساعدة عاجلة.",
+    tips: ["تنفّس 3 دقائق.", "مشي خفيف 10 دقائق.", "تواصل مع شخص تثق به."],
+    next_question: "هل تريد أدوات للقلق أم لتحسين النوم؟",
+    quick_choices: ["القلق", "النوم"],
+    when_to_seek_help: "أفكار بإيذاء النفس/خطر عاجل: اطلب مساعدة فورية.",
+  }),
+
+  path_ncd: card({
+    category: "general",
+    title: "الأمراض غير المعدية",
+    verdict: "الوقاية تعتمد على: غذاء صحي + نشاط + وزن + إيقاف التدخين + فحوصات دورية.",
+    tips: ["قلّل الملح/السكر.", "تحرّك يوميًا قدر الإمكان."],
+    next_question: "تريد الوقاية من أي شيء أكثر؟",
+    quick_choices: ["الضغط", "السكري"],
+    when_to_seek_help: `للتثقيف الصحي العام: ${MOH.awareness_root}`,
+  }),
+
+  path_infection_control: card({
+    category: "general",
+    title: "مكافحة الأمراض والعدوى",
+    verdict: "الوقاية: غسل اليدين + آداب السعال + البقاء بالمنزل عند المرض + لقاحات حسب الإرشاد الصحي.",
+    tips: ["اغسل اليدين جيدًا.", "تجنب مخالطة الآخرين عند وجود أعراض عدوى."],
+    next_question: "هل عندك أعراض تنفسية الآن؟",
+    quick_choices: ["نعم", "لا"],
+    when_to_seek_help: "إذا ضيق نفس شديد/حرارة عالية مستمرة/تدهور سريع: راجع الطبيب.",
+  }),
+
+  path_medication_safety: card({
+    category: "general",
+    title: "السلامة الدوائية",
+    verdict: "قواعد عامة للاستخدام الآمن (بدون جرعات): التزم بوصفة الطبيب واقرأ النشرة.",
+    tips: ["لا تخلط أدوية بدون استشارة.", "أبلغ عن الحساسية الدوائية.", "احفظ الدواء بعيدًا عن الأطفال."],
+    next_question: "هل السؤال عن تداخلات أم حساسية؟",
+    quick_choices: ["تداخلات", "حساسية"],
+    when_to_seek_help: "طفح شديد/تورم/صعوبة تنفس بعد دواء: طارئ.",
+  }),
+
+  path_emergency: card({
+    category: "emergency",
+    title: "الحالات الطارئة",
+    verdict: "علامات خطر تستدعي الطوارئ فورًا + تصرف أولي عام.",
+    tips: ["ألم صدر شديد/ضيق نفس شديد/إغماء/نزيف شديد/تشنجات.", "اتصل بالإسعاف فورًا عند أي علامة خطر."],
+    next_question: "هل لديك عرض خطير الآن؟",
+    quick_choices: ["نعم", "لا"],
+    when_to_seek_help: "هذه حالات طارئة — توجه للطوارئ فورًا.",
+  }),
 };
 
-// ---------- choice follow-ups (fix repeated cards) ----------
+// ---------- choice follow-ups ----------
 function handleChoiceFollowup(choiceRaw, lastCard) {
   const choice = String(choiceRaw || "").trim();
   const lastCat = String(lastCard?.category || "").trim();
+  const lastTitle = String(lastCard?.title || "").trim();
 
-  // Nutrition follow-ups
+  // ==== Quick follow-ups inside nutrition card ====
   if (lastCat === "nutrition") {
     if (choice.includes("سكر")) {
       return card({
@@ -348,12 +450,12 @@ function handleChoiceFollowup(choiceRaw, lastCard) {
         title: "تقليل السكر",
         verdict: "خطوات عملية لتقليل السكر اليومي بدون حرمان.",
         tips: [
-          "استبدل المشروبات المحلّاة بالماء/حليب قليل الدسم/شاي بدون سكر، وقلّل العصائر.",
-          "ابدأ بتقليل الحلويات تدريجيًا: نصف الكمية + اختر فاكهة بدلًا منها معظم الأيام.",
+          "استبدل المشروبات المحلّاة بالماء/شاي بدون سكر، وقلّل العصائر.",
+          "قلّل الحلويات تدريجيًا (نصف الكمية) واختر فاكهة معظم الأيام.",
         ],
         next_question: "أكثر شيء يرفع السكر عندك: المشروبات أم الحلويات؟",
         quick_choices: ["المشروبات", "الحلويات"],
-        when_to_seek_help: `إذا لديك سكري/ما قبل السكري أو أعراض مستمرة، راجع الطبيب/المركز الصحي. (وزارة الصحة العُمانية) ${MOH.nutrition}`,
+        when_to_seek_help: `إذا لديك سكري/ما قبل السكري أو أعراض مستمرة، راجع الطبيب/المركز الصحي. (وزارة الصحة العُمانية) ${MOH.diabetes}`,
       });
     }
     if (choice.includes("ملح")) {
@@ -372,7 +474,7 @@ function handleChoiceFollowup(choiceRaw, lastCard) {
     }
   }
 
-  // Activity follow-ups
+  // ==== Activity follow-ups ====
   if (lastCat === "activity") {
     if (choice.includes("خفيف")) {
       return card({
@@ -390,7 +492,7 @@ function handleChoiceFollowup(choiceRaw, lastCard) {
         category: "activity",
         title: "نشاط متوسط",
         verdict: "خطة بسيطة لرفع النشاط بشكل آمن.",
-        tips: ["مشي أسرع/دراجـة 20–30 دقيقة 3–5 أيام أسبوعيًا.", "أضف يومين تمارين مقاومة خفيفة للجسم."],
+        tips: ["مشي أسرع/دراجة 20–30 دقيقة 3–5 أيام أسبوعيًا.", "أضف يومين تمارين مقاومة خفيفة."],
         next_question: "تفضل المشي السريع أم تمارين منزلية؟",
         quick_choices: ["مشي سريع", "تمارين منزلية"],
         when_to_seek_help: "إذا ظهرت أعراض مقلقة أثناء النشاط، اطلب تقييمًا طبيًا.",
@@ -398,15 +500,15 @@ function handleChoiceFollowup(choiceRaw, lastCard) {
     }
   }
 
-  // Sleep follow-ups
+  // ==== Sleep follow-ups ====
   if (lastCat === "sleep") {
     if (choice.includes("سهر")) {
       return card({
         category: "sleep",
         title: "سهر متكرر",
-        verdict: "نرتّب لك روتين بسيط للنوم خلال 3 أيام.",
+        verdict: "نرتّب لك روتين بسيط خلال 3 أيام.",
         tips: ["قدّم وقت النوم 15 دقيقة يوميًا بدل تغيير كبير مرة واحدة.", "أوقف الشاشات قبل النوم بساعة قدر الإمكان."],
-        next_question: "سبب السهر: جوال/عمل/قهوة؟",
+        next_question: "سبب السهر الأقرب: جوال أم قهوة؟",
         quick_choices: ["جوال", "قهوة"],
         when_to_seek_help: "إذا استمر السهر مع نعاس شديد نهارًا أو شخير/انقطاع نفس، راجع مختص.",
       });
@@ -415,8 +517,8 @@ function handleChoiceFollowup(choiceRaw, lastCard) {
       return card({
         category: "sleep",
         title: "أرق",
-        verdict: "الأرق أحيانًا مرتبط بالتوتر أو المنبهات أو عادات النوم.",
-        tips: ["قلّل القهوة/المنبهات بعد العصر.", "إذا لم تنم خلال 20–30 دقيقة، قم بنشاط هادئ ثم عد للنوم."],
+        verdict: "الأرق قد يرتبط بالتوتر أو المنبهات أو عادات النوم.",
+        tips: ["قلّل القهوة بعد العصر.", "إذا لم تنم خلال 20–30 دقيقة، قم بنشاط هادئ ثم عد للنوم."],
         next_question: "كم ساعة تنام عادة؟",
         quick_choices: ["أقل من 6", "6–8"],
         when_to_seek_help: "إذا استمر الأرق لأكثر من أسبوعين وأثر على حياتك، راجع مختص.",
@@ -424,13 +526,13 @@ function handleChoiceFollowup(choiceRaw, lastCard) {
     }
   }
 
-  // Mental follow-ups
+  // ==== Mental follow-ups ====
   if (lastCat === "mental") {
     if (choice.includes("قلق")) {
       return card({
         category: "mental",
         title: "قلق",
-        verdict: "نعطيك أدوات بسيطة تقلل القلق خلال اليوم.",
+        verdict: "أدوات بسيطة تساعدك اليوم.",
         tips: ["تنفّس 4-4-6 لمدة 3 دقائق.", "خفف الأخبار/المنبهات وخذ مشي قصير."],
         next_question: "القلق يؤثر على النوم؟",
         quick_choices: ["نعم", "لا"],
@@ -450,8 +552,8 @@ function handleChoiceFollowup(choiceRaw, lastCard) {
     }
   }
 
-  // Generic: if user answers "نعم/لا" بعد سؤال محدد، نعطي تفرع بسيط
-  if (choice === "نعم" && lastCat === "first_aid") {
+  // ==== Heatstroke follow-up ====
+  if (lastTitle.includes("ضربة الشمس") && (choice === "نعم" || choice.includes("نعم"))) {
     return card({
       category: "first_aid",
       title: "احتمال إجهاد/ضربة حرارة",
@@ -463,12 +565,165 @@ function handleChoiceFollowup(choiceRaw, lastCard) {
     });
   }
 
+  // ==== PATH lifestyle follow-ups ====
+  if (lastTitle.includes("نمط الحياة") && lastCat === "general") {
+    if (choice.includes("التغذية")) return KB.nutrition;
+    if (choice.includes("النشاط")) return KB.activity;
+    if (choice.includes("النوم")) return KB.sleep;
+  }
+
+  // ==== PATH women follow-ups ====
+  if (lastTitle.includes("صحة النساء")) {
+    if (choice.includes("تغذية")) return KB.nutrition;
+    if (choice.includes("فحوصات")) {
+      return card({
+        category: "general",
+        title: "فحوصات عامة",
+        verdict: "الفحوصات المناسبة تختلف حسب العمر والتاريخ الصحي. الهدف هو الكشف المبكر.",
+        tips: ["تابع فحوصات دورية حسب إرشاد المركز الصحي.", "دوّن أعراضك/ملاحظاتك قبل الموعد الطبي."],
+        next_question: "هل الموضوع مرتبط بالدورة/حمل/أعراض عامة؟",
+        quick_choices: ["الدورة", "حمل"],
+        when_to_seek_help: `معلومات عامة للتثقيف الصحي. للمزيد: ${MOH.awareness_root}`,
+      });
+    }
+  }
+
+  // ==== PATH children follow-ups ====
+  if (lastTitle.includes("صحة الأطفال")) {
+    if (choice.includes("أقل")) {
+      return card({
+        category: "general",
+        title: "أطفال أقل من 5 سنوات",
+        verdict: "التركيز على التغذية المناسبة، التطعيمات، ومراقبة علامات الخطر.",
+        tips: ["سوائل كافية خاصة عند الإسهال/الحرارة.", "تجنب المشروبات المحلّاة قدر الإمكان."],
+        next_question: "هل توجد حرارة أو إسهال الآن؟",
+        quick_choices: ["حرارة", "إسهال"],
+        when_to_seek_help: "علامات الخطر: خمول شديد/جفاف/صعوبة تنفس/تشنجات → طوارئ.",
+      });
+    }
+    if (choice.includes("5")) {
+      return card({
+        category: "general",
+        title: "أطفال 5+ سنوات",
+        verdict: "نمط حياة صحي: وجبات متوازنة + نشاط يومي + نوم كافٍ.",
+        tips: ["نشاط بدني يومي.", "تقليل الوجبات السريعة تدريجيًا."],
+        next_question: "التحدي الأكبر: التغذية أم النشاط؟",
+        quick_choices: ["التغذية", "النشاط"],
+        when_to_seek_help: "إذا أعراض شديدة أو مستمرة راجع الطبيب.",
+      });
+    }
+  }
+
+  // ==== PATH elderly follow-ups ====
+  if (lastTitle.includes("صحة المسنين")) {
+    if (choice.includes("السقوط")) {
+      return card({
+        category: "general",
+        title: "الوقاية من السقوط",
+        verdict: "قلّل مخاطر السقوط في المنزل وادعم التوازن.",
+        tips: ["إزالة العوائق/السجاد المنزلق.", "إضاءة جيدة ليلًا.", "حركة خفيفة لتقوية العضلات."],
+        next_question: "هل حصل سقوط سابقًا؟",
+        quick_choices: ["نعم", "لا"],
+        when_to_seek_help: "بعد سقوط مع ألم شديد/دوخة/إغماء: يحتاج تقييم فوري.",
+      });
+    }
+    if (choice.includes("التغذية")) return KB.nutrition;
+  }
+
+  // ==== PATH adolescents follow-ups ====
+  if (lastTitle.includes("صحة اليافعين")) {
+    if (choice.includes("النوم")) return KB.sleep;
+    if (choice.includes("التغذية")) return KB.nutrition;
+  }
+
+  // ==== PATH mental follow-ups ====
+  if (lastTitle.includes("مسار الصحة النفسية")) {
+    if (choice.includes("القلق")) return handleChoiceFollowup("قلق", { category: "mental", title: "الصحة النفسية" }) || KB.mental;
+    if (choice.includes("النوم")) return KB.sleep;
+  }
+
+  // ==== PATH NCD follow-ups ====
+  if (lastTitle.includes("الأمراض غير المعدية")) {
+    if (choice.includes("الضغط")) return KB.bp;
+    if (choice.includes("السكري")) return KB.sugar;
+  }
+
+  // ==== PATH Infection Control follow-ups ====
+  if (lastTitle.includes("مكافحة الأمراض")) {
+    if (choice.includes("نعم")) {
+      return card({
+        category: "general",
+        title: "أعراض عدوى تنفسية",
+        verdict: "إرشاد عام: راقب الأعراض وقلّل الاختلاط واهتم بالسوائل والراحة.",
+        tips: ["غطِّ الفم عند السعال/العطاس.", "اغسل اليدين.", "راجع الطبيب إذا ساءت الأعراض."],
+        next_question: "هل توجد حرارة عالية أو ضيق نفس؟",
+        quick_choices: ["حرارة عالية", "ضيق نفس"],
+        when_to_seek_help: "ضيق نفس شديد/تدهور سريع: طوارئ.",
+      });
+    }
+    if (choice.includes("لا")) {
+      return card({
+        category: "general",
+        title: "وقاية من العدوى",
+        verdict: "الوقاية أفضل: نظافة اليدين وآداب السعال وتحديث اللقاحات حسب الإرشاد الصحي.",
+        tips: ["نظافة اليدين.", "تجنب مخالطة المرضى قدر الإمكان."],
+        next_question: "",
+        quick_choices: [],
+        when_to_seek_help: `معلومات عامة للتثقيف الصحي. للمزيد: ${MOH.awareness_root}`,
+      });
+    }
+  }
+
+  // ==== PATH Medication Safety follow-ups ====
+  if (lastTitle.includes("السلامة الدوائية")) {
+    if (choice.includes("تداخلات")) {
+      return card({
+        category: "general",
+        title: "تداخلات دوائية",
+        verdict: "قاعدة عامة: لا تجمع أدوية/مكملات بدون استشارة، خاصة مع الأمراض المزمنة.",
+        tips: ["اذكر كل الأدوية للطبيب/الصيدلي.", "تجنب تكرار نفس المادة الفعالة."],
+        next_question: "هل لديك مرض مزمن؟",
+        quick_choices: ["نعم", "لا"],
+        when_to_seek_help: "إذا ظهرت حساسية شديدة أو صعوبة تنفس بعد دواء: طوارئ.",
+      });
+    }
+    if (choice.includes("حساسية")) {
+      return card({
+        category: "general",
+        title: "حساسية دوائية",
+        verdict: "الحساسية قد تظهر بطفح/حكة/تورم، وقد تكون شديدة في بعض الحالات.",
+        tips: ["أوقف الدواء واطلب رأي طبي إذا ظهرت أعراض.", "احتفظ باسم الدواء كمعلومة للطبيب."],
+        next_question: "هل توجد صعوبة تنفس أو تورم بالوجه؟",
+        quick_choices: ["نعم", "لا"],
+        when_to_seek_help: "صعوبة تنفس/تورم شديد: طوارئ.",
+      });
+    }
+  }
+
+  // ==== PATH Emergency follow-ups ====
+  if (lastTitle.includes("الحالات الطارئة")) {
+    if (choice.includes("نعم")) return KB.emergency;
+    if (choice.includes("لا")) return KB.general;
+  }
+
   return null;
 }
 
-// ---------- intent router ----------
+// ---------- detect intents (including the long preset prompts from app.js) ----------
 function detectIntent(text) {
   const t = normalizeText(text);
+
+  // Quick paths sent as long prompts — detect by keywords
+  if (t.includes("مسار نمط الحياة")) return { kind: "kb", key: "path_lifestyle" };
+  if (t.includes("مسار صحة النساء")) return { kind: "kb", key: "path_women" };
+  if (t.includes("مسار صحة الأطفال")) return { kind: "kb", key: "path_children" };
+  if (t.includes("مسار صحة كبار السن") || t.includes("كبار السن")) return { kind: "kb", key: "path_elderly" };
+  if (t.includes("مسار صحة اليافعين") || t.includes("اليفاعين") || t.includes("المراهق")) return { kind: "kb", key: "path_adolescents" };
+  if (t.includes("مسار الصحة النفسية")) return { kind: "kb", key: "path_mental_health" };
+  if (t.includes("مسار الأمراض غير المعدية")) return { kind: "kb", key: "path_ncd" };
+  if (t.includes("مسار مكافحة الأمراض") || t.includes("مكافحة الأمراض والعدوى")) return { kind: "kb", key: "path_infection_control" };
+  if (t.includes("مسار السلامة الدوائية")) return { kind: "kb", key: "path_medication_safety" };
+  if (t.includes("مسار الحالات الطارئة") || t.includes("الحالات الطارئة")) return { kind: "kb", key: "path_emergency" };
 
   // طوارئ
   const emergencyFlags = [
@@ -491,7 +746,7 @@ function detectIntent(text) {
   ];
   if (emergencyFlags.some((f) => t.includes(normalizeText(f)))) return { kind: "kb", key: "emergency" };
 
-  // مسارات
+  // مسارات عامة
   if (/(تغذ|غذاء|حمية|رجيم|سعرات|اكل|أكل|ملح|سكر|دهون)/.test(t)) return { kind: "kb", key: "nutrition" };
   if (/(نشاط|رياضة|مشي|تمارين|حركة)/.test(t)) return { kind: "kb", key: "activity" };
   if (/(ضغط|ضغط الدم|مرتفع الضغط|انقباضي|انبساطي)/.test(t)) return { kind: "kb", key: "bp" };
@@ -504,7 +759,7 @@ function detectIntent(text) {
   const bpMatch = t.match(/\b(\d{2,3})\s*\/\s*(\d{2,3})\b/);
   if (bpMatch) return { kind: "bp_reading", s: Number(bpMatch[1]), d: Number(bpMatch[2]) };
 
-  // تحيات وتجارب (نعطي general بدون AI)
+  // تحيات وتجارب
   if (/^(مرحبا|مرحبًا|السلام عليكم|السلام)\b/.test(t)) return { kind: "kb", key: "general" };
   if (/^(شكرا|شكرًا|مشكور|يسلمو|يعطيك العافية)\b/.test(t)) return { kind: "kb", key: "general" };
 
@@ -522,7 +777,7 @@ function classifyBp(s, d) {
 }
 
 // ---------- cache + quotas ----------
-const cache = new Map(); // per user normalized msg
+const cache = new Map(); // per user normalized msg (+ last category)
 const userState = new Map(); // userId -> { lastAt, dayKey, used }
 const userMsgCount = new Map(); // userId -> count
 
@@ -540,27 +795,23 @@ function checkCooldownAndQuota(userId) {
   const dk = dayKeyNow();
   const st = userState.get(userId) || { lastAt: 0, dayKey: dk, used: 0 };
 
-  // reset day
   if (st.dayKey !== dk) {
     st.dayKey = dk;
     st.used = 0;
   }
 
-  // cooldown
   if (now - st.lastAt < COOLDOWN_MS) {
     st.lastAt = now;
     userState.set(userId, st);
     return { ok: false, reason: "cooldown" };
   }
 
-  // quota
   if (st.used >= DAILY_LIMIT) {
     st.lastAt = now;
     userState.set(userId, st);
     return { ok: false, reason: "daily_limit" };
   }
 
-  // consume
   st.used += 1;
   st.lastAt = now;
   userState.set(userId, st);
@@ -642,14 +893,15 @@ app.post("/chat", chatLimiter, async (req, res) => {
     const isChoice = meta && meta.is_choice === true;
 
     if (!msg) return res.status(400).json({ ok: false, error: "empty_message" });
-    if (msg.length > 1200) return res.status(400).json({ ok: false, error: "message_too_long" });
+    if (msg.length > 1400) return res.status(400).json({ ok: false, error: "message_too_long" });
 
-    // 0) اختيار من أزرار quick_choices: نعالجه قبل الكولداون/الحد اليومي حتى لا تتخرب المحادثة
     const lastCard = req.body?.context?.last || null;
+
+    // 0) اختيار من الأزرار (Quick Choices): نعالجه قبل الكولداون/الحد اليومي
     if (isChoice && lastCard && typeof lastCard === "object") {
       const follow = handleChoiceFollowup(msg, lastCard);
       if (follow) return res.json({ ok: true, data: follow });
-      // إذا ما كان عندنا تفرّع معروف، نكمل كرسالة عادية (لكن بدون احتسابها ضد التبريد/اليومي)
+      // لو ما عرفناه، نكمل كرسالة عادية لكن بدون "عقوبة" التبريد غالبًا
     }
 
     // 1) رسائل قصيرة جدًا
@@ -668,7 +920,7 @@ app.post("/chat", chatLimiter, async (req, res) => {
       });
     }
 
-    // 2) تبريد/حد يومي (لا يُطبّق على ضغط الأزرار في العادة)
+    // 2) تبريد/حد يومي (لا نطبقها على isChoice)
     if (!isChoice) {
       const gate = checkCooldownAndQuota(userId);
       if (!gate.ok) {
@@ -678,7 +930,7 @@ app.post("/chat", chatLimiter, async (req, res) => {
             data: card({
               category: "general",
               title: "لحظة",
-              verdict: "أرسلت رسائل بسرعة. انتظر ثانيتين ثم أرسل سؤالك.",
+              verdict: "أرسلت رسائل بسرعة. انتظر قليلًا ثم أرسل سؤالك.",
               tips: ["هذا لتقليل الضغط وحماية الخدمة للمجتمع."],
               next_question: "",
               quick_choices: [],
@@ -701,8 +953,8 @@ app.post("/chat", chatLimiter, async (req, res) => {
       }
     }
 
-    // 3) Cache
-    const cacheKey = `${userId}::${normalizeText(msg)}::${String(lastCard?.category || "")}`;
+    // 3) Cache (يشمل آخر تصنيف/عنوان حتى ما يكرر نفس البطاقة غلط)
+    const cacheKey = `${userId}::${normalizeText(msg)}::${String(lastCard?.category || "")}::${String(lastCard?.title || "")}`;
     const cached = cacheGet(cacheKey);
     if (cached) return res.json({ ok: true, data: cached });
 
@@ -748,7 +1000,7 @@ app.post("/chat", chatLimiter, async (req, res) => {
       return res.json({ ok: true, data });
     }
 
-    // 6) Gate إضافي: لا نشغّل AI إلا بعد N رسائل (للأسئلة غير المغطاة محليًا)
+    // 6) Gate إضافي: لا نشغّل AI إلا بعد N رسائل (فقط للأسئلة غير المغطاة محليًا)
     if (!isChoice && AI_AFTER_MESSAGES > 0) {
       const c = (userMsgCount.get(userId) || 0) + 1;
       userMsgCount.set(userId, c);

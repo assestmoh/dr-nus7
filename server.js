@@ -819,8 +819,7 @@ app.post("/chat", chatLimiter, async (req, res) => {
           {
             role: "assistant",
             content:
-              "آخر بطاقة (للاستمرار عليها):
-" + JSON.stringify(lastCard),
+              "آخر بطاقة (للاستمرار عليها):\n" + JSON.stringify(lastCard),
           },
           {
             role: "user",
@@ -838,6 +837,7 @@ app.post("/chat", chatLimiter, async (req, res) => {
               `السياق السابق (مختصر): ${lastVerdict}`,
           },
         ];
+
 
         try {
           const raw = await callGroq(messages);

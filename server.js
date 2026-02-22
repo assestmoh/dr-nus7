@@ -1,8 +1,12 @@
-// server.js — Dalil Alafiyah API (clean + hardened)
-// - Removes unused imports
-// - Adds CORS allowlist via ALLOWED_ORIGINS
-// - Adds rate limit (express-rate-limit) on /chat
-// - Keeps your existing JSON-structured Groq logic
+// server.js — Dalil Alafiyah API (clean + hardened + cheaper routing)
+//
+// Changes vs your version:
+// - Adds Small-first / Big-fallback routing (GROQ_SMALL_MODEL, GROQ_BIG_MODEL)
+// - Replaces expensive same-model retry with escalation
+// - Lowers max_tokens (dynamic for some categories)
+// - Compacts prior context to reduce tokens
+// - Makes rate limit key safer (IP by default; optional signed user id later)
+// - Keeps your strict JSON card logic and fallback recovery
 
 import "dotenv/config";
 import express from "express";
@@ -15,7 +19,12 @@ import rateLimit from "express-rate-limit";
 const app = express();
 
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
-const MODEL_ID = process.env.GROQ_MODEL || "openai/gpt-oss-120b";
+
+// Small-first / Big-fallback
+const SMALL_MODEL = process.env.GROQ_SMALL_MODEL || "llama3-8b-8192";
+const BIG_MODEL =
+  process.env.GROQ_BIG_MODEL || process.env.GROQ_MODEL || "openai/gpt-oss-120b";
+
 const PORT = process.env.PORT || 3000;
 
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || "")
@@ -48,10 +57,12 @@ app.use(bodyParser.json({ limit: "2mb" }));
 
 const chatLimiter = rateLimit({
   windowMs: 60 * 1000,
-  max: 25, // عدّلها إذا تبغى
+  max: Number(process.env.CHAT_RPM || 25),
   standardHeaders: true,
   legacyHeaders: false,
-  keyGenerator: (req) => String(req.headers["x-user-id"] || req.ip),
+
+  // Safer key (avoid header spoofing). If you later add signed x-user-id, you can change this.
+  keyGenerator: (req) => String(req.ip),
 });
 
 // ---------- helpers ----------
@@ -134,7 +145,15 @@ function recoverPartialCard(raw) {
   const quick_choices = arrPick("quick_choices", 2);
   const tips = arrPick("tips", 2);
 
-  return { category, title, verdict, next_question, quick_choices, tips, when_to_seek_help };
+  return {
+    category,
+    title,
+    verdict,
+    next_question,
+    quick_choices,
+    tips,
+    when_to_seek_help,
+  };
 }
 
 function isMetaJsonAnswer(d) {
@@ -366,7 +385,31 @@ general | nutrition | bp | sugar | sleep | activity | mental | first_aid | repor
 `.trim();
 }
 
-async function callGroq(messages) {
+function compactLastCard(lastCard) {
+  if (!lastCard || typeof lastCard !== "object") return null;
+  return {
+    category: sStr(lastCard.category) || "general",
+    title: sStr(lastCard.title).slice(0, 60),
+    verdict: sStr(lastCard.verdict).slice(0, 240),
+    next_question: sStr(lastCard.next_question).slice(0, 160),
+  };
+}
+
+function chooseMaxTokens(msg, lastCard) {
+  // Keep responses tight: most cases don't need many tokens.
+  const base = Number(process.env.GROQ_MAX_TOKENS || 260);
+
+  // If user requests report-like output or emergencies, allow a bit more room.
+  const text = String(msg || "");
+  const cat = sStr(lastCard?.category);
+  if (cat === "report" || /تقرير|ملخص|تحليل/i.test(text)) return Math.max(base, 320);
+  if (cat === "emergency" || /طوارئ|إسعاف|اختناق|نزيف|حروق|سكتة/i.test(text))
+    return Math.max(base, 320);
+
+  return base;
+}
+
+async function callGroq(messages, { model, max_tokens }) {
   const res = await fetchWithTimeout(
     "https://api.groq.com/openai/v1/chat/completions",
     {
@@ -376,16 +419,20 @@ async function callGroq(messages) {
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
-        model: MODEL_ID,
+        model,
         temperature: 0.35,
-        max_tokens: 520,
+        max_tokens,
         messages,
       }),
     },
     20000
   );
 
-  if (!res.ok) throw new Error("Groq API error");
+  if (!res.ok) {
+    const t = await res.text().catch(() => "");
+    throw new Error(`Groq API error (${res.status}) ${t.slice(0, 200)}`);
+  }
+
   const data = await res.json();
   return data.choices?.[0]?.message?.content || "";
 }
@@ -406,7 +453,7 @@ function fallback(rawText) {
 // ---------- routes ----------
 app.get("/health", (_req, res) => res.json({ ok: true }));
 
-app.post("/reset", (req, res) => {
+app.post("/reset", (_req, res) => {
   // إذا عندك جلسات/تخزين سياق لاحقًا — هنا مكان reset
   res.json({ ok: true });
 });
@@ -415,37 +462,54 @@ app.post("/chat", chatLimiter, async (req, res) => {
   try {
     const msg = String(req.body?.message || "").trim();
     if (!msg) return res.status(400).json({ ok: false, error: "empty_message" });
-    if (msg.length > 1200) return res.status(400).json({ ok: false, error: "message_too_long" });
+    if (msg.length > 1200)
+      return res.status(400).json({ ok: false, error: "message_too_long" });
 
     const lastCard = req.body?.context?.last || null;
+    const compact = compactLastCard(lastCard);
 
     const messages = [{ role: "system", content: buildSystemPrompt() }];
-    if (lastCard && typeof lastCard === "object") {
+
+    // Only include prior context if it exists; keep it compact to save tokens.
+    if (compact) {
       messages.push({
         role: "assistant",
-        content: "سياق سابق (آخر بطاقة JSON للاستمرار عليها):\n" + JSON.stringify(lastCard),
+        content: "سياق سابق مختصر للاستمرار:\n" + JSON.stringify(compact),
       });
     }
+
     messages.push({ role: "user", content: msg });
 
-    const raw = await callGroq(messages);
-    let parsed = extractJson(raw);
+    const maxTokens = chooseMaxTokens(msg, lastCard);
 
-    let retryRaw = "";
+    // 1) Small model first (cheap)
+    const raw1 = await callGroq(messages, { model: SMALL_MODEL, max_tokens: maxTokens });
+    let parsed = extractJson(raw1);
+
+    // 2) Big model only if parsing failed (escalation, not retry)
+    let raw2 = "";
     if (!parsed) {
-      retryRaw = await callGroq(messages);
-      parsed = extractJson(retryRaw);
+      raw2 = await callGroq(messages, { model: BIG_MODEL, max_tokens: maxTokens });
+      parsed = extractJson(raw2);
     }
 
+    // Normalize / recover
     let data;
     if (parsed) data = normalize(parsed);
-    else data = normalize(recoverPartialCard(retryRaw || raw) || fallback(raw));
+    else data = normalize(recoverPartialCard(raw2 || raw1) || fallback(raw1));
 
+    // Guard against meta formatting answers
     if (isMetaJsonAnswer(data)) {
-      data = normalize(recoverPartialCard(retryRaw || raw) || fallback(raw));
+      data = normalize(recoverPartialCard(raw2 || raw1) || fallback(raw1));
     }
 
-    return res.json({ ok: true, data });
+    return res.json({
+      ok: true,
+      data,
+      meta: {
+        model_used: parsed ? (raw2 ? BIG_MODEL : SMALL_MODEL) : (raw2 ? BIG_MODEL : SMALL_MODEL),
+      },
+    });
   } catch (e) {
     console.error(e);
     return res.status(500).json({ ok: false, error: "server_error", data: fallback("") });
@@ -453,5 +517,7 @@ app.post("/chat", chatLimiter, async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`🚀 API running on :${PORT} | model=${MODEL_ID}`);
+  console.log(
+    `🚀 API running on :${PORT} | small=${SMALL_MODEL} | big=${BIG_MODEL}`
+  );
 });

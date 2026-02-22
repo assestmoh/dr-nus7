@@ -1,13 +1,4 @@
-// server.js — Dalil Alafiyah API (clean + hardened + cheaper routing)
-//
-// Changes vs your version:
-// - Adds Small-first / Big-fallback routing (GROQ_SMALL_MODEL, GROQ_BIG_MODEL)
-// - Replaces expensive same-model retry with escalation
-// - Lowers max_tokens (dynamic for some categories)
-// - Compacts prior context to reduce tokens
-// - Makes rate limit key safer (IP by default; optional signed user id later)
-// - Keeps your strict JSON card logic and fallback recovery
-
+// server.js — Dalil Alafiyah API (clean + hardened + cheaper routing) + TTS
 import "dotenv/config";
 import express from "express";
 import cors from "cors";
@@ -20,10 +11,14 @@ const app = express();
 
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
 
-// Small-first / Big-fallback
+// Small-first / Big-fallback (LLM)
 const SMALL_MODEL = process.env.GROQ_SMALL_MODEL || "llama-3.1-8b-instant";
 const BIG_MODEL =
-  process.env.GROQ_BIG_MODEL || process.env.GROQ_MODEL || "              ";
+  (process.env.GROQ_BIG_MODEL || process.env.GROQ_MODEL || "llama-3.3-70b-versatile").trim();
+
+// TTS (Orpheus Arabic Saudi)
+const TTS_MODEL = (process.env.GROQ_TTS_MODEL || "canopylabs/orpheus-arabic-saudi").trim();
+const TTS_VOICE = (process.env.GROQ_TTS_VOICE || "fahad").trim();
 
 const PORT = process.env.PORT || 3000;
 
@@ -34,6 +29,11 @@ const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || "")
 
 if (!GROQ_API_KEY) {
   console.error("❌ GROQ_API_KEY غير مضبوط");
+  process.exit(1);
+}
+
+if (!BIG_MODEL) {
+  console.error("❌ BIG_MODEL فارغ. اضبط GROQ_BIG_MODEL أو GROQ_MODEL");
   process.exit(1);
 }
 
@@ -60,8 +60,6 @@ const chatLimiter = rateLimit({
   max: Number(process.env.CHAT_RPM || 25),
   standardHeaders: true,
   legacyHeaders: false,
-
-  // Safer key (avoid header spoofing). If you later add signed x-user-id, you can change this.
   keyGenerator: (req) => String(req.ip),
 });
 
@@ -242,16 +240,14 @@ function compactLastCard(lastCard) {
   return {
     category: sStr(lastCard.category) || "general",
     title: sStr(lastCard.title).slice(0, 60),
-    verdict: sStr(lastCard.verdict).slice(0, 240),
-    next_question: sStr(lastCard.next_question).slice(0, 160),
+    verdict: sStr(lastCard.verdict).slice(0, 160), // أقل توكنز
+    next_question: sStr(lastCard.next_question).slice(0, 120),
   };
 }
 
 function chooseMaxTokens(msg, lastCard) {
-  // Keep responses tight: most cases don't need many tokens.
   const base = Number(process.env.GROQ_MAX_TOKENS || 260);
 
-  // If user requests report-like output or emergencies, allow a bit more room.
   const text = String(msg || "");
   const cat = sStr(lastCard?.category);
   if (cat === "report" || /تقرير|ملخص|تحليل/i.test(text)) return Math.max(base, 320);
@@ -302,12 +298,73 @@ function fallback(rawText) {
   };
 }
 
+// ---------- TTS helpers ----------
+function normalizeArabicForTTS(s) {
+  // اختصر وخل النص مناسب للنطق
+  return String(s || "")
+    .replace(/\s+/g, " ")
+    .replace(/[<>]/g, "")
+    .trim()
+    .slice(0, 200);
+}
+
+async function callGroqTTS(text, { model = TTS_MODEL, voice = TTS_VOICE } = {}) {
+  const input = normalizeArabicForTTS(text);
+  if (!input) throw new Error("tts_empty_input");
+
+  const res = await fetchWithTimeout(
+    "https://api.groq.com/openai/v1/audio/speech",
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${GROQ_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model,
+        input,
+        voice,
+        response_format: "wav",
+      }),
+    },
+    20000
+  );
+
+  if (!res.ok) {
+    const t = await res.text().catch(() => "");
+    throw new Error(`Groq TTS error (${res.status}) ${t.slice(0, 200)}`);
+  }
+
+  const ab = await res.arrayBuffer();
+  return Buffer.from(ab);
+}
+
 // ---------- routes ----------
 app.get("/health", (_req, res) => res.json({ ok: true }));
 
 app.post("/reset", (_req, res) => {
-  // إذا عندك جلسات/تخزين سياق لاحقًا — هنا مكان reset
   res.json({ ok: true });
+});
+
+// ✅ NEW: TTS endpoint
+app.post("/tts", chatLimiter, async (req, res) => {
+  try {
+    const text = String(req.body?.text || "").trim();
+    const voice = String(req.body?.voice || TTS_VOICE).trim() || TTS_VOICE;
+
+    // حماية بسيطة ضد إدخال طويل جدًا
+    if (!text) return res.status(400).json({ ok: false, error: "empty_text" });
+
+    const wav = await callGroqTTS(text, { voice });
+
+    res.setHeader("Content-Type", "audio/wav");
+    res.setHeader("Cache-Control", "no-store");
+    res.setHeader("Content-Length", String(wav.length));
+    return res.status(200).send(wav);
+  } catch (e) {
+    console.error(e);
+    return res.status(500).json({ ok: false, error: "tts_error" });
+  }
 });
 
 app.post("/chat", chatLimiter, async (req, res) => {
@@ -322,7 +379,6 @@ app.post("/chat", chatLimiter, async (req, res) => {
 
     const messages = [{ role: "system", content: buildSystemPrompt() }];
 
-    // Only include prior context if it exists; keep it compact to save tokens.
     if (compact) {
       messages.push({
         role: "assistant",
@@ -334,23 +390,21 @@ app.post("/chat", chatLimiter, async (req, res) => {
 
     const maxTokens = chooseMaxTokens(msg, lastCard);
 
-    // 1) Small model first (cheap)
+    // 1) Small model first
     const raw1 = await callGroq(messages, { model: SMALL_MODEL, max_tokens: maxTokens });
     let parsed = extractJson(raw1);
 
-    // 2) Big model only if parsing failed (escalation, not retry)
+    // 2) Big model only if parsing failed
     let raw2 = "";
     if (!parsed) {
       raw2 = await callGroq(messages, { model: BIG_MODEL, max_tokens: maxTokens });
       parsed = extractJson(raw2);
     }
 
-    // Normalize / recover
     let data;
     if (parsed) data = normalize(parsed);
     else data = normalize(recoverPartialCard(raw2 || raw1) || fallback(raw1));
 
-    // Guard against meta formatting answers
     if (isMetaJsonAnswer(data)) {
       data = normalize(recoverPartialCard(raw2 || raw1) || fallback(raw1));
     }
@@ -359,7 +413,7 @@ app.post("/chat", chatLimiter, async (req, res) => {
       ok: true,
       data,
       meta: {
-        model_used: parsed ? (raw2 ? BIG_MODEL : SMALL_MODEL) : (raw2 ? BIG_MODEL : SMALL_MODEL),
+        model_used: raw2 ? BIG_MODEL : SMALL_MODEL,
       },
     });
   } catch (e) {
@@ -370,6 +424,6 @@ app.post("/chat", chatLimiter, async (req, res) => {
 
 app.listen(PORT, () => {
   console.log(
-    `🚀 API running on :${PORT} | small=${SMALL_MODEL} | big=${BIG_MODEL}`
+    `🚀 API running on :${PORT} | small=${SMALL_MODEL} | big=${BIG_MODEL} | tts=${TTS_MODEL}/${TTS_VOICE}`
   );
 });

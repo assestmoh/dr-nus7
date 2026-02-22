@@ -447,7 +447,7 @@ app.post("/chat", chatLimiter, async (req, res) => {
         data: {
           category: "general",
           title: "ازدحام مؤقت",
-          verdict: "فيه حد توكنز/دقيقة على الذكاء. انتظر قليلًا ثم أعد المحاولة.",
+          verdict: "فيه حد توكنز/دقيقة على Groq. انتظر قليلًا ثم أعد المحاولة.",
           next_question: "",
           quick_choices: ["أعد المحاولة بعد 20 ثانية", "خفّض طول الرسالة"],
           tips: ["لا ترسل رسائل متتالية بسرعة", "خفّض max_tokens إذا لزم"],

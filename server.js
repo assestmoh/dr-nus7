@@ -1,70 +1,79 @@
 import "dotenv/config";
 import express from "express";
-import cors from "cors";
-import bodyParser from "body-parser";
 import fetch from "node-fetch";
 import helmet from "helmet";
+import cors from "cors";
+import bodyParser from "body-parser";
 import rateLimit from "express-rate-limit";
 
 const app = express();
 
-const GROQ_API_KEY = process.env.GROQ_API_KEY;
-const PORT = process.env.PORT || 8000;
+/* ================= CONFIG ================= */
 
-if (!GROQ_API_KEY) {
-  console.error("❌ GROQ_API_KEY missing");
+const PORT = process.env.PORT || 8000;
+const API_KEY = process.env.GROQ_API_KEY;
+const MODEL = process.env.GROQ_SMALL_MODEL || "llama-3.1-8b-instant";
+
+const MAX_TOKENS = 120;
+const TEMP = 0.25;
+
+if (!API_KEY) {
+  console.error("Missing GROQ_API_KEY");
   process.exit(1);
 }
 
-/* ================= CONFIG ================= */
-
-const MODEL = process.env.GROQ_SMALL_MODEL || "llama-3.1-8b-instant";
-
-const TEMP = Number(process.env.GROQ_TEMPERATURE || 0.25);
-const MAX_TOKENS = Number(process.env.GROQ_MAX_TOKENS || 120);
-
-const SESSION_TTL = Number(
-  process.env.SESSION_TTL_MS || 6 * 60 * 60 * 1000
-);
-
-/* ================= BASIC SECURITY ================= */
+/* ================= SECURITY ================= */
 
 app.use(helmet());
-app.set("trust proxy", 1);
-
 app.use(cors({ origin: true }));
-
 app.use(bodyParser.json({ limit: "2mb" }));
 
 app.use(
   rateLimit({
-    windowMs: 60 * 1000,
-    max: Number(process.env.CHAT_RPM || 6),
-    standardHeaders: true,
-    legacyHeaders: false,
+    windowMs: 60000,
+    max: 6,
   })
 );
 
-/* ================= SESSION MEMORY ================= */
+/* ================= SMART CACHE ================= */
 
-const sessions = new Map();
+const CACHE = new Map();
+const CACHE_TTL = 1000 * 60 * 60 * 6; // 6h
 
-function hasSystem(sid) {
-  const s = sessions.get(sid);
-  if (!s) return false;
+function normalizeKey(text) {
+  return text
+    .toLowerCase()
+    .replace(/[؟?!.,]/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
 
-  if (Date.now() - s > SESSION_TTL) {
-    sessions.delete(sid);
-    return false;
+function getCache(key) {
+  const item = CACHE.get(key);
+  if (!item) return null;
+
+  if (Date.now() > item.exp) {
+    CACHE.delete(key);
+    return null;
   }
 
-  sessions.set(sid, Date.now());
-  return true;
+  return item.data;
 }
 
-function markSystem(sid) {
-  sessions.set(sid, Date.now());
+function setCache(key, data) {
+  CACHE.set(key, {
+    data,
+    exp: Date.now() + CACHE_TTL,
+  });
 }
+
+/* auto cleanup */
+setInterval(() => {
+  const now = Date.now();
+  for (const [k, v] of CACHE.entries()) {
+    if (now > v.exp) CACHE.delete(k);
+  }
+}, 600000);
 
 /* ================= HELPERS ================= */
 
@@ -72,53 +81,14 @@ function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-async function fetchWithTimeout(url, options, ms = 20000) {
-  const controller = new AbortController();
-  const id = setTimeout(() => controller.abort(), ms);
-
-  try {
-    return await fetch(url, {
-      ...options,
-      signal: controller.signal,
-    });
-  } finally {
-    clearTimeout(id);
-  }
-}
-
-/* ================= SYSTEM PROMPT ================= */
-
-function systemPrompt() {
-  return `
-أنت دليل العافية.
-قدم تثقيف صحي عام فقط.
-لا تشخص.
-لا تعطي جرعات.
-
-أخرج JSON فقط:
-
-{
- "category":"general",
- "title":"عنوان قصير",
- "verdict":"جملة مفيدة",
- "next_question":"",
- "quick_choices":[],
- "tips":[],
- "when_to_seek_help":""
-}
-`.trim();
-}
-
-/* ================= GROQ CALL + SMART RETRY ================= */
-
 async function callGroq(messages) {
   async function attempt() {
-    const res = await fetchWithTimeout(
+    const res = await fetch(
       "https://api.groq.com/openai/v1/chat/completions",
       {
         method: "POST",
         headers: {
-          Authorization: `Bearer ${GROQ_API_KEY}`,
+          Authorization: `Bearer ${API_KEY}`,
           "Content-Type": "application/json",
         },
         body: JSON.stringify({
@@ -131,29 +101,26 @@ async function callGroq(messages) {
     );
 
     if (!res.ok) {
-      const txt = await res.text();
-      const err = new Error(txt);
+      const t = await res.text();
+      const err = new Error(t);
       err.status = res.status;
       throw err;
     }
 
-    const data = await res.json();
-    return data.choices?.[0]?.message?.content || "";
+    const json = await res.json();
+    return json.choices?.[0]?.message?.content || "";
   }
 
   try {
     return await attempt();
   } catch (e) {
-    /* ✅ retry ذكي */
-    if (e.status === 429 || e.status === 503) {
-      await sleep(500 + Math.random() * 300);
+    if (e.status === 429) {
+      await sleep(500);
       return await attempt();
     }
     throw e;
   }
 }
-
-/* ================= JSON SAFE ================= */
 
 function extractJson(text) {
   try {
@@ -162,14 +129,22 @@ function extractJson(text) {
 
   const a = text.indexOf("{");
   const b = text.lastIndexOf("}");
-
   if (a !== -1 && b !== -1) {
     try {
       return JSON.parse(text.slice(a, b + 1));
     } catch {}
   }
-
   return null;
+}
+
+/* ================= PROMPT ================= */
+
+function systemPrompt() {
+  return `
+أنت دليل العافية.
+قدم تثقيف صحي فقط.
+أخرج JSON فقط.
+`.trim();
 }
 
 /* ================= ROUTES ================= */
@@ -180,54 +155,49 @@ app.get("/health", (_, res) => {
 
 app.post("/chat", async (req, res) => {
   try {
-    const msg = String(req.body?.message || "").trim();
-    const sid =
-      req.headers["x-session-id"] ||
-      req.body?.context?.session_id ||
-      "anon";
+    const message = String(req.body?.message || "").trim();
+    if (!message) return res.json({ ok: false });
 
-    if (!msg)
-      return res.status(400).json({ ok: false });
+    const key = normalizeKey(message);
 
-    const messages = [];
-
-    /* ✅ system once */
-    if (!hasSystem(sid)) {
-      messages.push({
-        role: "system",
-        content: systemPrompt(),
+    /* ===== CACHE HIT ===== */
+    const cached = getCache(key);
+    if (cached) {
+      console.log("⚡ CACHE HIT");
+      return res.json({
+        ok: true,
+        data: cached,
+        cached: true,
       });
-      markSystem(sid);
     }
 
-    messages.push({
-      role: "user",
-      content: msg,
-    });
+    /* ===== AI CALL ===== */
+    const messages = [
+      { role: "system", content: systemPrompt() },
+      { role: "user", content: message },
+    ];
 
     const raw = await callGroq(messages);
     const parsed = extractJson(raw);
 
-    /* ✅ لا fallback */
-    if (!parsed) {
-      return res.status(204).end();
-    }
+    if (!parsed)
+      return res.json({
+        ok: false,
+        error: "ai_no_response",
+      });
+
+    /* ===== SAVE CACHE ===== */
+    setCache(key, parsed);
 
     res.json({
       ok: true,
       data: parsed,
+      cached: false,
     });
   } catch (e) {
-    /* ✅ لا رد قبيح */
-    if (e.status === 429) {
-      return res.status(429).json({
-        ok: false,
-        error: "rate_limited",
-      });
-    }
-
     console.error(e);
-    res.status(503).json({
+
+    return res.json({
       ok: false,
       error: "temporary_unavailable",
     });
@@ -237,7 +207,5 @@ app.post("/chat", async (req, res) => {
 /* ================= START ================= */
 
 app.listen(PORT, "0.0.0.0", () => {
-  console.log(
-    `🚀 API running :${PORT} | model=${MODEL}`
-  );
+  console.log(`🚀 Smart Cached API :${PORT}`);
 });

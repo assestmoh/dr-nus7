@@ -125,7 +125,6 @@ function recoverPartialCard(raw) {
   const category = pick(/"category"\s*:\s*"([^"]+)"/) || "general";
   const title = pick(/"title"\s*:\s*"([^"]+)"/) || "دليل العافية";
   const verdict = pick(/"verdict"\s*:\s*"([^"]+)"/) || "";
-  const next_question = pick(/"next_question"\s*:\s*"([^"]*)"/) || "";
   const when_to_seek_help = pick(/"when_to_seek_help"\s*:\s*"([^"]*)"/) || "";
 
   const arrPick = (key, limit) => {
@@ -140,15 +139,12 @@ function recoverPartialCard(raw) {
       .slice(0, limit);
   };
 
-  const quick_choices = arrPick("quick_choices", 2);
-  const tips = arrPick("tips", 2);
+  const tips = arrPick("tips", 3);
 
   return {
     category,
     title,
     verdict,
-    next_question,
-    quick_choices,
     tips,
     when_to_seek_help,
   };
@@ -160,13 +156,9 @@ function isMetaJsonAnswer(d) {
     " " +
     String(d?.verdict || "") +
     " " +
-    String(d?.next_question || "") +
-    " " +
     String(d?.when_to_seek_help || "") +
     " " +
-    (Array.isArray(d?.tips) ? d.tips.join(" ") : "") +
-    " " +
-    (Array.isArray(d?.quick_choices) ? d.quick_choices.join(" ") : "");
+    (Array.isArray(d?.tips) ? d.tips.join(" ") : "");
 
   return /json|format|schema|اقتباس|فواصل|تنسيق/i.test(text);
 }
@@ -202,9 +194,7 @@ function normalize(obj) {
     category: cat,
     title: sStr(obj?.title) || "دليل العافية",
     verdict: sStr(obj?.verdict),
-    next_question: sStr(obj?.next_question),
-    quick_choices: sArr(obj?.quick_choices, 2),
-    tips: sArr(obj?.tips, 2),
+    tips: sArr(obj?.tips, 3),
     when_to_seek_help: sStr(obj?.when_to_seek_help),
   };
 }
@@ -217,7 +207,7 @@ function buildSystemPrompt() {
 أجب عربيًا واضحًا وباختصار، بدون تكرار.
 
 أعد JSON فقط وبلا أي نص خارجه وبدون Markdown، بالشكل:
-{"category":"general|nutrition|bp|sugar|sleep|activity|mental|first_aid|report|emergency|water|calories|bmi","title":"2-5 كلمات","verdict":"جملة واحدة","next_question":"سؤال واحد أو \"\"","quick_choices":["",""],"tips":["",""],"when_to_seek_help":"\"\" أو نص قصير"}
+{"category":"general|nutrition|bp|sugar|sleep|activity|mental|first_aid|report|emergency|water|calories|bmi","title":"2-5 كلمات","verdict":"جملة واحدة","tips":["","",""],"when_to_seek_help":"\"\" أو نص قصير"}
 `.trim();
 }
 
@@ -273,8 +263,6 @@ function fallback(rawText) {
     category: "general",
     title: "معلومة صحية",
     verdict: looseVerdict || "تعذر توليد رد منظم الآن. جرّب إعادة صياغة السؤال بشكل مختصر.",
-    next_question: "",
-    quick_choices: [],
     tips: [],
     when_to_seek_help: "",
   };

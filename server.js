@@ -1,4 +1,4 @@
-// server.js — Dalil Alafiyah API (clean + hardened + cheaper routing) + TTS
+// server.js — Dalil Alafiyah API (cheaper + safer: no big-fallback, forced JSON, system-lite, TTS cache)
 import "dotenv/config";
 import express from "express";
 import cors from "cors";
@@ -6,15 +6,16 @@ import bodyParser from "body-parser";
 import fetch from "node-fetch";
 import helmet from "helmet";
 import rateLimit from "express-rate-limit";
+import crypto from "crypto";
 
 const app = express();
 
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
 
-// Small-first / Big-fallback (LLM)
-const SMALL_MODEL = process.env.GROQ_SMALL_MODEL || "llama-3.1-8b-instant";
-const BIG_MODEL =
-  (process.env.GROQ_BIG_MODEL || process.env.GROQ_MODEL || "llama-3.3-70b-versatile").trim();
+// LLM (small-only by default)
+const SMALL_MODEL = (process.env.GROQ_SMALL_MODEL || "llama-3.1-8b-instant").trim();
+// Optional (kept for visibility / future), but we DO NOT auto-fallback to it anymore.
+const BIG_MODEL = (process.env.GROQ_BIG_MODEL || process.env.GROQ_MODEL || "").trim();
 
 // TTS (Orpheus Arabic Saudi)
 const TTS_MODEL = (process.env.GROQ_TTS_MODEL || "canopylabs/orpheus-arabic-saudi").trim();
@@ -29,11 +30,6 @@ const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || "")
 
 if (!GROQ_API_KEY) {
   console.error("❌ GROQ_API_KEY غير مضبوط");
-  process.exit(1);
-}
-
-if (!BIG_MODEL) {
-  console.error("❌ BIG_MODEL فارغ. اضبط GROQ_BIG_MODEL أو GROQ_MODEL");
   process.exit(1);
 }
 
@@ -55,12 +51,13 @@ app.use(
 
 app.use(bodyParser.json({ limit: "2mb" }));
 
+// Better: rate-limit by user-id (falls back to IP)
 const chatLimiter = rateLimit({
   windowMs: 60 * 1000,
   max: Number(process.env.CHAT_RPM || 25),
   standardHeaders: true,
   legacyHeaders: false,
-  keyGenerator: (req) => String(req.ip),
+  keyGenerator: (req) => String(req.header("x-user-id") || req.ip),
 });
 
 // ---------- helpers ----------
@@ -71,41 +68,6 @@ async function fetchWithTimeout(url, options = {}, ms = 15000) {
     return await fetch(url, { ...options, signal: controller.signal });
   } finally {
     clearTimeout(id);
-  }
-}
-
-function cleanJsonish(s) {
-  let t = String(s || "").trim();
-  if (t.startsWith("```")) {
-    t = t.replace(/^```[a-zA-Z]*\s*/m, "").replace(/```$/m, "").trim();
-  }
-  t = t.replace(/[“”]/g, '"').replace(/[‘’]/g, "'");
-  t = t.replace(/,\s*([}\]])/g, "$1");
-  return t;
-}
-
-function extractJson(text) {
-  const s0 = String(text || "");
-  let s = cleanJsonish(s0);
-
-  try {
-    const first = JSON.parse(s);
-    if (first && typeof first === "object") return first;
-    if (typeof first === "string") {
-      const second = JSON.parse(cleanJsonish(first));
-      if (second && typeof second === "object") return second;
-    }
-  } catch {}
-
-  const a = s.indexOf("{");
-  const b = s.lastIndexOf("}");
-  if (a === -1 || b === -1 || b <= a) return null;
-
-  const chunk = cleanJsonish(s.slice(a, b + 1));
-  try {
-    return JSON.parse(chunk);
-  } catch {
-    return null;
   }
 }
 
@@ -209,20 +171,32 @@ function normalize(obj) {
   };
 }
 
-function buildSystemPrompt() {
-  // Compressed prompt to cut tokens (still safe + Oman emergency routing)
+// ---------- prompts (system-lite after first message per user) ----------
+function buildSystemPromptFull() {
   return `
-أنت "دليل العافية" مساعد توعوي صحي عربي لعُمان. توعية عامة فقط (ليس تشخيصًا ولا وصف علاج/جرعات).
+أنت "دليل العافية" مساعد توعوي صحي عربي لعُمان. توعية عامة فقط (ليس تشخيصًا ولا علاجًا ولا جرعات).
 عند علامات الخطر أو الطوارئ: وجّه فورًا للاتصال 9999 أو 24343666 وقدّم إسعافًا أوليًا بسيطًا وآمنًا فقط.
-أجب عربيًا واضحًا وباختصار، بدون تكرار.
+اختصر جدًا، بدون تكرار.
 
-أعد JSON فقط وبلا أي نص خارجه وبدون Markdown، بالشكل:
-{"category":"general|nutrition|bp|sugar|sleep|activity|mental|first_aid|report|emergency|water|calories|bmi","title":"2-5 كلمات","verdict":"جملة واحدة","next_question":"سؤال واحد أو \"\"","quick_choices":["",""],"tips":["",""],"when_to_seek_help":"\"\" أو نص قصير"}
+أعد JSON فقط بالشكل:
+{"category":"general|nutrition|bp|sugar|sleep|activity|mental|first_aid|report|emergency|water|calories|bmi","title":"","verdict":"","next_question":"","quick_choices":["",""],"tips":["",""],"when_to_seek_help":""}
 `.trim();
 }
 
+const SYSTEM_LITE = `أجب باختصار وأعد JSON فقط. عند طوارئ: 9999 أو 24343666.`;
+
+const USER_SEEN = new Map(); // userId -> lastSeenTs
+const USER_SEEN_TTL_MS = 60 * 60 * 1000; // 1h
+
+function getSystemForUser(userId) {
+  const now = Date.now();
+  const last = USER_SEEN.get(userId) || 0;
+  const fresh = now - last < USER_SEEN_TTL_MS;
+  USER_SEEN.set(userId, now);
+  return fresh ? SYSTEM_LITE : buildSystemPromptFull();
+}
+
 function compactLastCard(lastCard) {
-  // Keep only what's useful for routing and keep it tiny
   const cat = sStr(lastCard?.category);
   return cat ? { category: cat } : null;
 }
@@ -232,9 +206,11 @@ function chooseMaxTokens(msg, lastCard) {
 
   const text = String(msg || "");
   const cat = sStr(lastCard?.category);
-  if (cat === "report" || /تقرير|ملخص|تحليل/i.test(text)) return Math.max(base, 320);
+
+  // reduced ceilings (was 320) to avoid waste
+  if (cat === "report" || /تقرير|ملخص|تحليل/i.test(text)) return Math.max(base, 180);
   if (cat === "emergency" || /طوارئ|إسعاف|اختناق|نزيف|حروق|سكتة/i.test(text))
-    return Math.max(base, 320);
+    return Math.max(base, 160);
 
   return base;
 }
@@ -250,9 +226,12 @@ async function callGroq(messages, { model, max_tokens }) {
       },
       body: JSON.stringify({
         model,
-        temperature: 0.35,
+        temperature: 0.2, // helps reduce formatting drift
         max_tokens,
         messages,
+
+        // ✅ Force valid JSON output (kills the JSON-parsing -> big-fallback leak)
+        response_format: { type: "json_object" },
       }),
     },
     20000
@@ -282,7 +261,6 @@ function fallback(rawText) {
 
 // ---------- TTS helpers ----------
 function normalizeArabicForTTS(s) {
-  // اختصر وخل النص مناسب للنطق
   return String(s || "")
     .replace(/\s+/g, " ")
     .replace(/[<>]/g, "")
@@ -321,6 +299,33 @@ async function callGroqTTS(text, { model = TTS_MODEL, voice = TTS_VOICE } = {}) 
   return Buffer.from(ab);
 }
 
+// ---------- TTS cache (server-side) ----------
+const TTS_CACHE = new Map(); // key -> { wav: Buffer, ts: number }
+const TTS_CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24h
+const TTS_CACHE_MAX_ITEMS = 500;
+
+function ttsKey(text, voice) {
+  return crypto.createHash("sha256").update(`${voice}||${text}`).digest("hex");
+}
+
+function ttsCacheGet(key) {
+  const hit = TTS_CACHE.get(key);
+  if (!hit) return null;
+  if (Date.now() - hit.ts > TTS_CACHE_TTL_MS) {
+    TTS_CACHE.delete(key);
+    return null;
+  }
+  return hit.wav;
+}
+
+function ttsCacheSet(key, wav) {
+  if (TTS_CACHE.size >= TTS_CACHE_MAX_ITEMS) {
+    const firstKey = TTS_CACHE.keys().next().value;
+    if (firstKey) TTS_CACHE.delete(firstKey);
+  }
+  TTS_CACHE.set(key, { wav, ts: Date.now() });
+}
+
 // ---------- routes ----------
 app.get("/health", (_req, res) => res.json({ ok: true }));
 
@@ -328,19 +333,29 @@ app.post("/reset", (_req, res) => {
   res.json({ ok: true });
 });
 
-// ✅ NEW: TTS endpoint
+// ✅ TTS endpoint (cached)
 app.post("/tts", chatLimiter, async (req, res) => {
   try {
     const text = String(req.body?.text || "").trim();
     const voice = String(req.body?.voice || TTS_VOICE).trim() || TTS_VOICE;
 
-    // حماية بسيطة ضد إدخال طويل جدًا
     if (!text) return res.status(400).json({ ok: false, error: "empty_text" });
 
-    const wav = await callGroqTTS(text, { voice });
+    const key = ttsKey(text.slice(0, 200), voice);
+    const etag = `"${key}"`;
+
+    // Conditional request
+    if (req.headers["if-none-match"] === etag) return res.status(304).end();
+
+    let wav = ttsCacheGet(key);
+    if (!wav) {
+      wav = await callGroqTTS(text, { voice });
+      ttsCacheSet(key, wav);
+    }
 
     res.setHeader("Content-Type", "audio/wav");
-    res.setHeader("Cache-Control", "no-store");
+    res.setHeader("ETag", etag);
+    res.setHeader("Cache-Control", "public, max-age=86400"); // 24h
     res.setHeader("Content-Length", String(wav.length));
     return res.status(200).send(wav);
   } catch (e) {
@@ -355,16 +370,18 @@ app.post("/chat", chatLimiter, async (req, res) => {
     if (!msg) return res.status(400).json({ ok: false, error: "empty_message" });
     if (msg.length > 350) return res.status(400).json({ ok: false, error: "message_too_long" });
 
+    const userId = String(req.header("x-user-id") || req.ip);
+
     const lastCard = req.body?.context?.last || null;
     const lastCategory = String(req.body?.context?.category || lastCard?.category || "").trim();
     const compact = compactLastCard({ category: lastCategory });
 
-    const messages = [{ role: "system", content: buildSystemPrompt() }];
+    const messages = [{ role: "system", content: getSystemForUser(userId) }];
 
     if (compact) {
       messages.push({
         role: "assistant",
-        content: "سياق سابق مختصر للاستمرار:\n" + JSON.stringify(compact),
+        content: "سياق سابق مختصر:\n" + JSON.stringify(compact),
       });
     }
 
@@ -372,30 +389,30 @@ app.post("/chat", chatLimiter, async (req, res) => {
 
     const maxTokens = chooseMaxTokens(msg, { category: lastCategory });
 
-    // 1) Small model first
-    const raw1 = await callGroq(messages, { model: SMALL_MODEL, max_tokens: maxTokens });
-    let parsed = extractJson(raw1);
+    // ✅ Small-only call (no hidden big-fallback)
+    const raw = await callGroq(messages, { model: SMALL_MODEL, max_tokens: maxTokens });
 
-    // 2) Big model only if parsing failed
-    let raw2 = "";
-    if (!parsed) {
-      raw2 = await callGroq(messages, { model: BIG_MODEL, max_tokens: maxTokens });
-      parsed = extractJson(raw2);
+    let parsed = null;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      parsed = null;
     }
 
     let data;
     if (parsed) data = normalize(parsed);
-    else data = normalize(recoverPartialCard(raw2 || raw1) || fallback(raw1));
+    else data = normalize(recoverPartialCard(raw) || fallback(raw));
 
     if (isMetaJsonAnswer(data)) {
-      data = normalize(recoverPartialCard(raw2 || raw1) || fallback(raw1));
+      data = normalize(recoverPartialCard(raw) || fallback(raw));
     }
 
     return res.json({
       ok: true,
       data,
       meta: {
-        model_used: raw2 ? BIG_MODEL : SMALL_MODEL,
+        model_used: SMALL_MODEL,
+        system_mode: USER_SEEN.get(userId) ? "lite_or_full" : "unknown",
       },
     });
   } catch (e) {
@@ -406,6 +423,8 @@ app.post("/chat", chatLimiter, async (req, res) => {
 
 app.listen(PORT, () => {
   console.log(
-    `🚀 API running on :${PORT} | small=${SMALL_MODEL} | big=${BIG_MODEL} | tts=${TTS_MODEL}/${TTS_VOICE}`
+    `🚀 API running on :${PORT} | small=${SMALL_MODEL}` +
+      (BIG_MODEL ? ` | big(kept-unused)=${BIG_MODEL}` : "") +
+      ` | tts=${TTS_MODEL}/${TTS_VOICE}`
   );
 });

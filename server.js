@@ -21,7 +21,7 @@ const app = express();
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
 
 // Small-first / Big-fallback
-const SMALL_MODEL = process.env.GROQ_SMALL_MODEL || "llama3-8b-8192";
+const SMALL_MODEL = process.env.GROQ_SMALL_MODEL || "llama-3.3-70b-versatile";
 const BIG_MODEL =
   process.env.GROQ_BIG_MODEL || process.env.GROQ_MODEL || "openai/gpt-oss-120b";
 

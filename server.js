@@ -205,9 +205,10 @@ function buildSystemPrompt() {
 أنت "دليل العافية" مساعد توعوي صحي عربي لعُمان. توعية عامة فقط (ليس تشخيصًا ولا وصف علاج/جرعات).
 عند علامات الخطر أو الطوارئ: وجّه فورًا للاتصال 9999 أو 24343666 وقدّم إسعافًا أوليًا بسيطًا وآمنًا فقط.
 أجب عربيًا واضحًا وباختصار، بدون تكرار.
+اجعل قيمة verdict سطرين كحد أقصى (جملتان قصيرتان مفيدتان) وافصل بينهما بـ \n.
 
 أعد JSON فقط وبلا أي نص خارجه وبدون Markdown، بالشكل:
-{"category":"general|nutrition|bp|sugar|sleep|activity|mental|first_aid|report|emergency|water|calories|bmi","title":"2-5 كلمات","verdict":"جملة واحدة","tips":["","",""],"when_to_seek_help":"\"\" أو نص قصير"}
+{"category":"general|nutrition|bp|sugar|sleep|activity|mental|first_aid|report|emergency|water|calories|bmi","title":"2-5 كلمات","verdict":"سطران كحد أقصى (جملتان قصيرتان مفيدتان)","tips":["","",""],"when_to_seek_help":"\"\" أو نص قصير"}
 `.trim();
 }
 
@@ -218,7 +219,7 @@ function compactLastCard(lastCard) {
 }
 
 function chooseMaxTokens(msg, lastCard) {
-  const base = Number(process.env.GROQ_MAX_TOKENS || 140);
+  const base = Number(process.env.GROQ_MAX_TOKENS || 220);
 
   const text = String(msg || "");
   const cat = sStr(lastCard?.category);

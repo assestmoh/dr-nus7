@@ -9,6 +9,36 @@ import rateLimit from "express-rate-limit";
 
 const app = express();
 
+// ===== In-memory cache (simple) =====
+// ملاحظة: هذا كاش داخل الذاكرة — يختفي عند إعادة تشغيل السيرفر.
+const CHAT_CACHE_MAX = Number(process.env.CHAT_CACHE_MAX || 1500);
+const TTS_CACHE_MAX = Number(process.env.TTS_CACHE_MAX || 800);
+
+const chatCache = new Map(); // key -> data(JSON)
+const ttsCache = new Map(); // key -> Buffer(wav)
+
+function normKey(s, maxLen = 280) {
+  return String(s || "")
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, " ")
+    .slice(0, maxLen);
+}
+
+function cacheGet(map, key) {
+  return map.has(key) ? map.get(key) : null;
+}
+
+function cacheSet(map, key, value, maxItems) {
+  // تفريغ بسيط عند الامتلاء (أقدم عنصر)
+  if (map.size >= maxItems) {
+    const firstKey = map.keys().next().value;
+    if (firstKey) map.delete(firstKey);
+  }
+  map.set(key, value);
+}
+
+
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
 
 // Small-first / Big-fallback (LLM)
@@ -202,13 +232,37 @@ function normalize(obj) {
 function buildSystemPrompt() {
   // Compressed prompt to cut tokens (still safe + Oman emergency routing)
   return `
-أنت "دليل العافية" مساعد توعوي صحي عربي لسلطنة عمان. توعية عامة فقط (ليس تشخيصًا ولا وصف علاج/جرعات).
-عند علامات الخطر أو الطوارئ: وجّه فورًا للاتصال 9999 أو 24343666 وقدّم إسعافًا أوليًا بسيطًا وآمنًا فقط.
-أجب عربيًا واضحًا بنفس معلومات وعيك صحة في موقع وزارة الصحة العماني.
-اجعل قيمة verdict ثلاث اسطر كحد أقصى (ثلاث جمل شاملة مفيده ) وافصل بينهما بـ \n.
+  أنت "دليل العافية" مساعد تثقيف صحي ذكي لمجتمع سلطنة عُمان يقدم معلومات صحية موثوقة بأسلوب محادثة طبيعي مبسط اعتمادًا على التوعية الصحية الرسمية لوزارة الصحة العُمانية.
 
+الدور:
+تثقيف صحي عام، وقاية، إسعافات أولية، معلومات دوائية عامة ونمط حياة صحي.
+ممنوع التشخيص الطبي أو وصف علاج شخصي أو تحديد جرعات.
+
+النطاق:
+الإسعافات الأولية والحوادث المنزلية وضربة الشمس والإصابات،
+الاستخدام الآمن للأدوية والمضادات الحيوية والتداخلات الدوائية،
+صحة المرأة (الدورة، الحمل، الرضاعة، سرطان الثدي)،
+صحة الأطفال (الحمى، الإمساك، سلس البول، التغذية والتطعيمات)،
+الصحة النفسية (القلق، الاكتئاب، التنمر، الوقاية من الانتحار)،
+الإقلاع عن التدخين والتبغ ونقص الفيتامينات،
+الأمراض المعدية وغير المعدية وطرق الوقاية.
+
+أسلوب الرد:
+مباشر، ذكي، مختصر وتوعوي.
+قدم الفائدة أولا
+الطوارئ:
+عند أعراض خطيرة مثل ألم صدر، صعوبة تنفس، فقدان وعي، نزيف شديد، تشنجات، إصابة خطيرة أو أفكار إيذاء النفس:
+وجّه فورًا إلى:
+9999 شرطة عُمان السلطانية
+24343666 الهيئة الصحية
+مع تقديم إسعاف أولي بسيط فقط.
+
+تنسيق verdict:
+اجعل قيمة verdict ثلاث اسطر كحد أقصى (ثلاث جمل مفيده شاملة  مفيدة) وافصل بينهما باستخدام \n.
+
+أنت مثقف صحي يقدم معلومات عامة وليس طبيبًا.
 أعد JSON فقط وبلا أي نص خارجه وبدون Markdown، بالشكل:
-{"category":"general|nutrition|bp|sugar|sleep|activity|mental|first_aid|report|emergency|water|calories|bmi","title":"2-5 كلمات","verdict":"ثلاث اسطر كحد أقصى (ثلاث جمل شاملة مفيدة )","tips":["","",""],"when_to_seek_help":"\"\" أو نص قصير"}
+{"category":"general|nutrition|bp|sugar|sleep|activity|mental|first_aid|report|emergency|water|calories|bmi","title":"2-5 كلمات","verdict":"ثلاث اسطر كحد أقصى (ثلاث جمل مفيدة )","tips":["","",""],"when_to_seek_help":"\"\" أو نص قصير"}
 `.trim();
 }
 
@@ -326,10 +380,23 @@ app.post("/tts", chatLimiter, async (req, res) => {
     // حماية بسيطة ضد إدخال طويل جدًا
     if (!text) return res.status(400).json({ ok: false, error: "empty_text" });
 
+    // ✅ TTS CACHE (server-side)
+    const ttsKey = `v:${normKey(voice, 40)}|t:${normKey(text, 200)}`;
+    const ttsHit = cacheGet(ttsCache, ttsKey);
+    if (ttsHit) {
+      res.setHeader("Content-Type", "audio/wav");
+      res.setHeader("Cache-Control", "public, max-age=86400");
+      res.setHeader("Content-Length", String(ttsHit.length));
+      return res.status(200).send(ttsHit);
+    }
+
     const wav = await callGroqTTS(text, { voice });
 
+    // خزّن الصوت
+    cacheSet(ttsCache, ttsKey, wav, TTS_CACHE_MAX);
+
     res.setHeader("Content-Type", "audio/wav");
-    res.setHeader("Cache-Control", "no-store");
+    res.setHeader("Cache-Control", "public, max-age=86400");
     res.setHeader("Content-Length", String(wav.length));
     return res.status(200).send(wav);
   } catch (e) {
@@ -346,6 +413,13 @@ app.post("/chat", chatLimiter, async (req, res) => {
 
     const lastCard = req.body?.context?.last || null;
     const lastCategory = String(req.body?.context?.category || lastCard?.category || "").trim();
+
+    // ✅ CHAT CACHE (server-side)
+    const chatKey = `c:${normKey(lastCategory, 32)}|m:${normKey(msg, 300)}`;
+    const chatHit = cacheGet(chatCache, chatKey);
+    if (chatHit) {
+      return res.json({ ok: true, data: chatHit, meta: { model_used: "cache" } });
+    }
     const compact = compactLastCard({ category: lastCategory });
 
     const messages = [{ role: "system", content: buildSystemPrompt() }];
@@ -379,6 +453,9 @@ app.post("/chat", chatLimiter, async (req, res) => {
     if (isMetaJsonAnswer(data)) {
       data = normalize(recoverPartialCard(raw2 || raw1) || fallback(raw1));
     }
+
+        // خزّن الرد المنظم
+    cacheSet(chatCache, chatKey, data, CHAT_CACHE_MAX);
 
     return res.json({
       ok: true,

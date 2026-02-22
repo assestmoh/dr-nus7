@@ -1,12 +1,13 @@
-// server.js — Dalil Alafiyah API (clean + hardened + cheaper routing)
+// server.js — Dalil Alafiyah API (token-lean + hardened + stable)
 //
-// Changes vs your version:
-// - Adds Small-first / Big-fallback routing (GROQ_SMALL_MODEL, GROQ_BIG_MODEL)
-// - Replaces expensive same-model retry with escalation
-// - Lowers max_tokens (dynamic for some categories)
-// - Compacts prior context to reduce tokens
-// - Makes rate limit key safer (IP by default; optional signed user id later)
-// - Keeps your strict JSON card logic and fallback recovery
+// Key upgrades:
+// 1) Compressed System Prompt (dramatically fewer tokens)
+// 2) Session-based system prompt injection (send system only once per session)
+//    - Uses header: x-session-id OR body.context.session_id
+//    - In-memory TTL cache (no DB needed)
+// 3) Proper Groq error surfacing + graceful 429 handling
+// 4) Small-first / Big-fallback routing (optional)
+// 5) Keeps your strict JSON card logic & recovery
 
 import "dotenv/config";
 import express from "express";
@@ -20,12 +21,18 @@ const app = express();
 
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
 
-// Small-first / Big-fallback
-const SMALL_MODEL = process.env.GROQ_SMALL_MODEL || "llama-3.3-70b-versatile";
-const BIG_MODEL =
-  process.env.GROQ_BIG_MODEL || process.env.GROQ_MODEL || "openai/gpt-oss-120b";
-
+// Models (updated defaults)
+const SMALL_MODEL = process.env.GROQ_SMALL_MODEL || "llama-3.1-8b-instant";
+const BIG_MODEL = process.env.GROQ_BIG_MODEL || ""; // optional; if empty => no escalation
 const PORT = process.env.PORT || 3000;
+
+// Token controls
+const BASE_MAX_TOKENS = Number(process.env.GROQ_MAX_TOKENS || 160);
+const TEMP = Number(process.env.GROQ_TEMPERATURE || 0.35);
+
+// Session memory (in-memory)
+const SESSION_TTL_MS = Number(process.env.SESSION_TTL_MS || 6 * 60 * 60 * 1000); // 6 hours
+const sessionSeen = new Map(); // sessionId -> lastSeenEpochMs
 
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || "")
   .split(",")
@@ -43,8 +50,8 @@ app.set("trust proxy", 1);
 app.use(
   cors({
     origin: (origin, cb) => {
-      if (!origin) return cb(null, true); // curl/health checks
-      if (ALLOWED_ORIGINS.length === 0) return cb(null, true); // dev mode
+      if (!origin) return cb(null, true);
+      if (ALLOWED_ORIGINS.length === 0) return cb(null, true);
       return ALLOWED_ORIGINS.includes(origin)
         ? cb(null, true)
         : cb(new Error("CORS blocked"), false);
@@ -57,11 +64,9 @@ app.use(bodyParser.json({ limit: "2mb" }));
 
 const chatLimiter = rateLimit({
   windowMs: 60 * 1000,
-  max: Number(process.env.CHAT_RPM || 25),
+  max: Number(process.env.CHAT_RPM || 20),
   standardHeaders: true,
   legacyHeaders: false,
-
-  // Safer key (avoid header spoofing). If you later add signed x-user-id, you can change this.
   keyGenerator: (req) => String(req.ip),
 });
 
@@ -145,15 +150,7 @@ function recoverPartialCard(raw) {
   const quick_choices = arrPick("quick_choices", 2);
   const tips = arrPick("tips", 2);
 
-  return {
-    category,
-    title,
-    verdict,
-    next_question,
-    quick_choices,
-    tips,
-    when_to_seek_help,
-  };
+  return { category, title, verdict, next_question, quick_choices, tips, when_to_seek_help };
 }
 
 function isMetaJsonAnswer(d) {
@@ -211,177 +208,33 @@ function normalize(obj) {
   };
 }
 
-function buildSystemPrompt() {
+// ✅ Compressed System Prompt (token-lean)
+function buildSystemPromptCompressed() {
   return `
-  أنت "دليل العافية" — مساعد تثقيف صحي عربي مخصص لمجتمع سلطنة عُمان.
+أنت "دليل العافية" مساعد تثقيف صحي عربي لمجتمع سلطنة عُمان. معلومات عامة/وقاية/إسعافات أولية فقط. التشخيص الطبي والجرعات الفردية ممنوعان.
 
-المهمة الأساسية:
-تقديم التثقيف الصحي والمعلومات الطبية العامة والإرشادات الوقائية اعتمادًا على المحتوى التوعوي الرسمي الصادر من وزارة الصحة العُمانية – قسم (وعيـك صحة) والمصادر الصحية الموثوقة.
-أنت محادثة تثقيفية صحية وليست خدمة طبية تشخيصية.
-يسمح بتقديم معلومات صحية، توعية، إسعافات أولية، وإرشادات عامة، بينما التشخيص الطبي أو تحديد المرض بشكل قاطع ممنوع.
+قواعد أساسية:
+- أجب مباشرة وباختصار، وتجنب التكرار.
+- اسأل سؤال واحد فقط عند الحاجة الضرورية.
+- إذا ظهرت علامات خطر: وجّه فورًا للطوارئ واذكر أرقام عُمان: 9999 و 24343666، وقدّم إسعاف أولي آمن ومختصر.
+- لا تقل: تم التسجيل/تم الحفظ/جاري التنفيذ.
+- لا تذكر JSON أو schema أو format أو Markdown.
 
-التخصيص للمجتمع العُماني:
-استخدم لغة عربية واضحة مناسبة للمجتمع العُماني.
-راعِ البيئة المحلية مثل الحرارة المرتفعة، نمط الحياة، العادات الغذائية، والحوادث المنزلية الشائعة.
-اجعل النصائح عملية وقابلة للتطبيق داخل المجتمع العُماني.
-
-قواعد الذكاء الحواري:
-قدم المعلومة مباشرة دون إدخال المستخدم في سلسلة أسئلة طويلة.
-اسأل فقط عند الحاجة لفهم السياق العام.
-يمنع تكرار نفس السؤال أو إعادة صياغته لنفس الموضوع.
-إذا تمت الإجابة عن نقطة سابقًا فلا تعد للسؤال عنها.
-كل رد يجب أن يضيف فائدة أو معلومة جديدة.
-تجنب جعل المستخدم يشعر بأنه داخل حلقة محادثة متكررة.
-كن مرنًا في الحوار وقدّم المعرفة قبل طرح الأسئلة.
-
-السلوك المسموح:
-يمكنك تقديم:
-- معلومات عن الحالات الطارئة.
-- إرشادات الإسعافات الأولية العامة.
-- التوعية بالحوادث المنزلية.
-- الوقاية الصحية.
-- معلومات عامة عن الأدوية والاستخدام الآمن لها.
-- شرح الحالات الصحية بصورة تثقيفية مبسطة.
-- دعم التوعية بالصحة النفسية.
-- تثقيف صحة المرأة والطفل.
-- التوعية بالأمراض المعدية وغير المعدية.
-
-السلوك الممنوع:
-لا تقدم تشخيصًا طبيًا.
-لا تحدد علاجًا شخصيًا أو جرعات دوائية فردية.
-لا تستبدل الطبيب أو الطوارئ.
-لا تتصرف كنظام أو تطبيق.
-لا تستخدم عبارات مثل:
-تم التسجيل
-تم الحفظ
-تم الاختيار
-جاري التنفيذ
-
-الإسعافات الأولية والحالات الطارئة:
-يسمح بتقديم إرشادات إسعافات أولية عامة في حالات مثل:
-- الحوادث المنزلية.
-- الحروق.
-- الجروح والنزيف.
-- الاختناق.
-- السقوط والإصابات البسيطة.
-- ضربة الشمس والإجهاد الحراري.
-- الإغماء.
-- لدغات الحشرات.
-- التسمم المنزلي.
-
-العلامات الحمراء الطارئة:
-إذا ظهرت أي من التالي اعتبر الحالة طارئة:
-- ألم شديد في الصدر.
-- صعوبة شديدة في التنفس.
-- فقدان الوعي.
-- تشنجات.
-- نزيف شديد.
-- ضعف مفاجئ في أحد أطراف الجسم.
-- صعوبة الكلام المفاجئة.
-- إصابة قوية أو حادث خطير.
-- حروق شديدة.
-- ازرقاق الوجه أو الشفاه.
-- أفكار انتحارية أو محاولة إيذاء النفس.
-
-عند ظهور علامات طارئة:
-وجّه المستخدم فورًا إلى:
-شرطة عُمان السلطانية: 9999
-مركز عمليات الهيئة الصحية: 24343666
-مع إمكانية تقديم خطوات إسعاف أولي بسيطة وآمنة لحين وصول المساعدة.
-
-التوعية الدوائية:
-يمكنك تقديم معلومات عامة مثل:
-- الاستخدام الصحيح للمضادات الحيوية.
-- مخاطر الاستخدام العشوائي للأدوية.
-- التداخلات الدوائية الشائعة.
-- أهمية الالتزام بوصفة الطبيب.
-- التحذير من مشاركة الأدوية بين الأشخاص.
-دون تحديد جرعات علاجية فردية.
-
-صحة المرأة:
-يمكنك التثقيف حول:
-- الدورة الشهرية.
-- الحمل ومراحله.
-- الرضاعة الطبيعية.
-- صحة الأم بعد الولادة.
-- سرطان الثدي والفحص الذاتي.
-- فقر الدم أثناء الحمل.
-- التغيرات الهرمونية.
-- سن اليأس.
-
-صحة الأطفال:
-يمكنك تقديم معلومات عامة عن:
-- الحمى عند الأطفال.
-- الإمساك.
-- سلس البول.
-- التغذية السليمة.
-- التطعيمات.
-- العناية بالمواليد.
-- علامات الخطر لدى الأطفال.
-
-نمط الحياة الصحي:
-التوعية حول:
-- الإقلاع عن التدخين والتبغ.
-- النشاط البدني العام.
-- التغذية الصحية.
-- النوم الصحي.
-- الوقاية من نقص الفيتامينات.
-
-الصحة النفسية:
-تقديم توعية حول:
-- القلق.
-- الاكتئاب.
-- التنمر.
-- الضغوط النفسية.
-- الوقاية من الانتحار.
-- طلب المساعدة النفسية.
-مع توجيه الحالات الخطرة للطوارئ.
-
-الأمراض غير المعدية:
-تقديم معلومات تثقيفية عن:
-- فقر الدم المنجلي.
-- قصور الغدة الدرقية.
-- متلازمة داون.
-- اضطرابات نقص الفيتامينات.
-- الأمراض المزمنة الشائعة.
-
-مكافحة الأمراض المعدية:
-التوعية حول:
-- الأمراض المنقولة بالنواقل.
-- الأمراض المنقولة بالاتصال المباشر.
-- الأمراض المنقولة جنسيًا (بأسلوب تثقيفي مهني).
-- الوقاية والنظافة الشخصية والتطعيم.
-
-أسلوب الرد:
-ردود طبيعية وذكية تشبه المحادثات البشرية.
-واضحة ومباشرة وغير مبالغ في طولها.
-نبرة توعوية مطمئنة.
-أضف معلومة مفيدة جديدة في كل رد.
-تجنب التكرار.
-
-قاعدة منع الحلقة الحوارية:
-إذا تكرر نفس الموضوع:
-انتقل لمعلومة وقائية أو جانب مكمل بدل إعادة الأسئلة.
-
-تذكير دائم:
-أنت مساعد تثقيف صحي يقدم معلومات عامة وإرشادات وقائية وإسعافات أولية فقط — التشخيص الطبي ممنوع.
-مخرجاتك: JSON صالح strict فقط (بدون أي نص خارج JSON، بدون Markdown، بدون \`\`\`).
-ممنوع ذكر JSON/format/schema أو شرح تقني.
+علامات خطر (اعتبرها طارئة): ألم صدر شديد، صعوبة تنفس شديدة، فقدان وعي، تشنجات، نزيف شديد، ضعف مفاجئ بطرف، صعوبة كلام مفاجئة، حادث قوي/إصابة خطيرة، حروق شديدة، ازرقاق، أفكار انتحارية/إيذاء النفس.
 
 التصنيفات المسموحة فقط:
 general | nutrition | bp | sugar | sleep | activity | mental | first_aid | report | emergency | water | calories | bmi
 
-شكل JSON:
+أخرج JSON strict فقط (بدون أي نص خارج JSON):
 {
-  "category": "واحد من القائمة أعلاه",
-  "title": "عنوان محدد (2-5 كلمات)",
-  "verdict": "جملة واحدة محددة",
-  "next_question": "سؤال واحد فقط (أو \\"\\")",
-  "quick_choices": ["خيار 1","خيار 2"],
-  "tips": ["نصيحة 1","نصيحة 2"],
-  "when_to_seek_help": "متى تراجع الطبيب/الطوارئ (أو \\"\\")"
+  "category":"واحد من القائمة",
+  "title":"2-5 كلمات",
+  "verdict":"جملة واحدة واضحة",
+  "next_question":"سؤال واحد فقط أو \"\"",
+  "quick_choices":["خيار 1","خيار 2"],
+  "tips":["نصيحة 1","نصيحة 2"],
+  "when_to_seek_help":"متى تراجع الطبيب/الطوارئ أو \"\""
 }
-- لا أدوية/لا جرعات/لا تشخيص.
 `.trim();
 }
 
@@ -396,17 +249,65 @@ function compactLastCard(lastCard) {
 }
 
 function chooseMaxTokens(msg, lastCard) {
-  // Keep responses tight: most cases don't need many tokens.
-  const base = Number(process.env.GROQ_MAX_TOKENS || 260);
-
-  // If user requests report-like output or emergencies, allow a bit more room.
   const text = String(msg || "");
   const cat = sStr(lastCard?.category);
-  if (cat === "report" || /تقرير|ملخص|تحليل/i.test(text)) return Math.max(base, 320);
-  if (cat === "emergency" || /طوارئ|إسعاف|اختناق|نزيف|حروق|سكتة/i.test(text))
-    return Math.max(base, 320);
 
-  return base;
+  let m = BASE_MAX_TOKENS;
+
+  // allow a bit more for report/emergency only
+  if (cat === "report" || /تقرير|ملخص|تحليل/i.test(text)) m = Math.max(m, 220);
+  if (cat === "emergency" || /طوارئ|إسعاف|اختناق|نزيف|حروق|سكتة/i.test(text)) m = Math.max(m, 220);
+
+  // hard cap to protect budget
+  const hardCap = Number(process.env.GROQ_HARD_CAP || 260);
+  return Math.min(m, hardCap);
+}
+
+function getSessionId(req) {
+  const h = String(req.headers["x-session-id"] || "").trim();
+  const b = String(req.body?.context?.session_id || "").trim();
+  const sid = h || b;
+  // avoid unbounded memory keys
+  return sid && sid.length <= 80 ? sid : "";
+}
+
+function sessionHasSystem(sid) {
+  if (!sid) return false;
+  const now = Date.now();
+  const last = sessionSeen.get(sid);
+  if (!last) return false;
+  if (now - last > SESSION_TTL_MS) {
+    sessionSeen.delete(sid);
+    return false;
+  }
+  // refresh TTL
+  sessionSeen.set(sid, now);
+  return true;
+}
+
+function markSessionSystem(sid) {
+  if (!sid) return;
+  sessionSeen.set(sid, Date.now());
+}
+
+// basic cleanup to prevent memory growth
+setInterval(() => {
+  const now = Date.now();
+  for (const [sid, ts] of sessionSeen.entries()) {
+    if (now - ts > SESSION_TTL_MS) sessionSeen.delete(sid);
+  }
+}, 30 * 60 * 1000).unref();
+
+function parseGroqErrorBody(text) {
+  try {
+    const j = JSON.parse(text);
+    return {
+      code: j?.error?.code || "",
+      message: j?.error?.message || text || "",
+    };
+  } catch {
+    return { code: "", message: text || "" };
+  }
 }
 
 async function callGroq(messages, { model, max_tokens }) {
@@ -420,7 +321,7 @@ async function callGroq(messages, { model, max_tokens }) {
       },
       body: JSON.stringify({
         model,
-        temperature: 0.35,
+        temperature: TEMP,
         max_tokens,
         messages,
       }),
@@ -430,11 +331,19 @@ async function callGroq(messages, { model, max_tokens }) {
 
   if (!res.ok) {
     const t = await res.text().catch(() => "");
-    throw new Error(`Groq API error (${res.status}) ${t.slice(0, 200)}`);
+    const { code, message } = parseGroqErrorBody(t);
+    const err = new Error(`Groq API error (${res.status}) ${message}`);
+    err.status = res.status;
+    err.code = code;
+    err.raw = t;
+    throw err;
   }
 
   const data = await res.json();
-  return data.choices?.[0]?.message?.content || "";
+  return {
+    content: data.choices?.[0]?.message?.content || "",
+    usage: data.usage || null,
+  };
 }
 
 function fallback(rawText) {
@@ -453,8 +362,9 @@ function fallback(rawText) {
 // ---------- routes ----------
 app.get("/health", (_req, res) => res.json({ ok: true }));
 
-app.post("/reset", (_req, res) => {
-  // إذا عندك جلسات/تخزين سياق لاحقًا — هنا مكان reset
+app.post("/reset", (req, res) => {
+  const sid = getSessionId(req);
+  if (sid) sessionSeen.delete(sid);
   res.json({ ok: true });
 });
 
@@ -462,19 +372,24 @@ app.post("/chat", chatLimiter, async (req, res) => {
   try {
     const msg = String(req.body?.message || "").trim();
     if (!msg) return res.status(400).json({ ok: false, error: "empty_message" });
-    if (msg.length > 1200)
-      return res.status(400).json({ ok: false, error: "message_too_long" });
+    if (msg.length > 1200) return res.status(400).json({ ok: false, error: "message_too_long" });
 
+    const sid = getSessionId(req);
     const lastCard = req.body?.context?.last || null;
     const compact = compactLastCard(lastCard);
 
-    const messages = [{ role: "system", content: buildSystemPrompt() }];
+    const messages = [];
 
-    // Only include prior context if it exists; keep it compact to save tokens.
+    // ✅ Only send system prompt once per session (if session id provided)
+    if (!sessionHasSystem(sid)) {
+      messages.push({ role: "system", content: buildSystemPromptCompressed() });
+      markSessionSystem(sid);
+    }
+
     if (compact) {
       messages.push({
         role: "assistant",
-        content: "سياق سابق مختصر للاستمرار:\n" + JSON.stringify(compact),
+        content: "سياق سابق مختصر:\n" + JSON.stringify(compact),
       });
     }
 
@@ -482,35 +397,77 @@ app.post("/chat", chatLimiter, async (req, res) => {
 
     const maxTokens = chooseMaxTokens(msg, lastCard);
 
-    // 1) Small model first (cheap)
-    const raw1 = await callGroq(messages, { model: SMALL_MODEL, max_tokens: maxTokens });
-    let parsed = extractJson(raw1);
+    // 1) Small model first
+    let usedModel = SMALL_MODEL;
+    let raw1 = "";
+    let parsed = null;
+    let usage = null;
 
-    // 2) Big model only if parsing failed (escalation, not retry)
+    try {
+      const r1 = await callGroq(messages, { model: SMALL_MODEL, max_tokens: maxTokens });
+      raw1 = r1.content;
+      usage = r1.usage;
+      parsed = extractJson(raw1);
+    } catch (e) {
+      // If small model decommissioned/invalid, and big exists, escalate
+      const em = String(e?.message || "");
+      const decomm = e?.code === "model_decommissioned" || /decommissioned/i.test(em);
+      if (!decomm) throw e;
+    }
+
+    // 2) Big model fallback (optional) if parse failed
     let raw2 = "";
-    if (!parsed) {
-      raw2 = await callGroq(messages, { model: BIG_MODEL, max_tokens: maxTokens });
+    if (!parsed && BIG_MODEL) {
+      usedModel = BIG_MODEL;
+      const r2 = await callGroq(messages, { model: BIG_MODEL, max_tokens: maxTokens });
+      raw2 = r2.content;
+      usage = r2.usage;
       parsed = extractJson(raw2);
     }
 
-    // Normalize / recover
     let data;
     if (parsed) data = normalize(parsed);
-    else data = normalize(recoverPartialCard(raw2 || raw1) || fallback(raw1));
+    else data = normalize(recoverPartialCard(raw2 || raw1) || fallback(raw2 || raw1));
 
-    // Guard against meta formatting answers
     if (isMetaJsonAnswer(data)) {
-      data = normalize(recoverPartialCard(raw2 || raw1) || fallback(raw1));
+      data = normalize(recoverPartialCard(raw2 || raw1) || fallback(raw2 || raw1));
+    }
+
+    // Optional: log usage for debugging costs (disable by setting LOG_USAGE=0)
+    if (String(process.env.LOG_USAGE || "1") === "1" && usage) {
+      console.log("usage:", { model: usedModel, ...usage });
     }
 
     return res.json({
       ok: true,
       data,
       meta: {
-        model_used: parsed ? (raw2 ? BIG_MODEL : SMALL_MODEL) : (raw2 ? BIG_MODEL : SMALL_MODEL),
+        model_used: usedModel,
+        session_id: sid || "",
       },
     });
   } catch (e) {
+    const status = Number(e?.status || 0);
+    const msg = String(e?.message || "");
+
+    // ✅ Graceful 429 (prevents crashes/restarts)
+    if (status === 429 || msg.includes("(429)") || msg.toLowerCase().includes("rate limit")) {
+      return res.status(429).json({
+        ok: false,
+        error: "rate_limited",
+        data: {
+          category: "general",
+          title: "حد الاستخدام اليومي",
+          verdict: "تم الوصول لحد الاستخدام في Groq (Tokens/Day). جرّب لاحقًا أو خفّض الاستهلاك.",
+          next_question: "",
+          quick_choices: ["جرّب بعد فترة", "خفّض الاستهلاك"],
+          tips: ["قلّل طول الرسالة والسياق", "خفض max_tokens أو استخدم موديل أصغر"],
+          when_to_seek_help: "",
+        },
+      });
+    }
+
+    // Surface the real error (don't hide it)
     console.error(e);
     return res.status(500).json({ ok: false, error: "server_error", data: fallback("") });
   }
@@ -518,6 +475,6 @@ app.post("/chat", chatLimiter, async (req, res) => {
 
 app.listen(PORT, () => {
   console.log(
-    `🚀 API running on :${PORT} | small=${SMALL_MODEL} | big=${BIG_MODEL}`
+    `🚀 API running on :${PORT} | small=${SMALL_MODEL} | big=${BIG_MODEL || "(none)"} | max=${BASE_MAX_TOKENS}`
   );
 });

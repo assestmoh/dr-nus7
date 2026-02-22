@@ -13,171 +13,64 @@ const GROQ_API_KEY = process.env.GROQ_API_KEY;
 
 // Small-first / Big-fallback (LLM)
 const SMALL_MODEL = process.env.GROQ_SMALL_MODEL || "llama-3.1-8b-instant";
-const BIG_MODEL =
-  (process.env.GROQ_BIG_MODEL || process.env.GROQ_MODEL || "llama-3.3-70b-versatile").trim();
+const BIG_MODEL = process.env.GROQ_BIG_MODEL || "llama-3.1-70b-versatile";
 
-// TTS (Orpheus Arabic Saudi)
-const TTS_MODEL = (process.env.GROQ_TTS_MODEL || "canopylabs/orpheus-arabic-saudi").trim();
-const TTS_VOICE = (process.env.GROQ_TTS_VOICE || "fahad").trim();
-
+// Limits
 const PORT = process.env.PORT || 3000;
+const ALLOW_ORIGIN = process.env.ALLOW_ORIGIN || "*";
 
-const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || "")
-  .split(",")
-  .map((s) => s.trim())
-  .filter(Boolean);
-
-if (!GROQ_API_KEY) {
-  console.error("❌ GROQ_API_KEY غير مضبوط");
-  process.exit(1);
-}
-
-if (!BIG_MODEL) {
-  console.error("❌ BIG_MODEL فارغ. اضبط GROQ_BIG_MODEL أو GROQ_MODEL");
-  process.exit(1);
-}
-
+// Middleware
 app.use(helmet());
-app.set("trust proxy", 1);
+app.use(cors({ origin: ALLOW_ORIGIN === "*" ? true : ALLOW_ORIGIN }));
+app.use(bodyParser.json({ limit: "256kb" }));
 
+// Rate limiting
 app.use(
-  cors({
-    origin: (origin, cb) => {
-      if (!origin) return cb(null, true); // curl/health checks
-      if (ALLOWED_ORIGINS.length === 0) return cb(null, true); // dev mode
-      return ALLOWED_ORIGINS.includes(origin)
-        ? cb(null, true)
-        : cb(new Error("CORS blocked"), false);
-    },
-    methods: ["POST", "GET"],
+  rateLimit({
+    windowMs: 60 * 1000,
+    max: Number(process.env.RATE_LIMIT_MAX || 40),
+    standardHeaders: true,
+    legacyHeaders: false,
   })
 );
 
-app.use(bodyParser.json({ limit: "2mb" }));
+// Helpers
+const sStr = (v) => (typeof v === "string" ? v.trim() : "");
+const sArr = (v, cap = 3) =>
+  Array.isArray(v)
+    ? v
+        .map((x) => sStr(x))
+        .filter(Boolean)
+        .slice(0, cap)
+    : [];
 
-const chatLimiter = rateLimit({
-  windowMs: 60 * 1000,
-  max: Number(process.env.CHAT_RPM || 25),
-  standardHeaders: true,
-  legacyHeaders: false,
-  keyGenerator: (req) => String(req.ip),
-});
-
-// ---------- helpers ----------
-async function fetchWithTimeout(url, options = {}, ms = 15000) {
-  const controller = new AbortController();
-  const id = setTimeout(() => controller.abort(), ms);
+function safeJsonParse(maybeJson) {
   try {
-    return await fetch(url, { ...options, signal: controller.signal });
-  } finally {
-    clearTimeout(id);
-  }
-}
-
-function cleanJsonish(s) {
-  let t = String(s || "").trim();
-  if (t.startsWith("```")) {
-    t = t.replace(/^```[a-zA-Z]*\s*/m, "").replace(/```$/m, "").trim();
-  }
-  t = t.replace(/[“”]/g, '"').replace(/[‘’]/g, "'");
-  t = t.replace(/,\s*([}\]])/g, "$1");
-  return t;
-}
-
-function extractJson(text) {
-  const s0 = String(text || "");
-  let s = cleanJsonish(s0);
-
-  try {
-    const first = JSON.parse(s);
-    if (first && typeof first === "object") return first;
-    if (typeof first === "string") {
-      const second = JSON.parse(cleanJsonish(first));
-      if (second && typeof second === "object") return second;
-    }
-  } catch {}
-
-  const a = s.indexOf("{");
-  const b = s.lastIndexOf("}");
-  if (a === -1 || b === -1 || b <= a) return null;
-
-  const chunk = cleanJsonish(s.slice(a, b + 1));
-  try {
-    return JSON.parse(chunk);
+    return JSON.parse(maybeJson);
   } catch {
     return null;
   }
 }
 
-function extractVerdictLoosely(raw) {
-  const s = String(raw || "");
-  const m = s.match(/"verdict"\s*:\s*"([^"]+)"/);
-  return m?.[1]?.replace(/\\"/g, '"').trim() || "";
+function extractJsonFromText(txt) {
+  // Try strict parse
+  const parsed = safeJsonParse(txt);
+  if (parsed) return parsed;
+
+  // Try to grab first JSON block
+  const s = String(txt || "");
+  const start = s.indexOf("{");
+  const end = s.lastIndexOf("}");
+  if (start !== -1 && end !== -1 && end > start) {
+    const chunk = s.slice(start, end + 1);
+    return safeJsonParse(chunk);
+  }
+  return null;
 }
 
-function recoverPartialCard(raw) {
-  const s = String(raw || "");
-  const pick = (re) => {
-    const m = s.match(re);
-    return m?.[1] ? m[1].replace(/\\"/g, '"').trim() : "";
-  };
+function normalizeLLMOutput(obj) {
+  if (!obj || typeof obj !== "object") obj = {};
 
-  const category = pick(/"category"\s*:\s*"([^"]+)"/) || "general";
-  const title = pick(/"title"\s*:\s*"([^"]+)"/) || "دليل العافية";
-  const verdict = pick(/"verdict"\s*:\s*"([^"]+)"/) || "";
-  const next_question = pick(/"next_question"\s*:\s*"([^"]*)"/) || "";
-  const when_to_seek_help = pick(/"when_to_seek_help"\s*:\s*"([^"]*)"/) || "";
-
-  const arrPick = (key, limit) => {
-    const m = s.match(new RegExp(`"${key}"\\s*:\\s*\\[([\\s\\S]*?)\\]`));
-    const inner = m?.[1] || "";
-    if (!inner) return [];
-    return inner
-      .split(",")
-      .map((x) => x.trim())
-      .map((x) => x.replace(/^"+|"+$/g, "").replace(/\\"/g, '"'))
-      .filter(Boolean)
-      .slice(0, limit);
-  };
-
-  const quick_choices = arrPick("quick_choices", 2);
-  const tips = arrPick("tips", 2);
-
-  return {
-    category,
-    title,
-    verdict,
-    next_question,
-    quick_choices,
-    tips,
-    when_to_seek_help,
-  };
-}
-
-function isMetaJsonAnswer(d) {
-  const text =
-    String(d?.title || "") +
-    " " +
-    String(d?.verdict || "") +
-    " " +
-    String(d?.next_question || "") +
-    " " +
-    String(d?.when_to_seek_help || "") +
-    " " +
-    (Array.isArray(d?.tips) ? d.tips.join(" ") : "") +
-    " " +
-    (Array.isArray(d?.quick_choices) ? d.quick_choices.join(" ") : "");
-
-  return /json|format|schema|اقتباس|فواصل|تنسيق/i.test(text);
-}
-
-const sStr = (v) => (typeof v === "string" ? v.trim() : "");
-const sArr = (v, n) =>
-  Array.isArray(v)
-    ? v.filter((x) => typeof x === "string" && x.trim()).slice(0, n)
-    : [];
-
-function normalize(obj) {
   let cat = sStr(obj?.category) || "general";
   if (cat === "blood_pressure" || cat === "bloodpressure") cat = "bp";
 
@@ -203,8 +96,8 @@ function normalize(obj) {
     title: sStr(obj?.title) || "دليل العافية",
     verdict: sStr(obj?.verdict),
     next_question: sStr(obj?.next_question),
-    quick_choices: sArr(obj?.quick_choices, 2),
-    tips: sArr(obj?.tips, 2),
+    quick_choices: sArr(obj?.quick_choices, 3), // ✅ تغيّر: 3 بدل 2
+    tips: sArr(obj?.tips, 3),                 // ✅ تغيّر: 3 بدل 2
     when_to_seek_help: sStr(obj?.when_to_seek_help),
   };
 }
@@ -217,7 +110,7 @@ function buildSystemPrompt() {
 أجب عربيًا واضحًا وباختصار، بدون تكرار.
 
 أعد JSON فقط وبلا أي نص خارجه وبدون Markdown، بالشكل:
-{"category":"general|nutrition|bp|sugar|sleep|activity|mental|first_aid|report|emergency|water|calories|bmi","title":"2-5 كلمات","verdict":"جملة واحدة","next_question":"سؤال واحد أو \"\"","quick_choices":["",""],"tips":["",""],"when_to_seek_help":"\"\" أو نص قصير"}
+{"category":"general|nutrition|bp|sugar|sleep|activity|mental|first_aid|report|emergency|water|calories|bmi","title":"2-5 كلمات","verdict":"سطرين كحد أقصى","next_question":"سؤال واحد أو \"\"","quick_choices":["","",""],"tips":["","",""],"when_to_seek_help":"\"\" أو نص قصير"}
 `.trim();
 }
 
@@ -239,173 +132,172 @@ function chooseMaxTokens(msg, lastCard) {
   return base;
 }
 
-async function callGroq(messages, { model, max_tokens }) {
-  const res = await fetchWithTimeout(
-    "https://api.groq.com/openai/v1/chat/completions",
-    {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${GROQ_API_KEY}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        model,
-        temperature: 0.35,
-        max_tokens,
-        messages,
-      }),
+async function callGroq({ model, messages, max_tokens }) {
+  if (!GROQ_API_KEY) throw new Error("Missing GROQ_API_KEY");
+
+  const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${GROQ_API_KEY}`,
     },
-    20000
-  );
+    body: JSON.stringify({
+      model,
+      messages,
+      temperature: 0.35,
+      max_tokens,
+      response_format: { type: "json_object" },
+    }),
+  });
 
   if (!res.ok) {
     const t = await res.text().catch(() => "");
-    throw new Error(`Groq API error (${res.status}) ${t.slice(0, 200)}`);
+    throw new Error(`Groq error ${res.status}: ${t.slice(0, 200)}`);
   }
 
   const data = await res.json();
-  return data.choices?.[0]?.message?.content || "";
+  const content = data?.choices?.[0]?.message?.content || "";
+  return content;
 }
 
-function fallback(rawText) {
-  const looseVerdict = extractVerdictLoosely(rawText);
+function buildUserPrompt(message, meta, lastCard) {
+  const ctx = compactLastCard(lastCard);
+  const m = sStr(message);
+  const tz = sStr(meta?.tz) || "Asia/Muscat";
+  const locale = sStr(meta?.locale) || "ar-OM";
+
+  return `
+المستخدم في عُمان. التزم بالتوعية العامة.
+الرسالة: ${m}
+اللغة/المنطقة: ${locale}
+المنطقة الزمنية: ${tz}
+السياق السابق (قد يكون فارغًا): ${ctx ? JSON.stringify(ctx) : "{}"}
+`.trim();
+}
+
+function parseViaRegexFallback(txt) {
+  // last resort: attempt to pull keys from noisy output
+  const s = String(txt || "");
+
+  const pick = (re) => {
+    const m = s.match(re);
+    return m && m[1] ? String(m[1]).replace(/\\"/g, '"').trim() : "";
+  };
+
+  const category = pick(/"category"\s*:\s*"([^"]+)"/) || "general";
+  const title = pick(/"title"\s*:\s*"([^"]+)"/) || "دليل العافية";
+  const verdict = pick(/"verdict"\s*:\s*"([^"]+)"/) || "";
+  const next_question = pick(/"next_question"\s*:\s*"([^"]*)"/) || "";
+  const when_to_seek_help = pick(/"when_to_seek_help"\s*:\s*"([^"]*)"/) || "";
+
+  const arrPick = (key, limit) => {
+    const m = s.match(new RegExp(`"${key}"\\s*:\\s*\\[([\\s\\S]*?)\\]`));
+    const inner = m?.[1] || "";
+    return inner
+      .split(",")
+      .map((x) => x.replace(/[\[\]"]/g, "").trim())
+      .filter(Boolean)
+      .slice(0, limit);
+  };
+
+  const quick_choices = arrPick("quick_choices", 3); // ✅ تغيّر: 3 بدل 2
+  const tips = arrPick("tips", 3);                   // ✅ تغيّر: 3 بدل 2
+
   return {
-    category: "general",
-    title: "معلومة صحية",
-    verdict: looseVerdict || "تعذر توليد رد منظم الآن. جرّب إعادة صياغة السؤال بشكل مختصر.",
-    next_question: "",
-    quick_choices: [],
-    tips: [],
-    when_to_seek_help: "",
+    category,
+    title,
+    verdict,
+    next_question,
+    quick_choices,
+    tips,
+    when_to_seek_help,
   };
 }
 
-// ---------- TTS helpers ----------
-function normalizeArabicForTTS(s) {
-  // اختصر وخل النص مناسب للنطق
-  return String(s || "")
-    .replace(/\s+/g, " ")
-    .replace(/[<>]/g, "")
-    .trim()
-    .slice(0, 200);
-}
-
-async function callGroqTTS(text, { model = TTS_MODEL, voice = TTS_VOICE } = {}) {
-  const input = normalizeArabicForTTS(text);
-  if (!input) throw new Error("tts_empty_input");
-
-  const res = await fetchWithTimeout(
-    "https://api.groq.com/openai/v1/audio/speech",
-    {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${GROQ_API_KEY}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        model,
-        input,
-        voice,
-        response_format: "wav",
-      }),
-    },
-    20000
-  );
-
-  if (!res.ok) {
-    const t = await res.text().catch(() => "");
-    throw new Error(`Groq TTS error (${res.status}) ${t.slice(0, 200)}`);
-  }
-
-  const ab = await res.arrayBuffer();
-  return Buffer.from(ab);
-}
-
-// ---------- routes ----------
-app.get("/health", (_req, res) => res.json({ ok: true }));
-
-app.post("/reset", (_req, res) => {
-  res.json({ ok: true });
+// Routes
+app.get("/", (_req, res) => {
+  res.json({ ok: true, name: "Dalil Alafiyah API" });
 });
 
-// ✅ NEW: TTS endpoint
-app.post("/tts", chatLimiter, async (req, res) => {
+app.post("/chat", async (req, res) => {
   try {
-    const text = String(req.body?.text || "").trim();
-    const voice = String(req.body?.voice || TTS_VOICE).trim() || TTS_VOICE;
-
-    // حماية بسيطة ضد إدخال طويل جدًا
-    if (!text) return res.status(400).json({ ok: false, error: "empty_text" });
-
-    const wav = await callGroqTTS(text, { voice });
-
-    res.setHeader("Content-Type", "audio/wav");
-    res.setHeader("Cache-Control", "no-store");
-    res.setHeader("Content-Length", String(wav.length));
-    return res.status(200).send(wav);
-  } catch (e) {
-    console.error(e);
-    return res.status(500).json({ ok: false, error: "tts_error" });
-  }
-});
-
-app.post("/chat", chatLimiter, async (req, res) => {
-  try {
-    const msg = String(req.body?.message || "").trim();
-    if (!msg) return res.status(400).json({ ok: false, error: "empty_message" });
-    if (msg.length > 350) return res.status(400).json({ ok: false, error: "message_too_long" });
-
+    const message = sStr(req.body?.message);
+    const meta = req.body?.meta || {};
     const lastCard = req.body?.context?.last || null;
     const lastCategory = String(req.body?.context?.category || lastCard?.category || "").trim();
-    const compact = compactLastCard({ category: lastCategory });
 
-    const messages = [{ role: "system", content: buildSystemPrompt() }];
+    // Create minimal last card for routing
+    const last = lastCategory ? { category: lastCategory } : lastCard;
 
-    if (compact) {
-      messages.push({
-        role: "assistant",
-        content: "سياق سابق مختصر للاستمرار:\n" + JSON.stringify(compact),
+    if (!message) {
+      return res.status(400).json({
+        category: "general",
+        title: "خطأ",
+        verdict: "أرسل رسالة نصية.",
+        next_question: "",
+        quick_choices: [],
+        tips: [],
+        when_to_seek_help: "",
       });
     }
 
-    messages.push({ role: "user", content: msg });
+    const system = buildSystemPrompt();
+    const user = buildUserPrompt(message, meta, last);
 
-    const maxTokens = chooseMaxTokens(msg, { category: lastCategory });
+    const max_tokens = chooseMaxTokens(message, last);
 
-    // 1) Small model first
-    const raw1 = await callGroq(messages, { model: SMALL_MODEL, max_tokens: maxTokens });
-    let parsed = extractJson(raw1);
+    // Small model first
+    let content = "";
+    let parsed = null;
 
-    // 2) Big model only if parsing failed
-    let raw2 = "";
+    try {
+      content = await callGroq({
+        model: SMALL_MODEL,
+        messages: [
+          { role: "system", content: system },
+          { role: "user", content: user },
+        ],
+        max_tokens,
+      });
+
+      parsed = extractJsonFromText(content);
+      if (!parsed) parsed = parseViaRegexFallback(content);
+    } catch {
+      parsed = null;
+    }
+
+    // Big fallback if needed
     if (!parsed) {
-      raw2 = await callGroq(messages, { model: BIG_MODEL, max_tokens: maxTokens });
-      parsed = extractJson(raw2);
+      content = await callGroq({
+        model: BIG_MODEL,
+        messages: [
+          { role: "system", content: system },
+          { role: "user", content: user },
+        ],
+        max_tokens: Math.max(max_tokens, 240),
+      });
+
+      parsed = extractJsonFromText(content) || parseViaRegexFallback(content);
     }
 
-    let data;
-    if (parsed) data = normalize(parsed);
-    else data = normalize(recoverPartialCard(raw2 || raw1) || fallback(raw1));
+    const normalized = normalizeLLMOutput(parsed);
 
-    if (isMetaJsonAnswer(data)) {
-      data = normalize(recoverPartialCard(raw2 || raw1) || fallback(raw1));
-    }
-
-    return res.json({
-      ok: true,
-      data,
-      meta: {
-        model_used: raw2 ? BIG_MODEL : SMALL_MODEL,
-      },
-    });
+    return res.json(normalized);
   } catch (e) {
-    console.error(e);
-    return res.status(500).json({ ok: false, error: "server_error", data: fallback("") });
+    return res.status(500).json({
+      category: "general",
+      title: "خطأ",
+      verdict: "حصل خطأ في الخادم.",
+      next_question: "",
+      quick_choices: [],
+      tips: [],
+      when_to_seek_help: "",
+      err: String(e?.message || e),
+    });
   }
 });
 
+// Start
 app.listen(PORT, () => {
-  console.log(
-    `🚀 API running on :${PORT} | small=${SMALL_MODEL} | big=${BIG_MODEL} | tts=${TTS_MODEL}/${TTS_VOICE}`
-  );
+  console.log(`Dalil Alafiyah API listening on :${PORT}`);
 });

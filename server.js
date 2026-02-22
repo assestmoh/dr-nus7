@@ -210,43 +210,25 @@ function normalize(obj) {
 }
 
 function buildSystemPrompt() {
+  // Compressed prompt to cut tokens (still safe + Oman emergency routing)
   return `
-أنت "دليل العافية" مساعد تثقيف صحي عربي لمجتمع سلطنة عُمان. تقدم معلومات صحية عامة وإرشادات وقائية وإسعافات أولية آمنة فقط.
-ممنوع: التشخيص الطبي، وصف علاج شخصي، تحديد جرعات، أو الادعاء بأنك بديل للطبيب/الطوارئ.
-الأسلوب: عربي واضح ومباشر، نصائح عملية تناسب عُمان (الحرارة، العادات)، بدون تكرار أو أسئلة كثيرة.
+أنت "دليل العافية" مساعد توعوي صحي عربي لعُمان. توعية عامة فقط (ليس تشخيصًا ولا وصف علاج/جرعات).
+عند علامات الخطر أو الطوارئ: وجّه فورًا للاتصال 9999 أو 24343666 وقدّم إسعافًا أوليًا بسيطًا وآمنًا فقط.
+أجب عربيًا واضحًا وباختصار، بدون تكرار.
 
-الطوارئ (علامات حمراء): ألم صدر شديد، ضيق نفس شديد، فقدان وعي، تشنجات، نزيف شديد، ضعف/خدر مفاجئ بطرف، صعوبة كلام مفاجئة، إصابة قوية، حروق شديدة، ازرقاق، أفكار انتحارية/إيذاء النفس.
-عند الطوارئ: وجّه فورًا للاتصال: 9999 (شرطة عُمان) أو 24343666 (عمليات الهيئة الصحية) وقدّم خطوات إسعاف أولي بسيطة وآمنة فقط.
-
-مخرجاتك: JSON صالح strict فقط — بدون أي نص خارج JSON، بدون Markdown، بدون ذكر JSON/format/schema أو شرح تقني.
-التصنيفات المسموحة فقط:
-general | nutrition | bp | sugar | sleep | activity | mental | first_aid | report | emergency | water | calories | bmi
-
-شكل JSON (التزم بالمفاتيح حرفيًا):
-{
-  "category": "واحد من القائمة أعلاه",
-  "title": "عنوان محدد (2-5 كلمات)",
-  "verdict": "جملة واحدة محددة",
-  "next_question": "سؤال واحد فقط (أو \\"\\")",
-  "quick_choices": ["خيار 1","خيار 2"],
-  "tips": ["نصيحة 1","نصيحة 2"],
-  "when_to_seek_help": "متى تراجع الطبيب/الطوارئ (أو \\"\\")"
-}
+أعد JSON فقط وبلا أي نص خارجه وبدون Markdown، بالشكل:
+{"category":"general|nutrition|bp|sugar|sleep|activity|mental|first_aid|report|emergency|water|calories|bmi","title":"2-5 كلمات","verdict":"جملة واحدة","next_question":"سؤال واحد أو \"\"","quick_choices":["",""],"tips":["",""],"when_to_seek_help":"\"\" أو نص قصير"}
 `.trim();
 }
 
 function compactLastCard(lastCard) {
-  if (!lastCard || typeof lastCard !== "object") return null;
-  return {
-    category: sStr(lastCard.category) || "general",
-    title: sStr(lastCard.title).slice(0, 60),
-    verdict: sStr(lastCard.verdict).slice(0, 160), // أقل توكنز
-    next_question: sStr(lastCard.next_question).slice(0, 120),
-  };
+  // Keep only what's useful for routing and keep it tiny
+  const cat = sStr(lastCard?.category);
+  return cat ? { category: cat } : null;
 }
 
 function chooseMaxTokens(msg, lastCard) {
-  const base = Number(process.env.GROQ_MAX_TOKENS || 260);
+  const base = Number(process.env.GROQ_MAX_TOKENS || 140);
 
   const text = String(msg || "");
   const cat = sStr(lastCard?.category);
@@ -371,11 +353,11 @@ app.post("/chat", chatLimiter, async (req, res) => {
   try {
     const msg = String(req.body?.message || "").trim();
     if (!msg) return res.status(400).json({ ok: false, error: "empty_message" });
-    if (msg.length > 1200)
-      return res.status(400).json({ ok: false, error: "message_too_long" });
+    if (msg.length > 350) return res.status(400).json({ ok: false, error: "message_too_long" });
 
     const lastCard = req.body?.context?.last || null;
-    const compact = compactLastCard(lastCard);
+    const lastCategory = String(req.body?.context?.category || lastCard?.category || "").trim();
+    const compact = compactLastCard({ category: lastCategory });
 
     const messages = [{ role: "system", content: buildSystemPrompt() }];
 
@@ -388,7 +370,7 @@ app.post("/chat", chatLimiter, async (req, res) => {
 
     messages.push({ role: "user", content: msg });
 
-    const maxTokens = chooseMaxTokens(msg, lastCard);
+    const maxTokens = chooseMaxTokens(msg, { category: lastCategory });
 
     // 1) Small model first
     const raw1 = await callGroq(messages, { model: SMALL_MODEL, max_tokens: maxTokens });

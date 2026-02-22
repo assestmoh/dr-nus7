@@ -221,17 +221,24 @@ function buildSystemPrompt() {
 9999 شرطة عُمان السلطانية
 24343666 الهيئة الصحية
 مع تقديم إسعاف أولي بسيط فقط.
-اجعل قيمة verdict ثلاث اسطر كحد أقصى (ثلاث جمل شاملة مفيده ) وافصل بينهما بـ \n.
+اجعل قيمة verdict ثلاث اسطر كحد أقصى (ثلاث جمل شاملة مفيده ) وافصل بينهما بـ \\n.
 
 أعد JSON فقط وبلا أي نص خارجه وبدون Markdown، بالشكل:
-{"category":"general|nutrition|bp|sugar|sleep|activity|mental|first_aid|report|emergency|water|calories|bmi","title":"2-5 كلمات","verdict":"ثلاث اسطر كحد أقصى (ثلاث جمل شاملة مفيدة )","tips":["","",""],"when_to_seek_help":"\"\" أو نص قصير"}
+{"category":"general|nutrition|bp|sugar|sleep|activity|mental|first_aid|report|emergency|water|calories|bmi","title":"2-5 كلمات","verdict":"ثلاث اسطر كحد أقصى (ثلاث جمل شاملة مفيدة )","tips":["","",""],"when_to_seek_help":"\\" \\" أو نص قصير"}
+
+تنبيه مهم للمسار:
+إذا وصلك سياق فيه "path" فهذا يعني مسار واجهة المستخدم المختار (مثل صحة النساء/الأطفال/التغذية). التزم بنفس المسار وقدّم معلومات جديدة غير مكررة عن السابق وبنفس هيكلة JSON.
 `.trim();
 }
 
+// ✅ NEW: include path in compact context (tiny)
 function compactLastCard(lastCard) {
-  // Keep only what's useful for routing and keep it tiny
   const cat = sStr(lastCard?.category);
-  return cat ? { category: cat } : null;
+  const path = sStr(lastCard?.path);
+  const out = {};
+  if (cat) out.category = cat;
+  if (path) out.path = path;
+  return Object.keys(out).length ? out : null;
 }
 
 function chooseMaxTokens(msg, lastCard) {
@@ -361,8 +368,14 @@ app.post("/chat", chatLimiter, async (req, res) => {
     if (msg.length > 350) return res.status(400).json({ ok: false, error: "message_too_long" });
 
     const lastCard = req.body?.context?.last || null;
+
+    // ✅ NEW: read path from meta/context too
+    const ctxPath = String(req.body?.context?.path || req.body?.meta?.path || "").trim();
+
     const lastCategory = String(req.body?.context?.category || lastCard?.category || "").trim();
-    const compact = compactLastCard({ category: lastCategory });
+
+    // ✅ NEW: compact includes category + path
+    const compact = compactLastCard({ category: lastCategory, path: ctxPath });
 
     const messages = [{ role: "system", content: buildSystemPrompt() }];
 
@@ -401,6 +414,8 @@ app.post("/chat", chatLimiter, async (req, res) => {
       data,
       meta: {
         model_used: raw2 ? BIG_MODEL : SMALL_MODEL,
+        // ✅ optional: expose path for debugging (safe)
+        path: ctxPath || null,
       },
     });
   } catch (e) {

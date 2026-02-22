@@ -1,4 +1,4 @@
-// server.js — Dalil Alafiyah API (clean + hardened + cheaper routing) + TTS
+// server.js — Dalil Alafiyah API (clean + hardened + cheaper routing)
 import "dotenv/config";
 import express from "express";
 import cors from "cors";
@@ -8,6 +8,10 @@ import helmet from "helmet";
 import rateLimit from "express-rate-limit";
 
 const app = express();
+
+// ✅ مهم جدًا عند وجود Reverse Proxy (Koyeb/Render/Fly/Nginx...)
+// حتى يقرأ Express الـ IP الحقيقي من X-Forwarded-For
+app.set("trust proxy", 1);
 
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
 
@@ -96,8 +100,8 @@ function normalizeLLMOutput(obj) {
     title: sStr(obj?.title) || "دليل العافية",
     verdict: sStr(obj?.verdict),
     next_question: sStr(obj?.next_question),
-    quick_choices: sArr(obj?.quick_choices, 3), // ✅ تغيّر: 3 بدل 2
-    tips: sArr(obj?.tips, 3),                 // ✅ تغيّر: 3 بدل 2
+    quick_choices: sArr(obj?.quick_choices, 3), // ✅ 3 بدل 2
+    tips: sArr(obj?.tips, 3),                 // ✅ 3 بدل 2
     when_to_seek_help: sStr(obj?.when_to_seek_help),
   };
 }
@@ -125,6 +129,7 @@ function chooseMaxTokens(msg, lastCard) {
 
   const text = String(msg || "");
   const cat = sStr(lastCard?.category);
+
   if (cat === "report" || /تقرير|ملخص|تحليل/i.test(text)) return Math.max(base, 320);
   if (cat === "emergency" || /طوارئ|إسعاف|اختناق|نزيف|حروق|سكتة/i.test(text))
     return Math.max(base, 320);
@@ -200,8 +205,8 @@ function parseViaRegexFallback(txt) {
       .slice(0, limit);
   };
 
-  const quick_choices = arrPick("quick_choices", 3); // ✅ تغيّر: 3 بدل 2
-  const tips = arrPick("tips", 3);                   // ✅ تغيّر: 3 بدل 2
+  const quick_choices = arrPick("quick_choices", 3); // ✅ 3 بدل 2
+  const tips = arrPick("tips", 3);                   // ✅ 3 بدل 2
 
   return {
     category,
@@ -223,10 +228,12 @@ app.post("/chat", async (req, res) => {
   try {
     const message = sStr(req.body?.message);
     const meta = req.body?.meta || {};
+
+    // ✅ الواجهة الجديدة ترسل context.category فقط
+    // لكن دعمنا القديم (context.last) لو موجود
     const lastCard = req.body?.context?.last || null;
     const lastCategory = String(req.body?.context?.category || lastCard?.category || "").trim();
 
-    // Create minimal last card for routing
     const last = lastCategory ? { category: lastCategory } : lastCard;
 
     if (!message) {
@@ -281,7 +288,6 @@ app.post("/chat", async (req, res) => {
     }
 
     const normalized = normalizeLLMOutput(parsed);
-
     return res.json(normalized);
   } catch (e) {
     return res.status(500).json({

@@ -63,6 +63,15 @@ const chatLimiter = rateLimit({
   keyGenerator: (req) => String(req.ip),
 });
 
+// ✅ TTS limiter منفصل (عادة الضغط عليه أكثر بسبب زر الاستماع)
+const ttsLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: Number(process.env.TTS_RPM || 18),
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req) => String(req.ip),
+});
+
 // ---------- helpers ----------
 async function fetchWithTimeout(url, options = {}, ms = 15000) {
   const controller = new AbortController();
@@ -326,11 +335,63 @@ async function callGroqTTS(text, { model = TTS_MODEL, voice = TTS_VOICE } = {}) 
 
   if (!res.ok) {
     const t = await res.text().catch(() => "");
-    throw new Error(`Groq TTS error (${res.status}) ${t.slice(0, 200)}`);
+    const e = new Error(`Groq TTS error (${res.status}) ${t.slice(0, 200)}`);
+    e.status = res.status;
+    e.body = t.slice(0, 500);
+    throw e;
   }
 
   const ab = await res.arrayBuffer();
   return Buffer.from(ab);
+}
+
+// ---------- TTS cache (in-memory) ----------
+// الهدف: تقليل استهلاك الرصيد عند تكرار نفس الاستماع لنفس الكرت.
+// ملاحظة: الكاش مؤقت (يختفي عند إعادة تشغيل السيرفر) لكنه يقلل الاستهلاك كثيرًا.
+const TTS_CACHE = new Map(); // key => { buf: Buffer, ts: number, bytes: number }
+const TTS_CACHE_TTL_MS = Number(process.env.TTS_CACHE_TTL_MS || 1000 * 60 * 60 * 6); // 6 ساعات
+const TTS_CACHE_MAX_ITEMS = Number(process.env.TTS_CACHE_MAX_ITEMS || 40);
+const TTS_CACHE_MAX_BYTES = Number(process.env.TTS_CACHE_MAX_BYTES || 18 * 1024 * 1024); // 18MB
+
+function ttsCacheKey(text, voice) {
+  return `${String(voice || TTS_VOICE).trim()}|${normalizeArabicForTTS(text)}`;
+}
+
+function ttsCacheGet(key) {
+  const hit = TTS_CACHE.get(key);
+  if (!hit) return null;
+  if (Date.now() - hit.ts > TTS_CACHE_TTL_MS) {
+    TTS_CACHE.delete(key);
+    return null;
+  }
+  // touch (LRU-ish)
+  TTS_CACHE.delete(key);
+  TTS_CACHE.set(key, hit);
+  return hit.buf;
+}
+
+function ttsCacheTotalBytes() {
+  let sum = 0;
+  for (const v of TTS_CACHE.values()) sum += Number(v.bytes || 0);
+  return sum;
+}
+
+function ttsCacheSet(key, buf) {
+  try {
+    TTS_CACHE.set(key, { buf, ts: Date.now(), bytes: buf.length });
+    // trim by items
+    while (TTS_CACHE.size > TTS_CACHE_MAX_ITEMS) {
+      const first = TTS_CACHE.keys().next().value;
+      if (!first) break;
+      TTS_CACHE.delete(first);
+    }
+    // trim by bytes
+    while (ttsCacheTotalBytes() > TTS_CACHE_MAX_BYTES) {
+      const first = TTS_CACHE.keys().next().value;
+      if (!first) break;
+      TTS_CACHE.delete(first);
+    }
+  } catch {}
 }
 
 // ---------- routes ----------
@@ -340,8 +401,8 @@ app.post("/reset", (_req, res) => {
   res.json({ ok: true });
 });
 
-// ✅ NEW: TTS endpoint
-app.post("/tts", chatLimiter, async (req, res) => {
+// ✅ TTS endpoint (مع كاش + limiter منفصل)
+app.post("/tts", ttsLimiter, async (req, res) => {
   try {
     const text = String(req.body?.text || "").trim();
     const voice = String(req.body?.voice || TTS_VOICE).trim() || TTS_VOICE;
@@ -349,14 +410,23 @@ app.post("/tts", chatLimiter, async (req, res) => {
     // حماية بسيطة ضد إدخال طويل جدًا
     if (!text) return res.status(400).json({ ok: false, error: "empty_text" });
 
-    const wav = await callGroqTTS(text, { voice });
+    const key = ttsCacheKey(text, voice);
+    const cached = ttsCacheGet(key);
+    const wav = cached || (await callGroqTTS(text, { voice }));
+    if (!cached) ttsCacheSet(key, wav);
 
     res.setHeader("Content-Type", "audio/wav");
-    res.setHeader("Cache-Control", "no-store");
+    // Cache على المتصفح/الوسيط لمدة قصيرة (آمن لأنه لا يتضمن بيانات حساسة إذا التزمنا بنص قصير)
+    res.setHeader("Cache-Control", "private, max-age=3600");
     res.setHeader("Content-Length", String(wav.length));
     return res.status(200).send(wav);
   } catch (e) {
     console.error(e);
+    // إذا كانت المشكلة رصيد/Rate limit رجّع 503 لكي يتعامل معها العميل (fallback)
+    const status = Number(e?.status || 0);
+    if (status === 402 || status === 429) {
+      return res.status(503).json({ ok: false, error: "tts_unavailable", hint: "quota_or_rate_limit" });
+    }
     return res.status(500).json({ ok: false, error: "tts_error" });
   }
 });

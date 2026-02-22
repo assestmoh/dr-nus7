@@ -21,7 +21,7 @@ const app = express();
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
 
 // Small-first / Big-fallback
-const SMALL_MODEL = process.env.GROQ_SMALL_MODEL || "llama-3.3-70b-versatile";
+const SMALL_MODEL = process.env.GROQ_SMALL_MODEL || "llama-3.1-8b-instant";
 const BIG_MODEL =
   process.env.GROQ_BIG_MODEL || process.env.GROQ_MODEL || "              ";
 

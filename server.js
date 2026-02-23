@@ -12,7 +12,7 @@ const app = express();
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
 
 // Small-first / Big-fallback (LLM)
-const SMALL_MODEL = process.env.GROQ_SMALL_MODEL || "openai/gpt-oss-120b";
+const SMALL_MODEL = process.env.GROQ_SMALL_MODEL || "llama-3.3-70b-versatile";
 const BIG_MODEL =
   (process.env.GROQ_BIG_MODEL || process.env.GROQ_MODEL || "openai/gpt-oss-120b").trim();
 
@@ -227,7 +227,7 @@ function buildSystemPrompt() {
 وجه للمختص عند الحاجة 
 عند اكتشاف حالات خطيرة توقف عن التثقيف وجه الى الطوارئ 9999 شرطة عُمان السلطانية و
 24343666 الهيئة الصحية
-اجعل قيمة verdict سطرين كحد أقصى ( جمل توعوية شاملة  مفيده ) وافصل بينهما بـ \\n.
+اجعل قيمة verdict سطرين كحد أقصى ( جمل توعوية شاملة  مفيده ) وافصل بينهما بـ.
 تنبية انت تثقيف عام و وعي عام
 أعد JSON فقط وبلا أي نص خارجه وبدون Markdown، بالشكل:
 {"category":"general|nutrition|bp|sugar|sleep|activity|mental|first_aid|report|emergency|water|calories|bmi","title":"2-5 كلمات","verdict":"سطرين كحد أقصى ( جمل توعوية شاملة مفيدة )","tips":["","",""],"when_to_seek_help":"\\" \\" أو نص قصير"}

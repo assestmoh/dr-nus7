@@ -232,10 +232,10 @@ function buildSystemPrompt() {
 9999 شرطة عُمان السلطانية
 24343666 الهيئة الصحية
 مع تقديم إسعاف أولي بسيط فقط.
-اجعل قيمة verdict ثلاث اسطر كحد أقصى (ثلاث جمل شاملة مفيده ) وافصل بينهما بـ \\n.
+اجعل قيمة verdict جملتين كحد أقصى (جملتين شاملة دقيقة مفيده ) وافصل بينهما بـ \\n.
 
 أعد JSON فقط وبلا أي نص خارجه وبدون Markdown، بالشكل:
-{"category":"general|nutrition|bp|sugar|sleep|activity|mental|first_aid|report|emergency|water|calories|bmi","title":"2-5 كلمات","verdict":"ثلاث اسطر كحد أقصى (ثلاث جمل شاملة مفيدة )","tips":["","",""],"when_to_seek_help":"\\" \\" أو نص قصير"}
+{"category":"general|nutrition|bp|sugar|sleep|activity|mental|first_aid|report|emergency|water|calories|bmi","title":"2-5 كلمات","verdict":"جملتين كحد أقصى (جملتين شاملة  دقيقة مفيدة )","tips":["","",""],"when_to_seek_help":"\\" \\" أو نص قصير"}
 
 تنبيه مهم للمسار:
 إذا وصلك سياق فيه "path" فهذا يعني مسار واجهة المستخدم المختار (مثل صحة النساء/الأطفال/التغذية). التزم بنفس المسار وقدّم معلومات جديدة غير مكررة عن السابق وبنفس هيكلة JSON.

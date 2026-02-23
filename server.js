@@ -9,12 +9,11 @@ import rateLimit from "express-rate-limit";
 
 const app = express();
 
-const GROQ_API_KEY = process.env.GROQ_API_KEY;
 
-// Small-first / Big-fallback (LLM)
-const SMALL_MODEL = process.env.GROQ_SMALL_MODEL || "llama-3.3-70b-versatile";
-const BIG_MODEL =
-  (process.env.GROQ_BIG_MODEL || process.env.GROQ_MODEL || "openai/gpt-oss-120b").trim();
+const GROQ_API_KEY = process.env.GROQ_API_KEY || "";
+const GROQ_MODEL = process.env.GROQ_MODEL || "openai/gpt-oss-120b";
+const INTERNAL_API_KEY = process.env.INTERNAL_API_KEY || "";
+
 
 // TTS (Orpheus Arabic Saudi)
 const TTS_MODEL = (process.env.GROQ_TTS_MODEL || "canopylabs/orpheus-arabic-saudi").trim();

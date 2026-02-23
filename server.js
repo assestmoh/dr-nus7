@@ -29,6 +29,11 @@ if (!GROQ_API_KEY) {
   process.exit(1);
 }
 
+if (!BIG_MODEL) {
+  console.error("❌ BIG_MODEL فارغ. اضبط GROQ_BIG_MODEL أو GROQ_MODEL");
+  process.exit(1);
+}
+
 app.use(helmet());
 app.set("trust proxy", 1);
 
@@ -340,8 +345,6 @@ async function callGroqTTS(text, { model = TTS_MODEL, voice = TTS_VOICE } = {}) 
 }
 
 // ---------- TTS cache (in-memory) ----------
-// الهدف: تقليل استهلاك الرصيد عند تكرار نفس الاستماع لنفس الكرت.
-// ملاحظة: الكاش مؤقت (يختفي عند إعادة تشغيل السيرفر) لكنه يقلل الاستهلاك كثيرًا.
 const TTS_CACHE = new Map(); // key => { buf: Buffer, ts: number, bytes: number }
 const TTS_CACHE_TTL_MS = Number(process.env.TTS_CACHE_TTL_MS || 1000 * 60 * 60 * 6); // 6 ساعات
 const TTS_CACHE_MAX_ITEMS = Number(process.env.TTS_CACHE_MAX_ITEMS || 40);
@@ -410,16 +413,16 @@ app.post("/tts", ttsLimiter, async (req, res) => {
     if (!cached) ttsCacheSet(key, wav);
 
     res.setHeader("Content-Type", "audio/wav");
-    // Cache على المتصفح/الوسيط لمدة قصيرة (آمن لأنه لا يتضمن بيانات حساسة إذا التزمنا بنص قصير)
     res.setHeader("Cache-Control", "private, max-age=3600");
     res.setHeader("Content-Length", String(wav.length));
     return res.status(200).send(wav);
   } catch (e) {
     console.error(e);
-    // إذا كانت المشكلة رصيد/Rate limit رجّع 503 لكي يتعامل معها العميل (fallback)
     const status = Number(e?.status || 0);
     if (status === 402 || status === 429) {
-      return res.status(503).json({ ok: false, error: "tts_unavailable", hint: "quota_or_rate_limit" });
+      return res
+        .status(503)
+        .json({ ok: false, error: "tts_unavailable", hint: "quota_or_rate_limit" });
     }
     return res.status(500).json({ ok: false, error: "tts_error" });
   }
@@ -454,13 +457,16 @@ app.post("/chat", chatLimiter, async (req, res) => {
 
     const maxTokens = chooseMaxTokens(msg, { category: lastCategory });
 
-    const raw1 = await callGroq(messages, {
-      model: GROQ_MODEL,
-      max_tokens: maxTokens,
-    });
+    // 1) Small model first
+    const raw1 = await callGroq(messages, { model: SMALL_MODEL, max_tokens: maxTokens });
     let parsed = extractJson(raw1);
 
+    // 2) Big model only if parsing failed
     let raw2 = "";
+    if (!parsed) {
+      raw2 = await callGroq(messages, { model: BIG_MODEL, max_tokens: maxTokens });
+      parsed = extractJson(raw2);
+    }
 
     let data;
     if (parsed) data = normalize(parsed);
@@ -474,7 +480,7 @@ app.post("/chat", chatLimiter, async (req, res) => {
       ok: true,
       data,
       meta: {
-        model_used: GROQ_MODEL,
+        model_used: raw2 ? BIG_MODEL : SMALL_MODEL,
         // ✅ optional: expose path for debugging (safe)
         path: ctxPath || null,
       },
@@ -486,5 +492,7 @@ app.post("/chat", chatLimiter, async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`🚀 API running on :${PORT} | model=${GROQ_MODEL} | tts=${TTS_MODEL}/${TTS_VOICE}`);
+  console.log(
+    `🚀 API running on :${PORT} | small=${SMALL_MODEL} | big=${BIG_MODEL} | tts=${TTS_MODEL}/${TTS_VOICE}`
+  );
 });

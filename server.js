@@ -12,9 +12,9 @@ const app = express();
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
 
 // Small-first / Big-fallback (LLM)
-const SMALL_MODEL = process.env.GROQ_SMALL_MODEL || "llama-3.1-8b-instant";
+const SMALL_MODEL = process.env.GROQ_SMALL_MODEL || "llama-3.3-70b-versatile";
 const BIG_MODEL =
-  (process.env.GROQ_BIG_MODEL || process.env.GROQ_MODEL || "llama-3.3-70b-versatile").trim();
+  (process.env.GROQ_BIG_MODEL || process.env.GROQ_MODEL || "openai/gpt-oss-120b").trim();
 
 // TTS (Orpheus Arabic Saudi)
 const TTS_MODEL = (process.env.GROQ_TTS_MODEL || "canopylabs/orpheus-arabic-saudi").trim();
@@ -219,6 +219,7 @@ function buildSystemPrompt() {
 النطاق:
 الإسعافات الأولية والحوادث المنزلية وضربة الشمس والإصابات،
 الاستخدام الآمن للأدوية والمضادات الحيوية والتداخلات الدوائية،
+انتبه في شرح عن  كيفية التعامل مع الجروح مع كبار السن ومرضى السكري لا تهلوس في الاجابات عن هذا الموضوع
 صحة المرأة (الدورة، الحمل، الرضاعة، سرطان الثدي)،
 صحة الأطفال (الحمى، الإمساك، سلس البول، التغذية والتطعيمات)،
 الصحة النفسية (القلق، الاكتئاب، التنمر، الوقاية من الانتحار)،

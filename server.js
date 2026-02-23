@@ -11,9 +11,10 @@ const app = express();
 
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
 
-// Single LLM model (one-model mode)
-// Set GROQ_MODEL to change it. Example: openai/gpt-oss-120b
-const CHAT_MODEL = (process.env.GROQ_MODEL || "openai/gpt-oss-120b").trim();
+// Small-first / Big-fallback (LLM)
+const SMALL_MODEL = process.env.GROQ_SMALL_MODEL || "openai/gpt-oss-120b";
+const BIG_MODEL =
+  (process.env.GROQ_BIG_MODEL || process.env.GROQ_MODEL || "openai/gpt-oss-120b").trim();
 
 // TTS (Orpheus Arabic Saudi)
 const TTS_MODEL = (process.env.GROQ_TTS_MODEL || "canopylabs/orpheus-arabic-saudi").trim();
@@ -31,8 +32,8 @@ if (!GROQ_API_KEY) {
   process.exit(1);
 }
 
-if (!CHAT_MODEL) {
-  console.error("❌ GROQ_MODEL فارغ. اضبط GROQ_MODEL");
+if (!BIG_MODEL) {
+  console.error("❌ BIG_MODEL فارغ. اضبط GROQ_BIG_MODEL أو GROQ_MODEL");
   process.exit(1);
 }
 
@@ -436,9 +437,7 @@ app.post("/tts", ttsLimiter, async (req, res) => {
     // إذا كانت المشكلة رصيد/Rate limit رجّع 503 لكي يتعامل معها العميل (fallback)
     const status = Number(e?.status || 0);
     if (status === 402 || status === 429) {
-      return res
-        .status(503)
-        .json({ ok: false, error: "tts_unavailable", hint: "quota_or_rate_limit" });
+      return res.status(503).json({ ok: false, error: "tts_unavailable", hint: "quota_or_rate_limit" });
     }
     return res.status(500).json({ ok: false, error: "tts_error" });
   }
@@ -473,23 +472,30 @@ app.post("/chat", chatLimiter, async (req, res) => {
 
     const maxTokens = chooseMaxTokens(msg, { category: lastCategory });
 
-    // Single model call
-    const raw1 = await callGroq(messages, { model: CHAT_MODEL, max_tokens: maxTokens });
+    // 1) Small model first
+    const raw1 = await callGroq(messages, { model: SMALL_MODEL, max_tokens: maxTokens });
     let parsed = extractJson(raw1);
+
+    // 2) Big model only if parsing failed
+    let raw2 = "";
+    if (!parsed) {
+      raw2 = await callGroq(messages, { model: BIG_MODEL, max_tokens: maxTokens });
+      parsed = extractJson(raw2);
+    }
 
     let data;
     if (parsed) data = normalize(parsed);
-    else data = normalize(recoverPartialCard(raw1) || fallback(raw1));
+    else data = normalize(recoverPartialCard(raw2 || raw1) || fallback(raw1));
 
     if (isMetaJsonAnswer(data)) {
-      data = normalize(recoverPartialCard(raw1) || fallback(raw1));
+      data = normalize(recoverPartialCard(raw2 || raw1) || fallback(raw1));
     }
 
     return res.json({
       ok: true,
       data,
       meta: {
-        model_used: CHAT_MODEL,
+        model_used: raw2 ? BIG_MODEL : SMALL_MODEL,
         // ✅ optional: expose path for debugging (safe)
         path: ctxPath || null,
       },
@@ -501,5 +507,7 @@ app.post("/chat", chatLimiter, async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`🚀 API running on :${PORT} | model=${CHAT_MODEL} | tts=${TTS_MODEL}/${TTS_VOICE}`);
+  console.log(
+    `🚀 API running on :${PORT} | small=${SMALL_MODEL} | big=${BIG_MODEL} | tts=${TTS_MODEL}/${TTS_VOICE}`
+  );
 });

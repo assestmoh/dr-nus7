@@ -9,11 +9,9 @@ import rateLimit from "express-rate-limit";
 
 const app = express();
 
-
 const GROQ_API_KEY = process.env.GROQ_API_KEY || "";
 const GROQ_MODEL = process.env.GROQ_MODEL || "openai/gpt-oss-120b";
 const INTERNAL_API_KEY = process.env.INTERNAL_API_KEY || "";
-
 
 // TTS (Orpheus Arabic Saudi)
 const TTS_MODEL = (process.env.GROQ_TTS_MODEL || "canopylabs/orpheus-arabic-saudi").trim();
@@ -28,11 +26,6 @@ const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || "")
 
 if (!GROQ_API_KEY) {
   console.error("❌ GROQ_API_KEY غير مضبوط");
-  process.exit(1);
-}
-
-if (!BIG_MODEL) {
-  console.error("❌ BIG_MODEL فارغ. اضبط GROQ_BIG_MODEL أو GROQ_MODEL");
   process.exit(1);
 }
 
@@ -461,16 +454,13 @@ app.post("/chat", chatLimiter, async (req, res) => {
 
     const maxTokens = chooseMaxTokens(msg, { category: lastCategory });
 
-    // 1) Small model first
-    const raw1 = await callGroq(messages, { model: SMALL_MODEL, max_tokens: maxTokens });
+    const raw1 = await callGroq(messages, {
+      model: GROQ_MODEL,
+      max_tokens: maxTokens,
+    });
     let parsed = extractJson(raw1);
 
-    // 2) Big model only if parsing failed
     let raw2 = "";
-    if (!parsed) {
-      raw2 = await callGroq(messages, { model: BIG_MODEL, max_tokens: maxTokens });
-      parsed = extractJson(raw2);
-    }
 
     let data;
     if (parsed) data = normalize(parsed);
@@ -484,7 +474,7 @@ app.post("/chat", chatLimiter, async (req, res) => {
       ok: true,
       data,
       meta: {
-        model_used: raw2 ? BIG_MODEL : SMALL_MODEL,
+        model_used: GROQ_MODEL,
         // ✅ optional: expose path for debugging (safe)
         path: ctxPath || null,
       },
@@ -496,7 +486,5 @@ app.post("/chat", chatLimiter, async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(
-    `🚀 API running on :${PORT} | small=${SMALL_MODEL} | big=${BIG_MODEL} | tts=${TTS_MODEL}/${TTS_VOICE}`
-  );
+  console.log(`🚀 API running on :${PORT} | model=${GROQ_MODEL} | tts=${TTS_MODEL}/${TTS_VOICE}`);
 });

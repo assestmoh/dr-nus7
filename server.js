@@ -9,9 +9,12 @@ import rateLimit from "express-rate-limit";
 
 const app = express();
 
-const GROQ_API_KEY = process.env.GROQ_API_KEY || "";
-const GROQ_MODEL = process.env.GROQ_MODEL || "openai/gpt-oss-120b";
-const INTERNAL_API_KEY = process.env.INTERNAL_API_KEY || "";
+const GROQ_API_KEY = process.env.GROQ_API_KEY;
+
+// Small-first / Big-fallback (LLM)
+const SMALL_MODEL = process.env.GROQ_SMALL_MODEL || "openai/gpt-oss-120b";
+const BIG_MODEL =
+  (process.env.GROQ_BIG_MODEL || process.env.GROQ_MODEL || "llama-3.3-70b-versatile").trim();
 
 // TTS (Orpheus Arabic Saudi)
 const TTS_MODEL = (process.env.GROQ_TTS_MODEL || "canopylabs/orpheus-arabic-saudi").trim();
@@ -216,7 +219,6 @@ function buildSystemPrompt() {
 النطاق:
 الإسعافات الأولية والحوادث المنزلية وضربة الشمس والإصابات،
 الاستخدام الآمن للأدوية والمضادات الحيوية والتداخلات الدوائية،
-انتبه في شرح عن  كيفية التعامل مع الجروح مع كبار السن ومرضى السكري لا تهلوس في الاجابات عن هذا الموضوع
 صحة المرأة (الدورة، الحمل، الرضاعة، سرطان الثدي)،
 صحة الأطفال (الحمى، الإمساك، سلس البول، التغذية والتطعيمات)،
 الصحة النفسية (القلق، الاكتئاب، التنمر، الوقاية من الانتحار)،
@@ -229,10 +231,10 @@ function buildSystemPrompt() {
 9999 شرطة عُمان السلطانية
 24343666 الهيئة الصحية
 مع تقديم إسعاف أولي بسيط فقط.
-اجعل قيمة verdict جملتين كحد أقصى (جملتين شاملة دقيقة مفيده ) وافصل بينهما بـ \\n.
+اجعل قيمة verdict ثلاث اسطر كحد أقصى (ثلاث جمل شاملة مفيده ) وافصل بينهما بـ \\n.
 
 أعد JSON فقط وبلا أي نص خارجه وبدون Markdown، بالشكل:
-{"category":"general|nutrition|bp|sugar|sleep|activity|mental|first_aid|report|emergency|water|calories|bmi","title":"2-5 كلمات","verdict":"جملتين كحد أقصى (جملتين شاملة  دقيقة مفيدة )","tips":["","",""],"when_to_seek_help":"\\" \\" أو نص قصير"}
+{"category":"general|nutrition|bp|sugar|sleep|activity|mental|first_aid|report|emergency|water|calories|bmi","title":"2-5 كلمات","verdict":"ثلاث اسطر كحد أقصى (ثلاث جمل شاملة مفيدة )","tips":["","",""],"when_to_seek_help":"\\" \\" أو نص قصير"}
 
 تنبيه مهم للمسار:
 إذا وصلك سياق فيه "path" فهذا يعني مسار واجهة المستخدم المختار (مثل صحة النساء/الأطفال/التغذية). التزم بنفس المسار وقدّم معلومات جديدة غير مكررة عن السابق وبنفس هيكلة JSON.
@@ -345,6 +347,8 @@ async function callGroqTTS(text, { model = TTS_MODEL, voice = TTS_VOICE } = {}) 
 }
 
 // ---------- TTS cache (in-memory) ----------
+// الهدف: تقليل استهلاك الرصيد عند تكرار نفس الاستماع لنفس الكرت.
+// ملاحظة: الكاش مؤقت (يختفي عند إعادة تشغيل السيرفر) لكنه يقلل الاستهلاك كثيرًا.
 const TTS_CACHE = new Map(); // key => { buf: Buffer, ts: number, bytes: number }
 const TTS_CACHE_TTL_MS = Number(process.env.TTS_CACHE_TTL_MS || 1000 * 60 * 60 * 6); // 6 ساعات
 const TTS_CACHE_MAX_ITEMS = Number(process.env.TTS_CACHE_MAX_ITEMS || 40);
@@ -413,16 +417,16 @@ app.post("/tts", ttsLimiter, async (req, res) => {
     if (!cached) ttsCacheSet(key, wav);
 
     res.setHeader("Content-Type", "audio/wav");
+    // Cache على المتصفح/الوسيط لمدة قصيرة (آمن لأنه لا يتضمن بيانات حساسة إذا التزمنا بنص قصير)
     res.setHeader("Cache-Control", "private, max-age=3600");
     res.setHeader("Content-Length", String(wav.length));
     return res.status(200).send(wav);
   } catch (e) {
     console.error(e);
+    // إذا كانت المشكلة رصيد/Rate limit رجّع 503 لكي يتعامل معها العميل (fallback)
     const status = Number(e?.status || 0);
     if (status === 402 || status === 429) {
-      return res
-        .status(503)
-        .json({ ok: false, error: "tts_unavailable", hint: "quota_or_rate_limit" });
+      return res.status(503).json({ ok: false, error: "tts_unavailable", hint: "quota_or_rate_limit" });
     }
     return res.status(500).json({ ok: false, error: "tts_error" });
   }

@@ -87,7 +87,6 @@ async function fetchWithTimeout(url, options = {}, ms = 15000) {
 }
 
 /* ================= Gemini Call ================= */
-
 async function callGemini(messages, maxTokens) {
 
   if (!genAI) throw new Error("Gemini disabled");
@@ -100,12 +99,27 @@ async function callGemini(messages, maxTokens) {
     },
   });
 
-  const prompt = messages
-    .map(m => `${m.role}: ${m.content}`)
-    .join("\n");
+  // ✅ دمج الرسائل بطريقة يفهمها Gemini
+  const system =
+    messages.find(m => m.role === "system")?.content || "";
 
-  const result =
-    await model.generateContent(prompt);
+  const rest =
+    messages
+      .filter(m => m.role !== "system")
+      .map(m => m.content)
+      .join("\n");
+
+  const prompt = `
+${system}
+
+⚠️ مهم جداً:
+أعد JSON فقط بدون شرح.
+لا تضف نص قبل أو بعد JSON.
+
+${rest}
+`;
+
+  const result = await model.generateContent(prompt);
 
   return result.response.text();
 }

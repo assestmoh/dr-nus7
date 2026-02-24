@@ -12,7 +12,7 @@ const app = express();
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
 
 // Small-first / Big-fallback (LLM)
-const SMALL_MODEL = process.env.GROQ_SMALL_MODEL || "llama-3.3-70b-versatile";
+const SMALL_MODEL = process.env.GROQ_SMALL_MODEL || "openai/gpt-oss-120b";
 const BIG_MODEL =
   (process.env.GROQ_BIG_MODEL || process.env.GROQ_MODEL || "openai/gpt-oss-120b").trim();
 

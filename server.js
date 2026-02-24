@@ -11,10 +11,9 @@ const app = express();
 
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
 
-// Small-first / Big-fallback (LLM)
-const SMALL_MODEL = process.env.GROQ_SMALL_MODEL || "openai/gpt-oss-120b";
-const BIG_MODEL =
-  (process.env.GROQ_BIG_MODEL || process.env.GROQ_MODEL || "llama-3.3-70b-versatile").trim();
+// Single-model (LLM)
+// You can set GROQ_MODEL (preferred). For backward compatibility, GROQ_SMALL_MODEL is also accepted.
+const MODEL = (process.env.GROQ_MODEL || process.env.GROQ_SMALL_MODEL || "openai/gpt-oss-120b").trim();
 
 // TTS (Orpheus Arabic Saudi)
 const TTS_MODEL = (process.env.GROQ_TTS_MODEL || "canopylabs/orpheus-arabic-saudi").trim();
@@ -32,8 +31,8 @@ if (!GROQ_API_KEY) {
   process.exit(1);
 }
 
-if (!BIG_MODEL) {
-  console.error("❌ BIG_MODEL فارغ. اضبط GROQ_BIG_MODEL أو GROQ_MODEL");
+if (!MODEL) {
+  console.error("❌ MODEL فارغ. اضبط GROQ_MODEL (أو GROQ_SMALL_MODEL للتوافق)");
   process.exit(1);
 }
 
@@ -206,6 +205,14 @@ function normalize(obj) {
     tips: sArr(obj?.tips, 3),
     when_to_seek_help: sStr(obj?.when_to_seek_help),
   };
+}
+
+
+function isEmptyCard(card) {
+  const verdictEmpty = !String(card?.verdict || "").trim();
+  const tipsEmpty = !Array.isArray(card?.tips) || card.tips.length === 0;
+  const seekEmpty = !String(card?.when_to_seek_help || "").trim();
+  return verdictEmpty && tipsEmpty && seekEmpty;
 }
 
 function buildSystemPrompt() {
@@ -535,30 +542,29 @@ app.post("/chat", chatLimiter, async (req, res) => {
 
     const maxTokens = chooseMaxTokens(msg, { category: lastCategory });
 
-    // 1) Small model first
-    const raw1 = await callGroq(messages, { model: SMALL_MODEL, max_tokens: maxTokens });
-    let parsed = extractJson(raw1);
-
-    // 2) Big model only if parsing failed
-    let raw2 = "";
-    if (!parsed) {
-      raw2 = await callGroq(messages, { model: BIG_MODEL, max_tokens: maxTokens });
-      parsed = extractJson(raw2);
-    }
+    // Single model only
+    const raw1 = await callGroq(messages, { model: MODEL, max_tokens: maxTokens });
+    const parsed = extractJson(raw1);
 
     let data;
     if (parsed) data = normalize(parsed);
-    else data = normalize(recoverPartialCard(raw2 || raw1) || fallback(raw1));
+    else data = normalize(recoverPartialCard(raw1) || fallback(raw1));
 
+    // If the model responded with meta/instructions instead of the expected content
     if (isMetaJsonAnswer(data)) {
-      data = normalize(recoverPartialCard(raw2 || raw1) || fallback(raw1));
+      data = normalize(recoverPartialCard(raw1) || fallback(raw1));
+    }
+
+    // Guardrail: prevent "title-only" cards
+    if (isEmptyCard(data)) {
+      data = fallback(raw1);
     }
 
     return res.json({
       ok: true,
       data,
       meta: {
-        model_used: raw2 ? BIG_MODEL : SMALL_MODEL,
+        model_used: MODEL,
         // ✅ optional: expose path for debugging (safe)
         path: ctxPath || null,
       },
@@ -571,6 +577,6 @@ app.post("/chat", chatLimiter, async (req, res) => {
 
 app.listen(PORT, () => {
   console.log(
-    `🚀 API running on :${PORT} | small=${SMALL_MODEL} | big=${BIG_MODEL} | tts=${TTS_MODEL}/${TTS_VOICE}`
+    `🚀 API running on :${PORT} | model=${MODEL} | tts=${TTS_MODEL}/${TTS_VOICE}`
   );
 });

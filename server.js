@@ -12,7 +12,7 @@ const app = express();
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
 
 // ✅ موديل واحد فقط (Groq)
-const MODEL = (process.env.GROQ_MODEL || "llama-3.3-70b-versatile").trim();
+const MODEL = (process.env.GROQ_MODEL || "openai/gpt-oss-120b").trim();
 
 // TTS (Orpheus Arabic Saudi)
 const TTS_MODEL = (process.env.GROQ_TTS_MODEL || "canopylabs/orpheus-arabic-saudi").trim();

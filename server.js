@@ -16,7 +16,7 @@ const MODEL = (process.env.GROQ_MODEL || "openai/gpt-oss-120b").trim();
 
 // TTS (Orpheus Arabic Saudi)
 const TTS_MODEL = (process.env.GROQ_TTS_MODEL || "canopylabs/orpheus-arabic-saudi").trim();
-const TTS_VOICE = (process.env.GROQ_TTS_VOICE || "fahad").trim();
+const TTS_VOICE = (process.env.GROQ_TTS_VOICE || "noura").trim();
 
 const PORT = process.env.PORT || 3000;
 

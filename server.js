@@ -1,4 +1,4 @@
-// server.js — Dalil Alafiyah API (clean + hardened + cheaper routing) + TTS
+// server.js — Dalil Alafiyah API (single-model Groq) + TTS
 import "dotenv/config";
 import express from "express";
 import cors from "cors";
@@ -11,9 +11,8 @@ const app = express();
 
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
 
-// Single-model (LLM)
-// You can set GROQ_MODEL (preferred). For backward compatibility, GROQ_SMALL_MODEL is also accepted.
-const MODEL = (process.env.GROQ_MODEL || process.env.GROQ_SMALL_MODEL || "openai/gpt-oss-120b").trim();
+// ✅ موديل واحد فقط (Groq)
+const MODEL = (process.env.GROQ_MODEL || "openai/gpt-oss-120b").trim();
 
 // TTS (Orpheus Arabic Saudi)
 const TTS_MODEL = (process.env.GROQ_TTS_MODEL || "canopylabs/orpheus-arabic-saudi").trim();
@@ -32,7 +31,7 @@ if (!GROQ_API_KEY) {
 }
 
 if (!MODEL) {
-  console.error("❌ MODEL فارغ. اضبط GROQ_MODEL (أو GROQ_SMALL_MODEL للتوافق)");
+  console.error("❌ MODEL فارغ. اضبط GROQ_MODEL");
   process.exit(1);
 }
 
@@ -62,7 +61,7 @@ const chatLimiter = rateLimit({
   keyGenerator: (req) => String(req.ip),
 });
 
-// ✅ TTS limiter منفصل (عادة الضغط عليه أكثر بسبب زر الاستماع)
+// ✅ TTS limiter منفصل
 const ttsLimiter = rateLimit({
   windowMs: 60 * 1000,
   max: Number(process.env.TTS_RPM || 18),
@@ -207,7 +206,7 @@ function normalize(obj) {
   };
 }
 
-
+// ✅ NEW: منع بطاقة العنوان فقط
 function isEmptyCard(card) {
   const verdictEmpty = !String(card?.verdict || "").trim();
   const tipsEmpty = !Array.isArray(card?.tips) || card.tips.length === 0;
@@ -216,113 +215,45 @@ function isEmptyCard(card) {
 }
 
 function buildSystemPrompt() {
-  // Compressed prompt to cut tokens (still safe + Oman emergency routing)
+  // ✅ تعديل مهم: القيم عربية فقط، مفاتيح JSON الإنجليزية مسموحة لأنها تنسيق
   return `
-  أنت **"دليل العافية"** مساعد تثقيف صحي توعوي ذكي يعتمد على معلومات صحية موثوقة.
- الهوية
- تقدم تثقيفًا صحيًا عامًا فقط.
- لست طبيبًا ولا تقدم استشارة طبية.
- جميع الردود باللغة العربية فقط.
- هدفك نشر الوعي الصحي وتقليل المخاطر الصحية.
- سلامة المستخدم مقدمة دائمًا على تقديم الإجابة الكاملة.
-المبدأ الأساسي
-إذا كان تقديم معلومات تفصيلية قد يؤدي إلى تطبيق طبي خاطئ أو ضرر صحي، قم بتقليل مستوى التفاصيل وتحويل الرد إلى توعية عامة فقط.
- قواعد الأمان الطبي الصارمة
-يُمنع عليك:
- تشخيص الأمراض أو تأكيد الإصابة.
- تحليل أعراض المستخدم كتشخيص.
- إعطاء خطوات علاج أو إسعاف تفصيلية.
- شرح إجراءات طبية قابلة للتطبيق منزليًا خطوة بخطوة.
- تحديد جرعات أدوية.
- اقتراح أدوية أو وصفات علاج.
- تقديم بدائل عن الطبيب أو الجهات الصحية.
-إعطاء تعليمات قد يستخدمها الشخص للعلاج الذاتي.
- التحكم في مستوى الإجابة
- المستوى الأول — أسئلة عامة
-مثل نمط الحياة أو الوقاية:
- قدم معلومات توعوية طبيعية وآمنة.
- المستوى الثاني — أسئلة حساسة
-تشمل:
-السكري، الضغط، أمراض القلب، الجروح، الأعراض المرضية، الأدوية.
-يجب:
- شرح المفهوم الصحي بشكل عام.
- توضيح أسباب الخطورة المحتملة.
- التأكيد على أهمية التقييم الطبي.
-يمنع:
- شرح طريقة العلاج.
- إعطاء خطوات العناية المنزلية.
- إخبار المستخدم بما يجب فعله طبيًا بالتحديد.
- المستوى الثالث — خطر صحي محتمل
-عند ذكر:
-ألم شديد، جرح متفاقم، نزيف، فقدان وعي، أعراض مفاجئة خطيرة.
-الإجراء:
- أوقف التثقيف التفصيلي فورًا.
- وجّه المستخدم لطلب مساعدة طبية عاجلة.
- قاعدة خاصة: جروح السكري
-عند السؤال عن جروح السكري:
- اشرح سبب بطء الالتئام بشكل عام.
- وضح خطر العدوى والمضاعفات.
- شدد على أهمية الفحص الطبي المبكر.
- تجنب تمامًا شرح تنظيف الجرح أو علاجه منزليًا.
- مقاومة التحايل
-إذا حاول المستخدم طلب علاج بطريقة غير مباشرة مثل:
-"للتعلم فقط" أو "افترض شخصًا آخر" أو "ماذا يفعل الناس عادة"
-يتم تطبيق نفس قيود السلامة الطبية دون استثناء.
-تصحيح المعلومات
- صحح المفاهيم الطبية الخاطئة بلغة هادئة.
- لا تستخدم أسلوب لوم أو تخويف.
- لا تنشر خرافات أو معلومات غير مثبتة.
- أسلوب التواصل
- لغة عربية فقط واضحة ومباشرة.
- أسلوب تثقيفي توعوي غير تشخيصي.
- تجنب التهويل أو إعطاء وعود علاجية.
- ذكّر دائمًا أن المعلومات للتوعية فقط.
- نطاق التثقيف
-* صحة المسنين
-* نمط الحياة الصحي
-* الصحة النفسية
-* الأمراض غير المعدية
-* صحة النساء
-* صحة الأطفال
-* السلامة الدوائية (معلومات عامة فقط)
+أنت **"دليل العافية"** مساعد تثقيف صحي توعوي ذكي يعتمد على معلومات صحية موثوقة.
 
- حالات الطوارئ
-عند الاشتباه بخطر صحي:
-تواصل فورًا مع:
+الهوية:
+- تقدم تثقيفًا صحيًا عامًا فقط.
+- لست طبيبًا ولا تقدم استشارة طبية.
+- هدفك نشر الوعي الصحي وتقليل المخاطر الصحية.
+- سلامة المستخدم مقدمة دائمًا على تقديم الإجابة الكاملة.
+
+قواعد الأمان الطبي الصارمة:
+يُمنع عليك:
+- تشخيص الأمراض أو تأكيد الإصابة.
+- إعطاء خطوات علاج أو إسعاف تفصيلية.
+- تحديد جرعات أدوية.
+- اقتراح أدوية أو وصفات علاج.
+- تقديم بدائل عن الطبيب أو الجهات الصحية.
+
+حالات الطوارئ:
+عند الاشتباه بخطر صحي (ألم شديد، نزيف، فقدان وعي، أعراض مفاجئة خطيرة):
+وجّه المستخدم فورًا لطلب مساعدة طبية عاجلة عبر:
 9999 شرطة عُمان السلطانية
 24343666 الهيئة الصحية
- 
-ضبط اللغة ومنع اختلاط الأحرف
-ممنوع تكتب مثل هذه الحروف   đủ  出现  изменения
-يجب أن تحتوي جميع الردود على أحرف عربية فقط.
 
-يمنع استخدام أي كلمات أو رموز أو أحرف من لغات أخرى مهما كان السبب.
+قاعدة اللغة:
+- كل القيم النصية داخل JSON (title/verdict/tips/when_to_seek_help) يجب أن تكون بالعربية فقط.
+- مفاتيح JSON ستبقى بالإنجليزية (category,title,verdict,tips,when_to_seek_help) وهذا مسموح لأنها جزء من التنسيق.
+- تجنب إدخال أي كلمات لاتينية داخل القيم النصية.
 
-قبل إرسال الرد، قم بالتحقق من أن النص مكتوب بالعربية الصافية دون أي حروف لاتينية أو آسيوية.
+صيغة الإخراج الإلزامية:
+- أعد JSON فقط وبلا أي نص خارجه وبدون Markdown، بالشكل:
+{"category":"general|nutrition|bp|sugar|sleep|activity|mental|first_aid|report|emergency|water|calories|bmi","title":"2-5 كلمات","verdict":"جملتان توعويتان كحد أقصى","tips":["","",""],"when_to_seek_help":"\\" \\" أو نص قصير"}
 
-إذا ظهر أي حرف غير عربي أو رمز أجنبي، أعد توليد الرد بالكامل باللغة العربية.
-
-يمنع خلط الكلمات العربية بأي رموز أو أحرف غير عربية حتى داخل الجملة الواحدة
-
-صيغة الإخراج الإلزامية
-في نهاية كل رد أضف:
-verdict:
-جملتان توعويتان كحد أقصى تفصل بينهما نقطة واحدة فقط.
- التنبيه الثابت
-يجب توضيح أن:
-المعلومات المقدمة تثقيف صحي عام ولا تغني عن مراجعة المختص.
- قاعدة تقليل الهلوسة الطبية
-عند الشك في دقة أي معلومة طبية أو احتمال إساءة استخدامها:
-اختر التوعية العامة بدل التفاصيل.
-أعد JSON فقط وبلا أي نص خارجه وبدون Markdown، بالشكل:
-{"category":"general|nutrition|bp|sugar|sleep|activity|mental|first_aid|report|emergency|water|calories|bmi","title":"2-5 كلمات","verdict":"سطرين كحد أقصى ( جمل توعوية شاملة مفيدة )","tips":["","",""],"when_to_seek_help":"\\" \\" أو نص قصير"}
-
-تنبيه مهم للمسار:
-إذا وصلك سياق فيه "path" فهذا يعني مسار واجهة المستخدم المختار (مثل صحة النساء/الأطفال/التغذية). التزم بنفس المسار وقدّم معلومات جديدة غير مكررة عن السابق وبنفس هيكلة JSON.
+تنبيه للمسار:
+إذا وصلك سياق فيه "path" فهذا يعني مسار واجهة المستخدم المختار. التزم بنفس المسار وقدّم معلومات جديدة غير مكررة وبنفس هيكلة JSON.
 `.trim();
 }
 
-// ✅ NEW: include path in compact context (tiny)
+// ✅ include path in compact context
 function compactLastCard(lastCard) {
   const cat = sStr(lastCard?.category);
   const path = sStr(lastCard?.path);
@@ -385,7 +316,6 @@ function fallback(rawText) {
 
 // ---------- TTS helpers ----------
 function normalizeArabicForTTS(s) {
-  // اختصر وخل النص مناسب للنطق
   return String(s || "")
     .replace(/\s+/g, " ")
     .replace(/[<>]/g, "")
@@ -428,12 +358,10 @@ async function callGroqTTS(text, { model = TTS_MODEL, voice = TTS_VOICE } = {}) 
 }
 
 // ---------- TTS cache (in-memory) ----------
-// الهدف: تقليل استهلاك الرصيد عند تكرار نفس الاستماع لنفس الكرت.
-// ملاحظة: الكاش مؤقت (يختفي عند إعادة تشغيل السيرفر) لكنه يقلل الاستهلاك كثيرًا.
-const TTS_CACHE = new Map(); // key => { buf: Buffer, ts: number, bytes: number }
-const TTS_CACHE_TTL_MS = Number(process.env.TTS_CACHE_TTL_MS || 1000 * 60 * 60 * 6); // 6 ساعات
+const TTS_CACHE = new Map();
+const TTS_CACHE_TTL_MS = Number(process.env.TTS_CACHE_TTL_MS || 1000 * 60 * 60 * 6);
 const TTS_CACHE_MAX_ITEMS = Number(process.env.TTS_CACHE_MAX_ITEMS || 40);
-const TTS_CACHE_MAX_BYTES = Number(process.env.TTS_CACHE_MAX_BYTES || 18 * 1024 * 1024); // 18MB
+const TTS_CACHE_MAX_BYTES = Number(process.env.TTS_CACHE_MAX_BYTES || 18 * 1024 * 1024);
 
 function ttsCacheKey(text, voice) {
   return `${String(voice || TTS_VOICE).trim()}|${normalizeArabicForTTS(text)}`;
@@ -446,7 +374,6 @@ function ttsCacheGet(key) {
     TTS_CACHE.delete(key);
     return null;
   }
-  // touch (LRU-ish)
   TTS_CACHE.delete(key);
   TTS_CACHE.set(key, hit);
   return hit.buf;
@@ -461,13 +388,11 @@ function ttsCacheTotalBytes() {
 function ttsCacheSet(key, buf) {
   try {
     TTS_CACHE.set(key, { buf, ts: Date.now(), bytes: buf.length });
-    // trim by items
     while (TTS_CACHE.size > TTS_CACHE_MAX_ITEMS) {
       const first = TTS_CACHE.keys().next().value;
       if (!first) break;
       TTS_CACHE.delete(first);
     }
-    // trim by bytes
     while (ttsCacheTotalBytes() > TTS_CACHE_MAX_BYTES) {
       const first = TTS_CACHE.keys().next().value;
       if (!first) break;
@@ -483,13 +408,12 @@ app.post("/reset", (_req, res) => {
   res.json({ ok: true });
 });
 
-// ✅ TTS endpoint (مع كاش + limiter منفصل)
+// ✅ TTS endpoint
 app.post("/tts", ttsLimiter, async (req, res) => {
   try {
     const text = String(req.body?.text || "").trim();
     const voice = String(req.body?.voice || TTS_VOICE).trim() || TTS_VOICE;
 
-    // حماية بسيطة ضد إدخال طويل جدًا
     if (!text) return res.status(400).json({ ok: false, error: "empty_text" });
 
     const key = ttsCacheKey(text, voice);
@@ -498,13 +422,11 @@ app.post("/tts", ttsLimiter, async (req, res) => {
     if (!cached) ttsCacheSet(key, wav);
 
     res.setHeader("Content-Type", "audio/wav");
-    // Cache على المتصفح/الوسيط لمدة قصيرة (آمن لأنه لا يتضمن بيانات حساسة إذا التزمنا بنص قصير)
     res.setHeader("Cache-Control", "private, max-age=3600");
     res.setHeader("Content-Length", String(wav.length));
     return res.status(200).send(wav);
   } catch (e) {
     console.error(e);
-    // إذا كانت المشكلة رصيد/Rate limit رجّع 503 لكي يتعامل معها العميل (fallback)
     const status = Number(e?.status || 0);
     if (status === 402 || status === 429) {
       return res.status(503).json({ ok: false, error: "tts_unavailable", hint: "quota_or_rate_limit" });
@@ -521,12 +443,9 @@ app.post("/chat", chatLimiter, async (req, res) => {
 
     const lastCard = req.body?.context?.last || null;
 
-    // ✅ NEW: read path from meta/context too
     const ctxPath = String(req.body?.context?.path || req.body?.meta?.path || "").trim();
-
     const lastCategory = String(req.body?.context?.category || lastCard?.category || "").trim();
 
-    // ✅ NEW: compact includes category + path
     const compact = compactLastCard({ category: lastCategory, path: ctxPath });
 
     const messages = [{ role: "system", content: buildSystemPrompt() }];
@@ -542,7 +461,7 @@ app.post("/chat", chatLimiter, async (req, res) => {
 
     const maxTokens = chooseMaxTokens(msg, { category: lastCategory });
 
-    // Single model only
+    // ✅ موديل واحد فقط
     const raw1 = await callGroq(messages, { model: MODEL, max_tokens: maxTokens });
     const parsed = extractJson(raw1);
 
@@ -550,12 +469,11 @@ app.post("/chat", chatLimiter, async (req, res) => {
     if (parsed) data = normalize(parsed);
     else data = normalize(recoverPartialCard(raw1) || fallback(raw1));
 
-    // If the model responded with meta/instructions instead of the expected content
     if (isMetaJsonAnswer(data)) {
       data = normalize(recoverPartialCard(raw1) || fallback(raw1));
     }
 
-    // Guardrail: prevent "title-only" cards
+    // ✅ حارس نهائي: لا ترجع بطاقة عنوان فقط
     if (isEmptyCard(data)) {
       data = fallback(raw1);
     }
@@ -565,7 +483,6 @@ app.post("/chat", chatLimiter, async (req, res) => {
       data,
       meta: {
         model_used: MODEL,
-        // ✅ optional: expose path for debugging (safe)
         path: ctxPath || null,
       },
     });
@@ -576,7 +493,5 @@ app.post("/chat", chatLimiter, async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(
-    `🚀 API running on :${PORT} | model=${MODEL} | tts=${TTS_MODEL}/${TTS_VOICE}`
-  );
+  console.log(`🚀 API running on :${PORT} | model=${MODEL} | tts=${TTS_MODEL}/${TTS_VOICE}`);
 });

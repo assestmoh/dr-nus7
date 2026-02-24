@@ -1,4 +1,4 @@
-// server.js — Dalil Alafiyah API (single-model Groq) + TTS
+// server.js — Dalil Alafiyah API (single-model Groq) + TTS (NO JSON mode to avoid 400 json_validate_failed)
 import "dotenv/config";
 import express from "express";
 import cors from "cors";
@@ -12,7 +12,7 @@ const app = express();
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
 
 // ✅ موديل واحد فقط (Groq)
-const MODEL = (process.env.GROQ_MODEL || "openai/gpt-oss-120b").trim();
+const MODEL = (process.env.GROQ_MODEL || "llama-3.3-70b-versatile").trim();
 
 // TTS (Orpheus Arabic Saudi)
 const TTS_MODEL = (process.env.GROQ_TTS_MODEL || "canopylabs/orpheus-arabic-saudi").trim();
@@ -29,7 +29,6 @@ if (!GROQ_API_KEY) {
   console.error("❌ GROQ_API_KEY غير مضبوط");
   process.exit(1);
 }
-
 if (!MODEL) {
   console.error("❌ MODEL فارغ. اضبط GROQ_MODEL");
   process.exit(1);
@@ -148,13 +147,7 @@ function recoverPartialCard(raw) {
 
   const tips = arrPick("tips", 3);
 
-  return {
-    category,
-    title,
-    verdict,
-    tips,
-    when_to_seek_help,
-  };
+  return { category, title, verdict, tips, when_to_seek_help };
 }
 
 function isMetaJsonAnswer(d) {
@@ -166,7 +159,6 @@ function isMetaJsonAnswer(d) {
     String(d?.when_to_seek_help || "") +
     " " +
     (Array.isArray(d?.tips) ? d.tips.join(" ") : "");
-
   return /json|format|schema|اقتباس|فواصل|تنسيق/i.test(text);
 }
 
@@ -206,51 +198,20 @@ function normalize(obj) {
   };
 }
 
-// ✅ اعتبر البطاقة فاشلة فقط إذا verdict فاضي
 function isEmptyCard(card) {
-  const verdictEmpty = !String(card?.verdict || "").trim();
-  return verdictEmpty;
+  return !String(card?.verdict || "").trim();
 }
 
 function buildSystemPrompt() {
+  // مختصر قدر الإمكان لتقليل فشل الإخراج
   return `
-أنت **"دليل العافية"** مساعد تثقيف صحي توعوي ذكي يعتمد على معلومات صحية موثوقة.
-
-الهوية:
-- تقدم تثقيفًا صحيًا عامًا فقط.
-- لست طبيبًا ولا تقدم استشارة طبية.
-- هدفك نشر الوعي الصحي وتقليل المخاطر الصحية.
-- سلامة المستخدم مقدمة دائمًا على تقديم الإجابة الكاملة.
-
-قواعد الأمان الطبي الصارمة:
-يُمنع عليك:
-- تشخيص الأمراض أو تأكيد الإصابة.
-- إعطاء خطوات علاج أو إسعاف تفصيلية.
-- تحديد جرعات أدوية.
-- اقتراح أدوية أو وصفات علاج.
-- تقديم بدائل عن الطبيب أو الجهات الصحية.
-
-حالات الطوارئ:
-عند الاشتباه بخطر صحي (ألم شديد، نزيف، فقدان وعي، أعراض مفاجئة خطيرة):
-وجّه المستخدم فورًا لطلب مساعدة طبية عاجلة عبر:
-9999 شرطة عُمان السلطانية
-24343666 الهيئة الصحية
-
-قاعدة اللغة:
-- كل القيم النصية داخل JSON (title/verdict/tips/when_to_seek_help) يجب أن تكون بالعربية فقط.
-- مفاتيح JSON ستبقى بالإنجليزية (category,title,verdict,tips,when_to_seek_help) وهذا مسموح لأنها جزء من التنسيق.
-- تجنب إدخال أي كلمات لاتينية داخل القيم النصية.
-
-صيغة الإخراج الإلزامية:
-- أعد JSON فقط وبلا أي نص خارجه وبدون Markdown، بالشكل:
-{"category":"general|nutrition|bp|sugar|sleep|activity|mental|first_aid|report|emergency|water|calories|bmi","title":"2-5 كلمات","verdict":"جملتان توعويتان كحد أقصى","tips":["","",""],"when_to_seek_help":"\\" \\" أو نص قصير"}
-
-تنبيه للمسار:
-إذا وصلك سياق فيه "path" فهذا يعني مسار واجهة المستخدم المختار. التزم بنفس المسار وقدّم معلومات جديدة غير مكررة وبنفس هيكلة JSON.
+أنت "دليل العافية" مساعد تثقيف صحي عام فقط. لست طبيبًا ولا تقدم علاجًا أو جرعات أو خطوات إسعاف تفصيلية.
+عند وجود أعراض خطيرة (ألم صدر شديد/ضيق نفس شديد/إغماء/نزيف شديد/ضعف مفاجئ): وجّه للطوارئ فورًا (9999 أو 24343666 في عُمان).
+أعد الناتج كـ JSON فقط بدون أي نص إضافي وبدون Markdown وبالمفاتيح التالية فقط:
+{"category":"general|nutrition|bp|sugar|sleep|activity|mental|first_aid|report|emergency|water|calories|bmi","title":"2-5 كلمات","verdict":"جملتان كحد أقصى","tips":["","",""],"when_to_seek_help":"نص قصير أو \\" \\""}
 `.trim();
 }
 
-// ✅ include path in compact context
 function compactLastCard(lastCard) {
   const cat = sStr(lastCard?.category);
   const path = sStr(lastCard?.path);
@@ -261,87 +222,47 @@ function compactLastCard(lastCard) {
 }
 
 function chooseMaxTokens(msg, lastCard) {
-  const base = Number(process.env.GROQ_MAX_TOKENS || 220);
+  // ✅ ارفعها شوي لتقليل نقص التوكنز أثناء إخراج JSON
+  const base = Number(process.env.GROQ_MAX_TOKENS || 520);
 
   const text = String(msg || "");
   const cat = sStr(lastCard?.category);
-  if (cat === "report" || /تقرير|ملخص|تحليل/i.test(text)) return Math.max(base, 320);
+  if (cat === "report" || /تقرير|ملخص|تحليل/i.test(text)) return Math.max(base, 750);
   if (cat === "emergency" || /طوارئ|إسعاف|اختناق|نزيف|حروق|سكتة/i.test(text))
-    return Math.max(base, 320);
+    return Math.max(base, 650);
 
   return base;
 }
 
 /**
- * ✅ callGroq (FIXED):
- * - tries JSON mode (response_format json_object)
- * - if Groq returns 400 لأي سبب: يعيد المحاولة بدون response_format مباشرة
- * - logs the response body for debugging (limited)
+ * ✅ callGroq (NO response_format):
+ * - removes JSON mode entirely to avoid 400 json_validate_failed
+ * - relies on prompt + extractJson + repair pass
  */
 async function callGroq(messages, { model, max_tokens }) {
   const url = "https://api.groq.com/openai/v1/chat/completions";
 
-  const baseHeaders = {
-    Authorization: `Bearer ${GROQ_API_KEY}`,
-    "Content-Type": "application/json",
-  };
-
-  const payloadJsonMode = {
-    model,
-    temperature: 0.35,
-    max_tokens,
-    messages,
-    response_format: { type: "json_object" },
-  };
-
-  // 1) First attempt (JSON mode)
-  let res = await fetchWithTimeout(
+  const res = await fetchWithTimeout(
     url,
     {
       method: "POST",
-      headers: baseHeaders,
-      body: JSON.stringify(payloadJsonMode),
+      headers: {
+        Authorization: `Bearer ${GROQ_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model,
+        temperature: 0.2,
+        max_tokens,
+        messages,
+      }),
     },
     20000
   );
 
-  // 2) If 400: retry without response_format (many models/endpoints reject it)
-  if (!res.ok && res.status === 400) {
-    const t1 = await res.text().catch(() => "");
-    console.error("Groq 400 (json mode). Retrying without response_format. Body:", t1.slice(0, 600));
-
-    const payloadPlain = {
-      model,
-      temperature: 0.35,
-      max_tokens,
-      messages,
-      // no response_format
-    };
-
-    res = await fetchWithTimeout(
-      url,
-      {
-        method: "POST",
-        headers: baseHeaders,
-        body: JSON.stringify(payloadPlain),
-      },
-      20000
-    );
-
-    if (!res.ok) {
-      const t2 = await res.text().catch(() => "");
-      console.error("Groq retry failed:", res.status, t2.slice(0, 600));
-      throw new Error(`Groq API error (${res.status}) ${(t2 || t1 || "").slice(0, 400)}`);
-    }
-
-    const data2 = await res.json();
-    return data2.choices?.[0]?.message?.content || "";
-  }
-
-  // Other non-OK statuses
   if (!res.ok) {
     const t = await res.text().catch(() => "");
-    console.error("Groq error:", res.status, t.slice(0, 600));
+    console.error("Groq error:", res.status, t.slice(0, 800));
     throw new Error(`Groq API error (${res.status}) ${t.slice(0, 400)}`);
   }
 
@@ -349,16 +270,12 @@ async function callGroq(messages, { model, max_tokens }) {
   return data.choices?.[0]?.message?.content || "";
 }
 
-/**
- * ✅ fallback updated:
- * - Always returns useful Arabic content
- */
 function fallback(_rawText) {
   return {
     category: "general",
     title: "معلومة صحية",
-    verdict: "أقدر أساعدك بمعلومة صحية عامة. اكتب سؤالك بجملة واحدة وحدد العمر والجنس إن كان له علاقة.",
-    tips: ["اذكر الأعراض باختصار", "حدّد المدة منذ بداية المشكلة", "اذكر إن كان لديك أمراض مزمنة"],
+    verdict: "أقدر أساعدك بمعلومة صحية عامة. اكتب سؤالك بجملة واحدة وبشكل مختصر.",
+    tips: ["اذكر الأعراض باختصار", "حدّد مدة الأعراض", "اذكر إن كان لديك مرض مزمن"],
     when_to_seek_help: "إذا كان هناك ألم شديد أو ضيق نفس أو إغماء أو نزيف فاطلب مساعدة عاجلة.",
   };
 }
@@ -542,7 +459,6 @@ app.post("/chat", chatLimiter, async (req, res) => {
       data = normalize(recoverPartialCard(raw1) || fallback(raw1));
     }
 
-    // ✅ حارس نهائي: إذا verdict فاضي رجّع fallback
     if (isEmptyCard(data)) {
       data = fallback(raw1);
     }
@@ -557,7 +473,6 @@ app.post("/chat", chatLimiter, async (req, res) => {
     });
   } catch (e) {
     console.error(e);
-    // ✅ ارجع hint بسيط عشان الواجهة/التشخيص
     const hint = String(e?.message || "").slice(0, 160);
     return res.status(500).json({ ok: false, error: "server_error", hint, data: fallback("") });
   }

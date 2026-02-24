@@ -206,16 +206,13 @@ function normalize(obj) {
   };
 }
 
-// ✅ NEW: منع بطاقة العنوان فقط
+// ✅ NEW: اعتبر البطاقة فاشلة فقط إذا verdict فاضي
 function isEmptyCard(card) {
   const verdictEmpty = !String(card?.verdict || "").trim();
-  const tipsEmpty = !Array.isArray(card?.tips) || card.tips.length === 0;
-  const seekEmpty = !String(card?.when_to_seek_help || "").trim();
-  return verdictEmpty && tipsEmpty && seekEmpty;
+  return verdictEmpty;
 }
 
 function buildSystemPrompt() {
-  // ✅ تعديل مهم: القيم عربية فقط، مفاتيح JSON الإنجليزية مسموحة لأنها تنسيق
   return `
 أنت **"دليل العافية"** مساعد تثقيف صحي توعوي ذكي يعتمد على معلومات صحية موثوقة.
 
@@ -275,24 +272,60 @@ function chooseMaxTokens(msg, lastCard) {
   return base;
 }
 
+/**
+ * ✅ callGroq updated:
+ * - uses response_format json_object
+ * - has a safe fallback if API rejects response_format (400 + mentions response_format)
+ */
 async function callGroq(messages, { model, max_tokens }) {
-  const res = await fetchWithTimeout(
-    "https://api.groq.com/openai/v1/chat/completions",
+  const payload = {
+    model,
+    temperature: 0.35,
+    max_tokens,
+    messages,
+    response_format: { type: "json_object" },
+  };
+
+  const url = "https://api.groq.com/openai/v1/chat/completions";
+
+  let res = await fetchWithTimeout(
+    url,
     {
       method: "POST",
       headers: {
         Authorization: `Bearer ${GROQ_API_KEY}`,
         "Content-Type": "application/json",
       },
-      body: JSON.stringify({
-        model,
-        temperature: 0.35,
-        max_tokens,
-        messages,
-      }),
+      body: JSON.stringify(payload),
     },
     20000
   );
+
+  // احتياط: لو الموديل/الواجهة رفضت response_format
+  if (!res.ok && res.status === 400) {
+    const t = await res.text().catch(() => "");
+    if (t.toLowerCase().includes("response_format")) {
+      delete payload.response_format;
+      res = await fetchWithTimeout(
+        url,
+        {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${GROQ_API_KEY}`,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify(payload),
+        },
+        20000
+      );
+      if (!res.ok) {
+        const t2 = await res.text().catch(() => "");
+        throw new Error(`Groq API error (${res.status}) ${t2.slice(0, 200)}`);
+      }
+      const data2 = await res.json();
+      return data2.choices?.[0]?.message?.content || "";
+    }
+  }
 
   if (!res.ok) {
     const t = await res.text().catch(() => "");
@@ -303,14 +336,18 @@ async function callGroq(messages, { model, max_tokens }) {
   return data.choices?.[0]?.message?.content || "";
 }
 
-function fallback(rawText) {
-  const looseVerdict = extractVerdictLoosely(rawText);
+/**
+ * ✅ fallback updated:
+ * - NEVER returns "تعذر توليد رد منظم..."
+ * - Always returns useful Arabic content
+ */
+function fallback(_rawText) {
   return {
     category: "general",
     title: "معلومة صحية",
-    verdict: looseVerdict || "تعذر توليد رد منظم الآن. جرّب إعادة صياغة السؤال بشكل مختصر.",
-    tips: [],
-    when_to_seek_help: "",
+    verdict: "أقدر أساعدك بمعلومة صحية عامة. اكتب سؤالك بجملة واحدة وحدد العمر والجنس إن كان له علاقة.",
+    tips: ["اذكر الأعراض باختصار", "حدّد المدة منذ بداية المشكلة", "اذكر إن كان لديك أمراض مزمنة"],
+    when_to_seek_help: "إذا كان هناك ألم شديد أو ضيق نفس أو إغماء أو نزيف فاطلب مساعدة عاجلة.",
   };
 }
 
@@ -461,9 +498,29 @@ app.post("/chat", chatLimiter, async (req, res) => {
 
     const maxTokens = chooseMaxTokens(msg, { category: lastCategory });
 
-    // ✅ موديل واحد فقط
-    const raw1 = await callGroq(messages, { model: MODEL, max_tokens: maxTokens });
-    const parsed = extractJson(raw1);
+    // ✅ موديل واحد فقط + JSON mode
+    let raw1 = await callGroq(messages, { model: MODEL, max_tokens: maxTokens });
+    let parsed = extractJson(raw1);
+
+    // ✅ NEW: إصلاح مرة ثانية إذا فشل JSON
+    if (!parsed) {
+      const repairMessages = [
+        { role: "system", content: buildSystemPrompt() },
+        ...messages.filter((m) => m.role !== "system"),
+        {
+          role: "user",
+          content:
+            "الناتج السابق غير صالح كـ JSON. أعد نفس الإجابة لكن كـ JSON صالح فقط وبنفس المفاتيح المطلوبة، بدون أي نص إضافي.",
+        },
+      ];
+
+      const raw2 = await callGroq(repairMessages, { model: MODEL, max_tokens: maxTokens });
+      const parsed2 = extractJson(raw2);
+      if (parsed2) {
+        raw1 = raw2;
+        parsed = parsed2;
+      }
+    }
 
     let data;
     if (parsed) data = normalize(parsed);
@@ -473,7 +530,7 @@ app.post("/chat", chatLimiter, async (req, res) => {
       data = normalize(recoverPartialCard(raw1) || fallback(raw1));
     }
 
-    // ✅ حارس نهائي: لا ترجع بطاقة عنوان فقط
+    // ✅ حارس نهائي: إذا verdict فاضي رجّع fallback (بدون الرسالة المزعجة)
     if (isEmptyCard(data)) {
       data = fallback(raw1);
     }

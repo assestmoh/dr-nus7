@@ -16,7 +16,7 @@ const MODEL = (process.env.GROQ_MODEL || "openai/gpt-oss-120b").trim();
 
 // TTS (Orpheus Arabic Saudi)
 const TTS_MODEL = (process.env.GROQ_TTS_MODEL || "canopylabs/orpheus-arabic-saudi").trim();
-const TTS_VOICE = (process.env.GROQ_TTS_VOICE || "salman").trim();
+const TTS_VOICE = (process.env.GROQ_TTS_VOICE || "sultan").trim();
 
 const PORT = process.env.PORT || 3000;
 
@@ -218,6 +218,7 @@ function buildSystemPrompt() {
 * صحة الأطفال
 * السلامة الدوائية
 عند وجود أعراض خطيرة (ألم صدر شديد/ضيق نفس شديد/إغماء/نزيف شديد/ضعف مفاجئ): وجّه للطوارئ فورًا (9999 أو 24343666 في عُمان).
+عند طلب الاستمرار في نفس المسار يجب تقديم محور جديد مختلف وعدم تكرار النشاط أو النصائح السابقة.
 أعد الناتج كـ JSON فقط بدون أي نص إضافي وبدون Markdown وبالمفاتيح التالية فقط:
 {"category":"general|nutrition|bp|sugar|sleep|activity|mental|first_aid|report|emergency|water|calories|bmi","title":"2-5 كلمات","verdict":"جملتان كحد أقصى","tips":["","",""],"when_to_seek_help":"نص قصير أو \\" \\""}
 `.trim();
